@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LLM API 中转站自动签到管理后台</title>
+  <!-- AstrBot Bridge SDK -->
+  <script src="/api/plugin/page/bridge-sdk.js"></script>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="container">
+    <!-- Toast Notifications -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- Header Card -->
+    <div class="card">
+      <div class="header-content">
+        <div class="title-area">
+          <h2>API 中转站自动签到管理</h2>
+          <div style="display: flex; gap: 12px; align-items: center; margin-top: 4px; flex-wrap: wrap;">
+            <p style="margin: 0;">可视化维护中转站配置、检测连通性与每日打卡任务</p>
+            <span id="target-time-badge" class="badge badge-info" onclick="openTargetTimeModal()" title="点击修改下次预计签到时间" style="font-size: 13px; padding: 4px 10px; cursor: pointer;">下次预计签到: --:--</span>
+          </div>
+        </div>
+        <div class="action-buttons">
+          <button class="btn btn-primary" onclick="openAddSiteModal()">
+            新增中转站
+          </button>
+          <button id="btn-run-all" class="btn btn-success" onclick="runCheckInAll()">
+            立即全部签到
+          </button>
+          <button class="btn" onclick="openSettingsModal()">
+            全局设置
+          </button>
+          <button class="btn" onclick="openLogsDrawer()">
+            历史日志
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Table Card -->
+    <div class="card" style="padding: 0; overflow: hidden;">
+      <div class="table-container">
+        <table class="custom-table">
+          <thead>
+            <tr>
+              <th>站点名称</th>
+              <th>框架/协议</th>
+              <th>Base URL</th>
+              <th>今日签到状态</th>
+              <th>凭据 (已脱敏)</th>
+              <th>启用</th>
+              <th style="text-align: right; padding-right: 24px;">操作</th>
+            </tr>
+          </thead>
+          <tbody id="sites-tbody">
+            <tr>
+              <td colspan="7" class="empty-text">加载中...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Add/Edit Site Modal -->
+    <div id="site-modal" class="modal-overlay" onclick="handleOverlayClick(event, 'site-modal')">
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3 id="site-modal-title">新增中转站</h3>
+          <button class="modal-close" onclick="closeModal('site-modal')">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label>站点名称 *</label>
+            <input type="text" id="site-name" class="form-control" placeholder="例如：公益中转站 A" />
+          </div>
+          <div class="form-group">
+            <label>框架类型</label>
+            <select id="site-type" class="form-control">
+              <option value="new-api">New-API / One-API (主流)</option>
+              <option value="generic_rest">通用 REST API</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Base URL *</label>
+            <input type="text" id="site-url" class="form-control" placeholder="例如：https://api.example.com" />
+          </div>
+          <div class="form-group">
+            <label>鉴权方式</label>
+            <div class="radio-group">
+              <label class="radio-label">
+                <input type="radio" name="auth_type" value="bearer_token" checked /> Bearer Token
+              </label>
+              <label class="radio-label">
+                <input type="radio" name="auth_type" value="cookie" /> Cookie
+              </label>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Token/Cookie *</label>
+            <textarea id="site-auth-value" class="form-control" rows="3" placeholder="请输入 Access Token 或 Cookie 凭据"></textarea>
+          </div>
+          <div class="form-group">
+            <label>自定义路径</label>
+            <input type="text" id="site-endpoint" class="form-control" placeholder="可选，例如 /api/user/self (留空自动探测)" />
+          </div>
+          <div class="form-group">
+            <label>代理地址 (可选)</label>
+            <input type="text" id="site-proxy" class="form-control" placeholder="可选，例如 http://127.0.0.1:7890 (留空使用系统/AstrBot 代理)" />
+          </div>
+          <div class="form-group">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+              <label style="margin: 0;">自定义请求头 (可选)</label>
+              <button type="button" class="btn btn-sm btn-primary-plain" onclick="addHeaderRow()">+ 添加 Header</button>
+            </div>
+            <div id="headers-list-container" class="kv-editor"></div>
+          </div>
+          <div class="form-group" style="display: flex; align-items: center; justify-content: space-between;">
+            <label style="margin: 0;">默认开启</label>
+            <label class="switch">
+              <input type="checkbox" id="site-enabled" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" onclick="closeModal('site-modal')">取消</button>
+          <button class="btn btn-primary" onclick="submitSiteForm()">保存站点</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Global Settings Modal -->
+    <div id="settings-modal" class="modal-overlay" onclick="handleOverlayClick(event, 'settings-modal')">
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3>定时签到设置</h3>
+          <button class="modal-close" onclick="closeModal('settings-modal')">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-group" style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px;">
+            <label style="margin: 0;">自动定时签到</label>
+            <label class="switch">
+              <input type="checkbox" id="setting-enabled" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="form-group" style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px;">
+            <label style="margin: 0;">区间随机打卡</label>
+            <label class="switch">
+              <input type="checkbox" id="setting-random" onchange="toggleRandomMode()" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div id="random-time-fields">
+            <div class="form-group">
+              <label>最早打卡时间</label>
+              <input type="time" id="setting-start-time" class="form-control" value="08:00" />
+            </div>
+            <div class="form-group">
+              <label>最晚打卡时间</label>
+              <input type="time" id="setting-end-time" class="form-control" value="10:30" />
+            </div>
+          </div>
+          <div id="fixed-time-field" style="display: none;">
+            <div class="form-group">
+              <label>每日固定时间</label>
+              <input type="time" id="setting-fixed-time" class="form-control" value="08:30" />
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" onclick="closeModal('settings-modal')">取消</button>
+          <button class="btn btn-primary" onclick="saveSettings()">保存配置</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- History Logs Drawer -->
+    <div id="logs-drawer" class="drawer-overlay" onclick="handleOverlayClick(event, 'logs-drawer')">
+      <div class="drawer-panel">
+        <div class="modal-header">
+          <h3>历史签到日志</h3>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <button class="btn btn-sm btn-danger-plain" onclick="clearLogs()">清空日志</button>
+            <button class="modal-close" onclick="closeModal('logs-drawer')">&times;</button>
+          </div>
+        </div>
+        <div class="modal-body" id="logs-body">
+          <div class="empty-text">加载中...</div>
+        </div>
+      </div>
+    </div>
+    <!-- Confirm Action Custom Modal -->
+    <div id="confirm-modal" class="modal-overlay" onclick="handleOverlayClick(event, 'confirm-modal')">
+      <div class="modal-card" style="max-width: 400px;">
+        <div class="modal-header">
+          <h3 id="confirm-title">确认操作</h3>
+          <button class="modal-close" onclick="closeModal('confirm-modal')">&times;</button>
+        </div>
+        <div class="modal-body">
+          <p id="confirm-message" style="margin: 0; color: #475569; font-size: 14px;"></p>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" onclick="closeModal('confirm-modal')">取消</button>
+          <button id="confirm-ok-btn" class="btn btn-danger-plain">确定</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Edit Target Time Modal -->
+    <div id="target-time-modal" class="modal-overlay" onclick="handleOverlayClick(event, 'target-time-modal')">
+      <div class="modal-card" style="max-width: 420px;">
+        <div class="modal-header">
+          <h3>修改下次预计签到时间</h3>
+          <button class="modal-close" onclick="closeModal('target-time-modal')">&times;</button>
+        </div>
+        <div class="modal-body">
+          <p style="font-size: 13px; color: #64748b; margin-top: 0; margin-bottom: 16px;">
+            手动指定下一次触发打卡的具体时刻（不受全局时间区间限制）。
+          </p>
+          <div class="form-group">
+            <label>指定下次签到时刻 (HH:MM)</label>
+            <input type="time" id="custom-target-time-input" class="form-control" />
+          </div>
+        </div>
+        <div class="modal-footer" style="display: flex; justify-content: space-between;">
+          <button class="btn btn-danger-plain" onclick="resetCustomTargetTime()">恢复自动配置</button>
+          <div>
+            <button class="btn" onclick="closeModal('target-time-modal')" style="margin-right: 6px;">取消</button>
+            <button class="btn btn-primary" onclick="saveCustomTargetTime()">保存时间</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js" defer></script>
+</body>
+</html>
