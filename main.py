@@ -1,23 +1,34 @@
 """Main plugin entry point for AstrBot scheduled check-in plugin."""
 
-from datetime import datetime
 import json
 import logging
+from collections.abc import AsyncGenerator
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import aiohttp
 
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.star import Context, Star, register
-from astrbot.api.web import json_response, request
+from astrbot.api.web import error_response, json_response, request
+from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .core.adapters import create_adapter
 from .core.scheduler import CheckInScheduler
 
-from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
-
 logger = logging.getLogger("astrbot")
+
+
+async def _read_json_body() -> tuple[bool, Any]:
+    """Parse the current request body without leaking JSON decode failures."""
+    try:
+        payload = await request.json()
+    except Exception:
+        return False, None
+    if payload is None:
+        return False, None
+    return True, payload
 
 
 @register(
@@ -43,6 +54,7 @@ class ScheduledCheckInPlugin(Star):
         self.sites_file: Path = self.data_dir / "sites.json"
         self.settings_file: Path = self.data_dir / "settings.json"
         self.history_file: Path = self.data_dir / "history.json"
+        self.acw_cache_file: Path = self.data_dir / "acw_sc_v2_cache.json"
 
         self.scheduler = CheckInScheduler(self)
         self._register_routes()
@@ -69,7 +81,7 @@ class ScheduledCheckInPlugin(Star):
         if not self.sites_file.exists():
             return []
         try:
-            with open(self.sites_file, "r", encoding="utf-8") as f:
+            with open(self.sites_file, encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
             logger.error(f"Error reading sites.json: {e}")
@@ -100,7 +112,7 @@ class ScheduledCheckInPlugin(Star):
         if not self.settings_file.exists():
             return default_settings
         try:
-            with open(self.settings_file, "r", encoding="utf-8") as f:
+            with open(self.settings_file, encoding="utf-8") as f:
                 data = json.load(f)
                 default_settings.update(data)
                 return default_settings
@@ -127,7 +139,7 @@ class ScheduledCheckInPlugin(Star):
         logs = []
         if self.history_file.exists():
             try:
-                with open(self.history_file, "r", encoding="utf-8") as f:
+                with open(self.history_file, encoding="utf-8") as f:
                     logs = json.load(f)
             except Exception:
                 logs = []
@@ -158,7 +170,7 @@ class ScheduledCheckInPlugin(Star):
         if not self.history_file.exists():
             return []
         try:
-            with open(self.history_file, "r", encoding="utf-8") as f:
+            with open(self.history_file, encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
             logger.error(f"Error reading history.json: {e}")
@@ -218,7 +230,13 @@ class ScheduledCheckInPlugin(Star):
         Returns:
             JSON response.
         """
-        sites = await request.json()
+        parsed, sites = await _read_json_body()
+        if not parsed:
+            return error_response("请求体必须是合法 JSON")
+        if not isinstance(sites, list) or not all(
+            isinstance(site, dict) for site in sites
+        ):
+            return error_response("站点配置必须是对象数组")
         self.save_sites(sites)
         return json_response({"status": "ok", "message": "站点配置保存成功"})
 
@@ -228,10 +246,14 @@ class ScheduledCheckInPlugin(Star):
         Returns:
             JSON response with connection test result.
         """
-        site_config = await request.json()
+        parsed, site_config = await _read_json_body()
+        if not parsed:
+            return error_response("请求体必须是合法 JSON")
+        if not isinstance(site_config, dict):
+            return error_response("站点配置必须是对象")
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
-            adapter = create_adapter(site_config, session)
+            adapter = create_adapter(site_config, session, self.acw_cache_file)
             result = await adapter.test_connection()
             self.record_history([result], log_type="test")
             return json_response(result.to_dict())
@@ -242,11 +264,11 @@ class ScheduledCheckInPlugin(Star):
         Returns:
             JSON response with results.
         """
-        body = {}
-        try:
-            body = await request.json()
-        except Exception:
-            pass
+        parsed, body = await _read_json_body()
+        if not parsed:
+            return error_response("请求体必须是合法 JSON")
+        if not isinstance(body, dict):
+            return error_response("签到请求必须是对象")
         force = bool(body.get("force", False))
         results = await self.scheduler.run_check_in_all(manual=True, force=force)
         return json_response({"status": "ok", "results": [r.to_dict() for r in results]})
@@ -269,7 +291,11 @@ class ScheduledCheckInPlugin(Star):
         Returns:
             JSON response.
         """
-        data = await request.json()
+        parsed, data = await _read_json_body()
+        if not parsed:
+            return error_response("请求体必须是合法 JSON")
+        if not isinstance(data, dict):
+            return error_response("全局设置必须是对象")
         self.save_settings(data)
         self.scheduler.reset_today_target_time()
         return json_response({"status": "ok", "message": "全局设置已更新"})
@@ -280,7 +306,11 @@ class ScheduledCheckInPlugin(Star):
         Returns:
             JSON response.
         """
-        body = await request.json()
+        parsed, body = await _read_json_body()
+        if not parsed:
+            return error_response("请求体必须是合法 JSON")
+        if not isinstance(body, dict):
+            return error_response("签到时间配置必须是对象")
         target_time = str(body.get("target_time", "")).strip()
         settings = self.get_settings()
         settings["manual_target_time"] = target_time
@@ -317,13 +347,19 @@ class ScheduledCheckInPlugin(Star):
         logger.info(f"CheckIn Notification:\n{text}")
 
     @filter.command("清空签到日志")
-    async def cmd_clear_logs(self, event: AstrMessageEvent) -> None:
+    async def cmd_clear_logs(
+        self,
+        event: AstrMessageEvent,
+    ) -> AsyncGenerator[MessageEventResult, None]:
         """清空历史签到日志记录"""
         self.clear_history_logs()
         yield event.plain_result("历史签到日志已成功清空！")
 
     @filter.command("签到")
-    async def cmd_checkin(self, event: AstrMessageEvent) -> None:
+    async def cmd_checkin(
+        self,
+        event: AstrMessageEvent,
+    ) -> AsyncGenerator[MessageEventResult, None]:
         """手动触发中转站签到打卡并回复简报结果"""
         yield event.plain_result("正在批量请求中转站签到，请稍候...")
         results = await self.scheduler.run_check_in_all(manual=True)
@@ -331,7 +367,10 @@ class ScheduledCheckInPlugin(Star):
         yield event.plain_result(report)
 
     @filter.command("签到状态")
-    async def cmd_status(self, event: AstrMessageEvent) -> None:
+    async def cmd_status(
+        self,
+        event: AstrMessageEvent,
+    ) -> AsyncGenerator[MessageEventResult, None]:
         """查看当前配置的所有中转站连接状态与余额明细"""
         sites = self.get_sites()
         if not sites:
@@ -344,7 +383,7 @@ class ScheduledCheckInPlugin(Star):
         async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
             for site in sites:
                 if site.get("enabled", True):
-                    adapter = create_adapter(site, session)
+                    adapter = create_adapter(site, session, self.acw_cache_file)
                     res = await adapter.test_connection()
                     results.append(res)
 
