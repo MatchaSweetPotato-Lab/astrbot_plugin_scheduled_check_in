@@ -20,6 +20,17 @@ from .core.scheduler import CheckInScheduler
 logger = logging.getLogger("astrbot")
 
 
+async def _read_json_body() -> tuple[bool, Any]:
+    """Parse the current request body without leaking JSON decode failures."""
+    try:
+        payload = await request.json()
+    except Exception:
+        return False, None
+    if payload is None:
+        return False, None
+    return True, payload
+
+
 @register(
     "astrbot_plugin_scheduled_check_in",
     "Soulter",
@@ -219,7 +230,9 @@ class ScheduledCheckInPlugin(Star):
         Returns:
             JSON response.
         """
-        sites = await request.json()
+        parsed, sites = await _read_json_body()
+        if not parsed:
+            return error_response("请求体必须是合法 JSON")
         if not isinstance(sites, list) or not all(
             isinstance(site, dict) for site in sites
         ):
@@ -233,7 +246,9 @@ class ScheduledCheckInPlugin(Star):
         Returns:
             JSON response with connection test result.
         """
-        site_config = await request.json()
+        parsed, site_config = await _read_json_body()
+        if not parsed:
+            return error_response("请求体必须是合法 JSON")
         if not isinstance(site_config, dict):
             return error_response("站点配置必须是对象")
         connector = aiohttp.TCPConnector(ssl=False)
@@ -249,13 +264,11 @@ class ScheduledCheckInPlugin(Star):
         Returns:
             JSON response with results.
         """
-        body = {}
-        try:
-            body = await request.json()
-        except Exception:
-            pass
+        parsed, body = await _read_json_body()
+        if not parsed:
+            return error_response("请求体必须是合法 JSON")
         if not isinstance(body, dict):
-            body = {}
+            return error_response("签到请求必须是对象")
         force = bool(body.get("force", False))
         results = await self.scheduler.run_check_in_all(manual=True, force=force)
         return json_response({"status": "ok", "results": [r.to_dict() for r in results]})
@@ -278,7 +291,9 @@ class ScheduledCheckInPlugin(Star):
         Returns:
             JSON response.
         """
-        data = await request.json()
+        parsed, data = await _read_json_body()
+        if not parsed:
+            return error_response("请求体必须是合法 JSON")
         if not isinstance(data, dict):
             return error_response("全局设置必须是对象")
         self.save_settings(data)
@@ -291,7 +306,9 @@ class ScheduledCheckInPlugin(Star):
         Returns:
             JSON response.
         """
-        body = await request.json()
+        parsed, body = await _read_json_body()
+        if not parsed:
+            return error_response("请求体必须是合法 JSON")
         if not isinstance(body, dict):
             return error_response("签到时间配置必须是对象")
         target_time = str(body.get("target_time", "")).strip()
