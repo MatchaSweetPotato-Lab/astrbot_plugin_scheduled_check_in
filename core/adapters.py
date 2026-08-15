@@ -123,12 +123,17 @@ class BaseCheckInAdapter(ABC):
             return merged_headers
 
         cookies: dict[str, str] = {}
-        for part in merged_headers.get("Cookie", "").split(";"):
-            if "=" not in part:
-                continue
-            name, value = part.strip().split("=", 1)
-            if name:
-                cookies[name] = value
+        cookie_header_values: list[str] = []
+        for header_name in list(merged_headers):
+            if header_name.lower() == "cookie":
+                cookie_header_values.append(merged_headers.pop(header_name))
+        for header_value in cookie_header_values:
+            for part in header_value.split(";"):
+                if "=" not in part:
+                    continue
+                name, value = part.strip().split("=", 1)
+                if name:
+                    cookies[name] = value
         cookies.update(self._challenge_cookies)
         merged_headers["Cookie"] = "; ".join(f"{name}={value}" for name, value in cookies.items())
         return merged_headers
@@ -422,7 +427,16 @@ class GenericRestAdapter(BaseCheckInAdapter):
                     import json
                     payload = json.loads(response.text)
                     if isinstance(payload, dict) and "success" in payload:
-                        is_success = bool(payload["success"])
+                        success_value = payload["success"]
+                        response_success: bool | None = None
+                        if isinstance(success_value, bool):
+                            response_success = success_value
+                        elif isinstance(success_value, str):
+                            normalized = success_value.strip().lower()
+                            if normalized in {"true", "false"}:
+                                response_success = normalized == "true"
+                        if response_success is not None:
+                            is_success = is_success and response_success
                 except (TypeError, ValueError):
                     pass
             is_expired = status_code in (401, 403)

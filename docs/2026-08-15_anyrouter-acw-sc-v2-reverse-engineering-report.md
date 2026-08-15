@@ -80,6 +80,20 @@ sequenceDiagram
 - linked_workitem: n/a
 - supersedes: none
 
+### E-004
+
+- source_type: live_http
+- locator: `GET https://anyrouter.top/api/user/sign_in`
+- collected_at: 2026-08-15T18:38:12+08:00
+- tool: curl 8.x with response decompression
+- content_hash: dynamic response
+- repro_command: |
+    `curl.exe --compressed -H "Accept: application/json, text/plain, */*" -H "User-Agent: Mozilla/5.0" https://anyrouter.top/api/user/sign_in`
+- raw_excerpt: |
+    响应脚本的数据流为 `arg1[index]` → 按重排表写入缓冲区 → `join('')` → 与解码密钥逐字节 XOR → 累加到最终 Cookie 变量 → `acw_sc__v2`。
+- linked_workitem: PR review hardening
+- supersedes: none
+
 ### E-002
 
 - title: Python 解算 Cookie 后请求进入后端鉴权层
@@ -143,6 +157,23 @@ sequenceDiagram
 - remediation: n/a
 - optional_attack:
 
+### F-003
+
+- title: 常量提取必须绑定到 Cookie 生成数据流
+- severity: n/a_re
+- category: parser_validation
+- status: validated
+- evidence_ids: [E-004]
+- location: `core/acw_sc_v2.py:_extract_algorithm_dataflow`
+- impact: 页面中的无关重排表或 40 字符字符串不会被误选为挑战算法常量。
+- confidence: high
+- repro_steps:
+  1. 在挑战脚本的真实常量前加入无关重排表和密钥。
+  2. 确认转译器仍选择 Cookie 表达式实际引用的重排表与密钥。
+  3. 删除重排、XOR 或 Cookie 累加链路，确认转译器拒绝脚本。
+- remediation: n/a
+- optional_attack:
+
 ## Path
 
 ### P-001
@@ -163,6 +194,7 @@ sequenceDiagram
 ```powershell
 python -m unittest discover -s tests -v
 python -m py_compile core\acw_sc_v2.py core\adapters.py core\scheduler.py main.py
+python -m ruff check core\acw_sc_v2.py core\adapters.py core\scheduler.py main.py tests\test_acw_sc_v2.py
 ```
 
 真实端点验证应使用测试账号自己的 Token 或 Cookie，不应把凭据写入报告或测试文件。

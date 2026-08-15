@@ -35,14 +35,44 @@ def encode_custom_base64(value: str) -> str:
     return encoded.translate(str.maketrans(STANDARD_BASE64, CUSTOM_BASE64)).rstrip("=")
 
 
-def make_challenge(arg1: str = ARG1, encoded_key: str = ENCODED_XOR_KEY) -> str:
+def make_challenge(
+    arg1: str = ARG1,
+    encoded_key: str = ENCODED_XOR_KEY,
+    include_decoys: bool = False,
+) -> str:
     permutation = ",".join(hex(value) for value in PERMUTATION)
+    decoys = ""
+    if include_decoys:
+        decoy_permutation = ",".join(str(value) for value in range(40, 0, -1))
+        decoys = f"""
+var decoyPermutation=[{decoy_permutation}];
+var decoyKey='1111111111111111111111111111111111111111';
+"""
     return f"""<html><script>
 var arg1='{arg1}';
+{decoys}
+function decodeKey(value) {{
+  var alphabet='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=';
+  return value;
+}}
 var permutation=[{permutation}];
-var strings=['{encoded_key}','abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/='];
-var result=(parseInt(arg1.slice(0,2),16)^parseInt(strings[0].slice(0,2),16));
-document.cookie='acw_sc__v2='+result;
+var xorKey=decodeKey('{encoded_key}');
+var reordered=[];
+var joined='';
+var cookieValue='';
+for(var sourceIndex=0;sourceIndex<arg1.length;sourceIndex++){{
+  var character=arg1[sourceIndex];
+  for(var slot=0;slot<permutation.length;slot++){{
+    permutation[slot]===sourceIndex+1&&(reordered[slot]=character);
+  }}
+}}
+joined=reordered.join('');
+for(var index=0;index<joined.length&&index<xorKey.length;index+=2){{
+  var byte=(parseInt(joined.slice(index,index+2),16)^parseInt(xorKey.slice(index,index+2),16)).toString(16);
+  if(byte.length===1) byte='0'+byte;
+  cookieValue+=byte;
+}}
+document.cookie='acw_sc__v2='+cookieValue;
 </script></html>"""
 
 
@@ -62,6 +92,29 @@ class AcwScV2TranslationTests(unittest.TestCase):
 
     def test_rejects_an_unknown_algorithm_shape(self) -> None:
         challenge = make_challenge().replace("parseInt", "Number")
+        with self.assertRaises(AcwScV2Error):
+            translate_acw_sc_v2(challenge)
+
+    def test_uses_only_constants_linked_to_the_cookie_dataflow(self) -> None:
+        challenge = make_challenge(include_decoys=True)
+
+        _, algorithm, _ = translate_acw_sc_v2(challenge)
+        solution = AcwScV2SolverCache().solve(challenge)
+
+        self.assertEqual(algorithm.permutation, PERMUTATION)
+        self.assertEqual(algorithm.xor_key, "3000176000856006061501533003690027800375")
+        self.assertEqual(solution.cookie_value, EXPECTED_COOKIE)
+
+    def test_rejects_constants_without_a_verified_cookie_dataflow(self) -> None:
+        permutation = ",".join(hex(value) for value in PERMUTATION)
+        challenge = f"""<html><script>
+var arg1='{ARG1}';
+var permutation=[{permutation}];
+var xorKey='{ENCODED_XOR_KEY}';
+var result=(parseInt(arg1.slice(0,2),16)^parseInt(xorKey.slice(0,2),16));
+document.cookie='acw_sc__v2='+result;
+</script></html>"""
+
         with self.assertRaises(AcwScV2Error):
             translate_acw_sc_v2(challenge)
 
@@ -149,6 +202,7 @@ class ChallengeAwareRequestTests(unittest.IsolatedAsyncioTestCase):
             "method": "GET",
             "auth_type": "cookie",
             "auth_value": "session=auth-value",
+            "custom_headers": {"cookie": "custom=header-value"},
             "solve_acw_sc_v2": True,
         }
 
@@ -163,11 +217,40 @@ class ChallengeAwareRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.message, 'HTTP 401: {"success":false,"message":"unauthorized"}')
         self.assertEqual(len(session.requests), 2)
-        retry_cookie = str(session.requests[1]["headers"]["Cookie"])  # type: ignore[index]
+        retry_headers = session.requests[1]["headers"]
+        self.assertIsInstance(retry_headers, dict)
+        cookie_headers = {
+            str(name): str(value)
+            for name, value in retry_headers.items()  # type: ignore[union-attr]
+            if str(name).lower() == "cookie"
+        }
+        self.assertEqual(len(cookie_headers), 1)
+        retry_cookie = next(iter(cookie_headers.values()))
         self.assertIn("session=auth-value", retry_cookie)
+        self.assertIn("custom=header-value", retry_cookie)
         self.assertIn("acw_tc=tc-value", retry_cookie)
         self.assertIn("cdn_sec_tc=sec-value", retry_cookie)
         self.assertIn(f"acw_sc__v2={EXPECTED_COOKIE}", retry_cookie)
+
+    async def test_string_success_cannot_override_failed_http_status(self) -> None:
+        session = _FakeSession(
+            [_FakeResponse(401, '{"success":"false","message":"unauthorized"}')]
+        )
+        config = {
+            "id": "site-2",
+            "name": "Example",
+            "base_url": "https://example.test",
+            "checkin_endpoint": "/api/user/sign_in",
+            "method": "GET",
+            "auth_type": "bearer_token",
+            "auth_value": "invalid-token",
+        }
+        adapter = GenericRestAdapter(config, session)  # type: ignore[arg-type]
+
+        result = await adapter.test_connection()
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.expired)
 
 
 if __name__ == "__main__":

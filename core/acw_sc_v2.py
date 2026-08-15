@@ -30,11 +30,28 @@ _ARG1_RE = re.compile(
     r"\barg1\s*=\s*(?P<quote>['\"])(?P<value>[0-9a-fA-F]{40})(?P=quote)",
     re.IGNORECASE,
 )
-_HEX_XOR_RE = re.compile(
-    r"parseInt\s*\([^;]{1,500}?\)\s*\^\s*parseInt\s*\(",
+_IDENTIFIER = r"[A-Za-z_$][A-Za-z0-9_$]*"
+_ARRAY_ASSIGN_RE = re.compile(
+    rf"(?:\bvar\s+|[,;])\s*(?P<name>{_IDENTIFIER})\s*=\s*\[(?P<body>[^\[\]]+)\]"
+)
+_REORDER_FLOW_RE = re.compile(
+    rf"(?P<permutation>{_IDENTIFIER})\s*\[\s*(?P<slot>{_IDENTIFIER})\s*\]"
+    rf"\s*={{2,3}}\s*(?P<source_index>{_IDENTIFIER})\s*\+\s*(?:0x)?1"
+    rf"\s*&&\s*\(?\s*(?P<buffer>{_IDENTIFIER})"
+    rf"\s*\[\s*(?P=slot)\s*\]\s*=\s*(?P<character>{_IDENTIFIER})\s*\)?",
     re.DOTALL,
 )
-_ARRAY_RE = re.compile(r"\[([^\[\]]+)\]")
+_HEX_OPERAND = (
+    rf"parseInt\s*\(\s*(?P<%s>{_IDENTIFIER})\s*"
+    rf"(?:\[[^\]]+\]|\.\s*{_IDENTIFIER})\s*\([^)]{{1,200}}\)"
+    r"\s*,\s*(?:0x10|16)\s*\)"
+)
+_HEX_XOR_OPERANDS_RE = re.compile(
+    (_HEX_OPERAND % "left")
+    + r"\s*\^\s*"
+    + (_HEX_OPERAND % "right"),
+    re.DOTALL,
+)
 _JS_STRING_RE = re.compile(
     r"(?P<quote>['\"])(?P<body>(?:\\.|(?!\1).)*)(?P=quote)",
     re.DOTALL,
@@ -95,9 +112,11 @@ def _extract_arg1(script: str) -> str:
     return match.group("value")
 
 
-def _extract_permutation(script: str) -> tuple[int, ...]:
-    for match in _ARRAY_RE.finditer(script):
-        raw_items = match.group(1).split(",")
+def _extract_permutation_assignments(script: str) -> dict[str, tuple[int, ...]]:
+    """Return valid permutation arrays keyed by their JavaScript variable name."""
+    assignments: dict[str, tuple[int, ...]] = {}
+    for match in _ARRAY_ASSIGN_RE.finditer(script):
+        raw_items = match.group("body").split(",")
         if len(raw_items) != 40:
             continue
         try:
@@ -105,8 +124,90 @@ def _extract_permutation(script: str) -> tuple[int, ...]:
         except ValueError:
             continue
         if sorted(values) == list(range(1, 41)):
-            return values
-    raise AcwScV2Error("挑战脚本缺少有效的 40 项字符重排表")
+            assignments[match.group("name")] = values
+    return assignments
+
+
+def _extract_algorithm_dataflow(script: str) -> tuple[tuple[int, ...], str]:
+    """Tie the permutation and XOR-key operand to the cookie-producing flow."""
+    permutations = _extract_permutation_assignments(script)
+    candidates: list[tuple[tuple[int, ...], str]] = []
+
+    for flow_match in _REORDER_FLOW_RE.finditer(script):
+        permutation_name = flow_match.group("permutation")
+        permutation = permutations.get(permutation_name)
+        if permutation is None:
+            continue
+
+        character = re.escape(flow_match.group("character"))
+        source_index = re.escape(flow_match.group("source_index"))
+        source_pattern = re.compile(
+            rf"(?:\bvar\s+|,)\s*{character}\s*=\s*arg1"
+            rf"\s*\[\s*{source_index}\s*\]"
+        )
+        flow_prefix = script[max(0, flow_match.start() - 500) : flow_match.start()]
+        if source_pattern.search(flow_prefix) is None:
+            continue
+
+        buffer_name = re.escape(flow_match.group("buffer"))
+        flow_suffix = script[flow_match.end() : flow_match.end() + 3000]
+        join_pattern = re.compile(
+            rf"\b(?P<joined>{_IDENTIFIER})\s*=\s*{buffer_name}\s*"
+            rf"(?:\[[^\]]+\]|\.\s*join)\s*\(\s*"
+            rf"(?P<quote>['\"])(?P=quote)\s*\)"
+        )
+        join_match = join_pattern.search(flow_suffix)
+        if join_match is None:
+            continue
+
+        xor_region = flow_suffix[join_match.end() :]
+        xor_match = _HEX_XOR_OPERANDS_RE.search(xor_region)
+        if xor_match is None:
+            continue
+        joined_name = join_match.group("joined")
+        operands = (xor_match.group("left"), xor_match.group("right"))
+        if operands.count(joined_name) != 1:
+            continue
+        key_name = operands[1] if operands[0] == joined_name else operands[0]
+
+        byte_prefix = xor_region[max(0, xor_match.start() - 100) : xor_match.start()]
+        byte_match = re.search(
+            rf"(?:\bvar\s+)?(?P<byte>{_IDENTIFIER})\s*=\s*\(\s*$",
+            byte_prefix,
+        )
+        if byte_match is None:
+            continue
+        byte_name = re.escape(byte_match.group("byte"))
+        xor_suffix = xor_region[xor_match.end() : xor_match.end() + 1200]
+        accumulator_match = re.search(
+            rf"\b(?P<accumulator>{_IDENTIFIER})\s*\+=\s*{byte_name}\b",
+            xor_suffix,
+        )
+        if accumulator_match is None:
+            continue
+        accumulator = re.escape(accumulator_match.group("accumulator"))
+        cookie_suffix = xor_suffix[accumulator_match.end() :]
+        if re.search(
+            rf"['\"]{re.escape(_COOKIE_NAME)}=['\"]\s*\+\s*{accumulator}\b",
+            cookie_suffix,
+        ) is None:
+            continue
+
+        key_assignments = list(
+            re.finditer(
+                rf"(?:\bvar\s+|,)\s*{re.escape(key_name)}\s*=\s*"
+                rf"(?P<expression>{_IDENTIFIER}\s*\([^;)]*\)|['\"][^'\"]+['\"])",
+                script[: flow_match.end()],
+            )
+        )
+        if not key_assignments:
+            continue
+        key_assignment = key_assignments[-1]
+        candidates.append((permutation, key_assignment.group("expression")))
+
+    if len(candidates) != 1:
+        raise AcwScV2Error("无法唯一确认生成 acw_sc__v2 的字符重排与 XOR 数据流")
+    return candidates[0]
 
 
 def _iter_js_strings(script: str) -> list[str]:
@@ -138,20 +239,70 @@ def _decode_custom_base64(value: str, alphabet: str) -> str | None:
         return None
 
 
-def _extract_xor_key(script: str, arg1: str) -> str:
-    strings = _iter_js_strings(script)
-
-    for value in strings:
+def _xor_key_candidates(
+    values: list[str],
+    alphabets: list[str],
+    arg1: str,
+) -> set[str]:
+    candidates: set[str] = set()
+    for value in values:
         if value != arg1 and _HEX_40_RE.fullmatch(value):
-            return value.lower()
-
-    for alphabet in _extract_base64_alphabets(strings):
-        for value in strings:
+            candidates.add(value.lower())
+        for alphabet in alphabets:
             decoded = _decode_custom_base64(value, alphabet)
             if decoded and decoded != arg1 and _HEX_40_RE.fullmatch(decoded):
-                return decoded.lower()
+                candidates.add(decoded.lower())
+    return candidates
 
-    raise AcwScV2Error("挑战脚本缺少可识别的 40 位 XOR 密钥")
+
+def _extract_xor_key(script: str, arg1: str, key_expression: str) -> str:
+    strings = _iter_js_strings(script)
+    alphabets = _extract_base64_alphabets(strings)
+
+    expression_candidates = _xor_key_candidates(
+        _iter_js_strings(key_expression),
+        alphabets,
+        arg1,
+    )
+    if len(expression_candidates) == 1:
+        return expression_candidates.pop()
+    if len(expression_candidates) > 1:
+        raise AcwScV2Error("XOR 操作数表达式包含多个候选密钥")
+
+    decoder_call = re.fullmatch(
+        rf"\s*(?P<callee>{_IDENTIFIER})\s*\([^)]*\)\s*",
+        key_expression,
+    )
+    if decoder_call is None:
+        raise AcwScV2Error("XOR 操作数不是可验证的字符串或解码器调用")
+
+    decoder_name = decoder_call.group("callee")
+    alias_match = re.search(
+        rf"(?:\bvar\s+|,)\s*{re.escape(decoder_name)}\s*=\s*"
+        rf"(?P<target>{_IDENTIFIER})\b",
+        script,
+    )
+    decoder_target = alias_match.group("target") if alias_match else decoder_name
+    function_match = re.search(
+        rf"\bfunction\s+{re.escape(decoder_target)}\s*\(",
+        script,
+    )
+    if function_match is None:
+        raise AcwScV2Error("无法确认 XOR 密钥解码器")
+    next_function = re.search(r"\bfunction\s+[A-Za-z_$]", script[function_match.end() :])
+    function_end = (
+        function_match.end() + next_function.start()
+        if next_function is not None
+        else len(script)
+    )
+    decoder_source = script[function_match.start() : function_end]
+    if not any(alphabet in decoder_source for alphabet in alphabets):
+        raise AcwScV2Error("XOR 密钥解码器缺少可验证的 Base64 字母表")
+
+    candidates = _xor_key_candidates(strings, alphabets, arg1)
+    if len(candidates) != 1:
+        raise AcwScV2Error("无法从 XOR 解码器唯一确认 40 位密钥")
+    return candidates.pop()
 
 
 def translate_acw_sc_v2(script: str) -> tuple[str, AcwScV2Algorithm, str]:
@@ -162,13 +313,12 @@ def translate_acw_sc_v2(script: str) -> tuple[str, AcwScV2Algorithm, str]:
     """
     if _COOKIE_NAME not in script.lower():
         raise AcwScV2Error("响应不是 acw_sc__v2 挑战")
-    if _HEX_XOR_RE.search(script) is None:
-        raise AcwScV2Error("挑战脚本不是受支持的十六进制 XOR 算法")
 
     arg1 = _extract_arg1(script)
+    permutation, key_expression = _extract_algorithm_dataflow(script)
     algorithm = AcwScV2Algorithm(
-        permutation=_extract_permutation(script),
-        xor_key=_extract_xor_key(script, arg1),
+        permutation=permutation,
+        xor_key=_extract_xor_key(script, arg1, key_expression),
     )
     return arg1, algorithm, build_python_source(algorithm)
 
