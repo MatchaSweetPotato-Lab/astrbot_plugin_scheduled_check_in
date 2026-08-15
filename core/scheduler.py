@@ -1,9 +1,9 @@
 """Scheduler module managing daily sign-in execution and report formatting."""
 
 import asyncio
-from datetime import datetime
 import logging
 import random
+from datetime import datetime
 from typing import Any
 
 import aiohttp
@@ -235,7 +235,11 @@ class CheckInScheduler:
                 if idx > 0:
                     await asyncio.sleep(random.uniform(1.5, 3.5))
 
-                adapter = create_adapter(site_config, session)
+                adapter = create_adapter(
+                    site_config,
+                    session,
+                    getattr(self.plugin, "acw_cache_file", None),
+                )
                 result = await adapter.check_in()
                 results.append(result)
 
