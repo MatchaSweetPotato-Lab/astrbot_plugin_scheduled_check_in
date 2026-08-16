@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import unittest
+
+import tests  # noqa: F401
 from core.http_client import (
     DEFAULT_IMPERSONATE,
     create_client_session,

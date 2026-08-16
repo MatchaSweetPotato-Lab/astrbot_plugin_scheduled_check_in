@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import tests  # noqa: F401
 from core.acw_sc_v2 import (
     AcwScV2Error,
     AcwScV2SolverCache,

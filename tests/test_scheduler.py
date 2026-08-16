@@ -7,6 +7,7 @@ import unittest
 from datetime import datetime
 from typing import Any
 
+import tests  # noqa: F401
 from core.adapters import CheckInResult
 from core.scheduler import CheckInScheduler
 

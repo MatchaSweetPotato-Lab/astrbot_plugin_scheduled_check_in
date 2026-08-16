@@ -20,6 +20,7 @@ from .core.http_client import (
     normalize_impersonate,
 )
 from .core.scheduler import CheckInScheduler
+from .core.storage import DatabaseManager
 
 logger = logging.getLogger("astrbot")
 
@@ -55,9 +56,7 @@ class ScheduledCheckInPlugin(Star):
         self.data_dir: Path = Path(get_astrbot_plugin_data_path()) / "astrbot_plugin_scheduled_check_in"
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
-        self.sites_file: Path = self.data_dir / "sites.json"
-        self.settings_file: Path = self.data_dir / "settings.json"
-        self.history_file: Path = self.data_dir / "history.json"
+        self.db = DatabaseManager(self.data_dir / "data.db", legacy_data_dir=self.data_dir)
         self.acw_cache_file: Path = self.data_dir / "acw_sc_v2_cache.json"
 
         self.scheduler = CheckInScheduler(self)
@@ -77,122 +76,117 @@ class ScheduledCheckInPlugin(Star):
     # Data Storage Utilities
     # ------------------------------------------------------------------
     def get_sites(self) -> list[dict[str, Any]]:
-        """Read configured sites from JSON file.
+        """Read configured sites from SQLite database.
 
         Returns:
             List of site configuration dictionaries.
         """
-        if not self.sites_file.exists():
-            return []
         try:
-            with open(self.sites_file, encoding="utf-8") as f:
-                return json.load(f)
+            return self.db.get_sites()
         except Exception as e:
-            logger.error(f"Error reading sites.json: {e}")
+            logger.error(f"Error reading sites from database: {e}", exc_info=True)
             return []
 
     def save_sites(self, sites_data: list[dict[str, Any]]) -> None:
-        """Write site configurations to JSON file.
+        """Write site configurations to SQLite database.
 
         Args:
             sites_data: List of site dictionaries.
         """
-        with open(self.sites_file, "w", encoding="utf-8") as f:
-            json.dump(sites_data, f, ensure_ascii=False, indent=2)
+        try:
+            self.db.save_sites(sites_data)
+        except Exception as e:
+            logger.error(f"Error saving sites to database: {e}", exc_info=True)
 
     def get_settings(self) -> dict[str, Any]:
-        """Read plugin settings from JSON file.
+        """Read plugin settings from SQLite database.
 
         Returns:
             Settings dictionary.
         """
-        default_settings = {
-            "enabled": True,
-            "random_enabled": True,
-            "start_time": "08:00",
-            "end_time": "10:30",
-            "checkin_time": "08:30",
-            "http_ssl_verify": True,
-            "http_timeout_seconds": 15,
-            "http_impersonate": DEFAULT_IMPERSONATE,
-        }
-        if not self.settings_file.exists():
-            return default_settings
         try:
-            with open(self.settings_file, encoding="utf-8") as f:
-                data = json.load(f)
-                default_settings.update(data)
-                default_settings["http_impersonate"] = normalize_impersonate(
-                    default_settings.get("http_impersonate")
-                )
-                return default_settings
+            return self.db.get_settings()
         except Exception as e:
-            logger.error(f"Error reading settings.json: {e}")
-            return default_settings
+            logger.error(f"Error reading settings from database: {e}", exc_info=True)
+            return {
+                "enabled": True,
+                "random_enabled": True,
+                "start_time": "08:00",
+                "end_time": "10:30",
+                "checkin_time": "08:30",
+                "http_ssl_verify": True,
+                "http_timeout_seconds": 15,
+                "http_impersonate": DEFAULT_IMPERSONATE,
+                "manual_target_time": "",
+                "max_history_records": 0,
+            }
 
     def save_settings(self, settings_data: dict[str, Any]) -> None:
-        """Write settings to JSON file.
+        """Write settings to SQLite database.
 
         Args:
             settings_data: Settings dictionary.
         """
-        with open(self.settings_file, "w", encoding="utf-8") as f:
-            json.dump(settings_data, f, ensure_ascii=False, indent=2)
+        try:
+            self.db.save_settings(settings_data)
+        except Exception as e:
+            logger.error(f"Error saving settings to database: {e}", exc_info=True)
 
     def record_history(self, results: list[Any], log_type: str = "scheduled") -> None:
-        """Record check-in results into history JSON log.
+        """Record check-in results into history SQLite table.
 
         Args:
             results: List of CheckInResult objects.
             log_type: Type of log entry ("scheduled", "manual", "test").
         """
-        logs = []
-        if self.history_file.exists():
-            try:
-                with open(self.history_file, encoding="utf-8") as f:
-                    logs = json.load(f)
-            except Exception:
-                logs = []
+        try:
+            report_text = CheckInScheduler.format_report(results)
+            entry = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "type": log_type,
+                "manual": log_type == "manual",
+                "success": all(r.success for r in results) if results else False,
+                "report": report_text,
+                "details": [r.to_dict() for r in results],
+            }
+            self.db.record_history(entry)
+        except Exception as e:
+            logger.error(f"Error recording history to database: {e}", exc_info=True)
 
-        report_text = CheckInScheduler.format_report(results)
-        entry = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "type": log_type,
-            "manual": log_type == "manual",
-            "success": all(r.success for r in results) if results else False,
-            "report": report_text,
-            "details": [r.to_dict() for r in results],
-        }
+    def read_history_logs(
+        self,
+        limit: int = 100,
+        before_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read history log entries from SQLite database.
 
-        # Keep last 50 log entries
-        logs.insert(0, entry)
-        logs = logs[:50]
-
-        with open(self.history_file, "w", encoding="utf-8") as f:
-            json.dump(logs, f, ensure_ascii=False, indent=2)
-
-    def read_history_logs(self) -> list[dict[str, Any]]:
-        """Read history log file.
+        Args:
+            limit: Maximum number of logs to return.
+            before_id: Optional log ID cursor.
 
         Returns:
             List of history log entries.
         """
-        if not self.history_file.exists():
-            return []
         try:
-            with open(self.history_file, encoding="utf-8") as f:
-                return json.load(f)
+            return self.db.read_history_logs(limit=limit, before_id=before_id)
         except Exception as e:
-            logger.error(f"Error reading history.json: {e}")
+            logger.error(f"Error reading history logs from database: {e}", exc_info=True)
             return []
 
-    def clear_history_logs(self) -> None:
-        """Clear all history log entries."""
+    def count_history_logs(self) -> int:
+        """Count total history log entries in SQLite database."""
         try:
-            with open(self.history_file, "w", encoding="utf-8") as f:
-                json.dump([], f, ensure_ascii=False, indent=2)
+            return self.db.count_history_logs()
         except Exception as e:
-            logger.error(f"Error clearing history.json: {e}")
+            logger.error(f"Error counting history logs from database: {e}", exc_info=True)
+            return 0
+
+    def clear_history_logs(self) -> None:
+        """Clear all history log entries from SQLite database."""
+        try:
+            self.db.clear_history_logs()
+        except Exception as e:
+            logger.error(f"Error clearing history logs from database: {e}", exc_info=True)
 
     # ------------------------------------------------------------------
     # Web API Routes for Pages Dashboard
@@ -326,6 +320,11 @@ class ScheduledCheckInPlugin(Star):
             return error_response("全局设置必须是对象")
         settings = self.get_settings()
         settings.update(data)
+        if "max_history_records" in data:
+            try:
+                settings["max_history_records"] = max(0, int(data["max_history_records"]))
+            except (ValueError, TypeError):
+                settings["max_history_records"] = 0
         settings["http_impersonate"] = normalize_impersonate(
             settings.get("http_impersonate")
         )
@@ -352,12 +351,35 @@ class ScheduledCheckInPlugin(Star):
         return json_response({"status": "ok", "message": "下次签到时间已设置"})
 
     async def api_get_logs(self) -> Any:
-        """Web API: Get history logs.
+        """Web API: Get history logs with pagination support.
 
         Returns:
-            JSON response.
+            JSON response with items, total, has_more, and next_before_id.
         """
-        return json_response(self.read_history_logs())
+        limit = 20
+        before_id = None
+        try:
+            if hasattr(request, "query") and request.query:
+                q_limit = request.query.get("limit")
+                if q_limit is not None and str(q_limit).strip():
+                    limit = max(1, min(100, int(q_limit)))
+                q_before_id = request.query.get("before_id")
+                if q_before_id is not None and str(q_before_id).strip():
+                    before_id = int(q_before_id)
+        except Exception as e:
+            logger.warning(f"Failed to parse query params for /api/logs: {e}")
+
+        logs = self.read_history_logs(limit=limit, before_id=before_id)
+        total = self.count_history_logs()
+        has_more = len(logs) == limit
+        next_before_id = logs[-1]["id"] if (has_more and logs) else None
+
+        return json_response({
+            "items": logs,
+            "has_more": has_more,
+            "total": total,
+            "next_before_id": next_before_id,
+        })
 
     async def api_clear_logs(self) -> Any:
         """Web API: Clear history logs.

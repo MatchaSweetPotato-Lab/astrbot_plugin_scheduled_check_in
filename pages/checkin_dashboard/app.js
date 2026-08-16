@@ -12,24 +12,32 @@ let settings = {
   http_ssl_verify: true,
   http_timeout_seconds: 15,
   http_impersonate: '',
-  http_impersonate_options: []
+  http_impersonate_options: [],
+  max_history_records: 0
 };
-let logs = [];
+let logItems = [];
+let logsNextBeforeId = null;
+let logsHasMore = true;
+let logsLoading = false;
+let logsTotal = 0;
 let isEdit = false;
 let editIndex = -1;
 let activeConfirmResolver = null;
 
 // Helper: Toast Notifications
-function showToast(message, type = 'success') {
+function showToast(message, type = 'success', duration = 3500) {
   const container = document.getElementById('toast-container');
   if (!container) return;
+  const rawText = String(message || '').trim();
   const toast = document.createElement('div');
   toast.className = `toast toast-${type}`;
-  toast.textContent = message;
+  toast.title = rawText; // Hover to view full text when truncated
+  toast.textContent = rawText.length > 500 ? rawText.substring(0, 500) + '...' : rawText;
+  toast.addEventListener('click', () => toast.remove());
   container.appendChild(toast);
   setTimeout(() => {
     toast.remove();
-  }, 3000);
+  }, duration);
 }
 
 // Helper: Custom Confirm Dialog (Avoids iframe sandbox confirm() restrictions)
@@ -557,6 +565,10 @@ function renderSettingsForm() {
   document.getElementById('setting-fixed-time').value = settings.checkin_time;
   document.getElementById('setting-http-ssl-verify').checked = settings.http_ssl_verify === true;
   document.getElementById('setting-http-timeout').value = settings.http_timeout_seconds;
+  const maxRecordsInput = document.getElementById('setting-max-history-records');
+  if (maxRecordsInput) {
+    maxRecordsInput.value = settings.max_history_records ?? 0;
+  }
   renderImpersonateOptions();
   toggleRandomMode();
 }
@@ -617,6 +629,9 @@ async function saveSettings() {
   timeoutInputElement.value = String(http_timeout_seconds);
   const httpImpersonateSelect = document.getElementById('setting-http-impersonate');
   const http_impersonate = httpImpersonateSelect.value;
+  const maxRecordsInput = document.getElementById('setting-max-history-records');
+  const max_history_records = Math.max(0, parseInt(maxRecordsInput ? maxRecordsInput.value : 0, 10) || 0);
+  if (maxRecordsInput) maxRecordsInput.value = String(max_history_records);
 
   settings = {
     enabled,
@@ -626,7 +641,8 @@ async function saveSettings() {
     checkin_time,
     http_ssl_verify,
     http_timeout_seconds,
-    http_impersonate
+    http_impersonate,
+    max_history_records
   };
 
   try {
@@ -679,22 +695,32 @@ async function resetCustomTargetTime() {
   }
 }
 
-// History Logs Actions
-async function loadLogs() {
-  const container = document.getElementById('logs-body');
-  try {
-    const data = await apiGet('/api/logs');
-    logs = Array.isArray(data) ? data : [];
-    renderLogs();
-  } catch (e) {
-    renderLogMessage(container, '读取日志失败');
-  }
-}
-
+// History Logs Actions & Infinite Scroll Pagination
 function getLogTitle(log) {
   if (log.type === 'test') return '单站连通性测试';
   if (log.type === 'manual' || (log.manual && log.type !== 'test')) return '手动一键签到';
   return '自动定时签到';
+}
+
+function createLogTimelineItem(log) {
+  const item = document.createElement('div');
+  item.className = 'timeline-item';
+
+  const header = document.createElement('div');
+  header.className = 'timeline-header';
+  const title = document.createElement('span');
+  title.className = 'timeline-title';
+  title.textContent = getLogTitle(log);
+  const time = document.createElement('span');
+  time.className = 'timeline-time';
+  time.textContent = log.timestamp || '';
+  header.append(title, time);
+
+  const content = document.createElement('div');
+  content.className = 'timeline-content';
+  content.textContent = log.report || '';
+  item.append(header, content);
+  return item;
 }
 
 function renderLogMessage(container, message) {
@@ -706,54 +732,134 @@ function renderLogMessage(container, message) {
   container.appendChild(empty);
 }
 
-function renderLogs() {
+function updateLogsFooter(isLoadingMore) {
   const container = document.getElementById('logs-body');
   if (!container) return;
 
-  if (logs.length === 0) {
-    renderLogMessage(container, '暂无签到历史记录');
-    return;
+  const existingLoading = container.querySelector('.logs-loading-more');
+  if (existingLoading) existingLoading.remove();
+  const existingEnd = container.querySelector('.logs-end-line');
+  if (existingEnd) existingEnd.remove();
+
+  if (logItems.length === 0) return;
+
+  if (isLoadingMore) {
+    const loadingDiv = document.createElement('div');
+    loadingDiv.className = 'logs-loading-more';
+    const spinner = document.createElement('div');
+    spinner.className = 'spinner';
+    const text = document.createElement('span');
+    text.textContent = '正在加载更多历史记录...';
+    loadingDiv.append(spinner, text);
+    container.appendChild(loadingDiv);
+  } else if (!logsHasMore) {
+    const endDiv = document.createElement('div');
+    endDiv.className = 'logs-end-line';
+    endDiv.textContent = `已加载全部日志 (共 ${logItems.length} 条)`;
+    container.appendChild(endDiv);
+  }
+}
+
+async function fetchLogsPage(isInitial = false) {
+  const container = document.getElementById('logs-body');
+  if (!container) return;
+  if (logsLoading || (!isInitial && !logsHasMore)) return;
+
+  logsLoading = true;
+
+  if (isInitial) {
+    logItems = [];
+    logsNextBeforeId = null;
+    logsHasMore = true;
+    logsTotal = 0;
+    renderLogMessage(container, '正在加载历史日志...');
+  } else {
+    updateLogsFooter(true);
   }
 
-  container.replaceChildren();
-  const timeline = document.createElement('div');
-  timeline.className = 'timeline';
+  try {
+    const params = { limit: 20 };
+    if (logsNextBeforeId !== null && logsNextBeforeId !== undefined) {
+      params.before_id = logsNextBeforeId;
+    }
 
-  logs.forEach(log => {
-    const item = document.createElement('div');
-    item.className = 'timeline-item';
+    const data = await apiGet('/api/logs', params);
+    let newItems = [];
 
-    const header = document.createElement('div');
-    header.className = 'timeline-header';
-    const title = document.createElement('span');
-    title.className = 'timeline-title';
-    title.textContent = getLogTitle(log);
-    const time = document.createElement('span');
-    time.className = 'timeline-time';
-    time.textContent = log.timestamp || '';
-    header.append(title, time);
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+      newItems = Array.isArray(data.items) ? data.items : [];
+      logsHasMore = Boolean(data.has_more);
+      logsTotal = typeof data.total === 'number' ? data.total : (logItems.length + newItems.length);
+      logsNextBeforeId = data.next_before_id ?? (newItems.length > 0 ? newItems[newItems.length - 1].id : null);
+    } else if (Array.isArray(data)) {
+      newItems = data;
+      logsHasMore = newItems.length === 20;
+      logsNextBeforeId = newItems.length > 0 ? newItems[newItems.length - 1].id : null;
+      logsTotal = logItems.length + newItems.length;
+    }
 
-    const content = document.createElement('div');
-    content.className = 'timeline-content';
-    content.textContent = log.report || '';
-    item.append(header, content);
-    timeline.appendChild(item);
-  });
+    if (isInitial) {
+      container.replaceChildren();
+      if (newItems.length === 0) {
+        renderLogMessage(container, '暂无签到历史记录');
+        logsLoading = false;
+        return;
+      }
+      const timeline = document.createElement('div');
+      timeline.className = 'timeline';
+      timeline.id = 'logs-timeline';
+      container.appendChild(timeline);
+    }
 
-  container.appendChild(timeline);
+    const timeline = document.getElementById('logs-timeline');
+    if (timeline) {
+      newItems.forEach(log => {
+        logItems.push(log);
+        timeline.appendChild(createLogTimelineItem(log));
+      });
+    }
+
+    updateLogsFooter(false);
+  } catch (e) {
+    console.error('fetchLogsPage error:', e);
+    if (isInitial) {
+      renderLogMessage(container, '读取日志失败');
+    }
+  } finally {
+    logsLoading = false;
+  }
+}
+
+function handleLogsScroll() {
+  const body = document.getElementById('logs-body');
+  if (!body || logsLoading || !logsHasMore) return;
+  if (body.scrollTop + body.clientHeight >= body.scrollHeight - 80) {
+    fetchLogsPage(false);
+  }
 }
 
 function openLogsDrawer() {
   openModal('logs-drawer');
-  loadLogs();
+  fetchLogsPage(true);
+}
+
+async function loadLogs() {
+  const drawer = document.getElementById('logs-drawer');
+  if (drawer && drawer.classList.contains('active')) {
+    await fetchLogsPage(true);
+  }
 }
 
 function clearLogs() {
   showConfirm('确定要清空所有历史签到日志吗？此操作无法撤销。', async () => {
     try {
       await apiPost('/api/logs/clear', {});
-      logs = [];
-      renderLogs();
+      logItems = [];
+      logsNextBeforeId = null;
+      logsHasMore = false;
+      logsTotal = 0;
+      const container = document.getElementById('logs-body');
+      renderLogMessage(container, '暂无签到历史记录');
       showToast('历史日志已成功清空', 'success');
     } catch (e) {
       showToast('清空日志失败', 'error');
@@ -765,5 +871,8 @@ function clearLogs() {
 document.addEventListener('DOMContentLoaded', () => {
   loadSites();
   loadSettings();
-  loadLogs();
+  const logsBody = document.getElementById('logs-body');
+  if (logsBody) {
+    logsBody.addEventListener('scroll', handleLogsScroll);
+  }
 });
