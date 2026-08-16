@@ -76,8 +76,7 @@ function maskToken(val) {
 
 function getSiteId(site) {
   // Site IDs are transported as trimmed strings, matching the scheduler API.
-  if (!site || site.id === undefined || site.id === null) return '';
-  return String(site.id).trim();
+  return String(site?.id ?? '').trim();
 }
 
 function normalizeImpersonateValue(value) {
@@ -224,14 +223,14 @@ function renderSitesTable() {
 
     const nameCell = document.createElement('td');
     const name = document.createElement('strong');
-    name.textContent = site.name || '';
+    name.textContent = site.name;
     nameCell.appendChild(name);
     row.appendChild(nameCell);
 
     const typeCell = document.createElement('td');
     const typeBadge = document.createElement('span');
     typeBadge.className = `badge ${site.type === 'new-api' ? 'badge-success' : 'badge-info'}`;
-    typeBadge.textContent = site.type || 'new-api';
+    typeBadge.textContent = site.type;
     typeCell.appendChild(typeBadge);
     row.appendChild(typeCell);
 
@@ -239,7 +238,7 @@ function renderSitesTable() {
     const urlButton = document.createElement('button');
     urlButton.type = 'button';
     urlButton.className = 'link link-button';
-    urlButton.textContent = site.base_url || '';
+    urlButton.textContent = site.base_url;
     urlButton.addEventListener('click', () => openUrl(site.base_url));
     urlCell.appendChild(urlButton);
     row.appendChild(urlCell);
@@ -260,7 +259,7 @@ function renderSitesTable() {
     switchLabel.className = 'switch';
     const enabledInput = document.createElement('input');
     enabledInput.type = 'checkbox';
-    enabledInput.checked = site.enabled !== false;
+    enabledInput.checked = site.enabled === true;
     enabledInput.addEventListener('change', event => {
       toggleSiteEnabled(index, event.currentTarget.checked);
     });
@@ -279,7 +278,7 @@ function renderSitesTable() {
       '重新签到',
       'btn-success-plain',
       async () => {
-        if (!siteId || recheckButton.dataset.rechecking === 'true') return;
+        if (recheckButton.dataset.rechecking === 'true') return;
         recheckButton.disabled = true;
         recheckButton.dataset.rechecking = 'true';
         try {
@@ -292,10 +291,6 @@ function renderSitesTable() {
         }
       }
     );
-    if (!siteId) {
-      recheckButton.disabled = true;
-      recheckButton.title = '站点 ID 不可用，请先保存站点';
-    }
     actionButtons.push(
       recheckButton,
       createActionButton('测试', 'btn-primary-plain', () => testSingleSite(index)),
@@ -409,17 +404,17 @@ function openEditSiteModal(index) {
   isEdit = true;
   editIndex = index;
   document.getElementById('site-modal-title').textContent = '编辑中转站';
-  document.getElementById('site-name').value = site.name || '';
-  document.getElementById('site-type').value = site.type || 'new-api';
-  document.getElementById('site-url').value = site.base_url || '';
+  document.getElementById('site-name').value = site.name;
+  document.getElementById('site-type').value = site.type;
+  document.getElementById('site-url').value = site.base_url;
   const authType = site.auth_type === 'cookie' ? 'cookie' : 'bearer_token';
   document.querySelector(`input[name="auth_type"][value="${authType}"]`).checked = true;
   document.getElementById('site-solve-acw-sc-v2').checked = site.solve_acw_sc_v2 === true;
-  document.getElementById('site-auth-value').value = site.auth_value || '';
-  document.getElementById('site-endpoint').value = site.checkin_endpoint || '';
-  document.getElementById('site-proxy').value = site.proxy || '';
-  setHeadersFromText(site.custom_headers || '');
-  document.getElementById('site-enabled').checked = site.enabled !== false;
+  document.getElementById('site-auth-value').value = site.auth_value;
+  document.getElementById('site-endpoint').value = site.checkin_endpoint;
+  document.getElementById('site-proxy').value = site.proxy;
+  setHeadersFromText(site.custom_headers);
+  document.getElementById('site-enabled').checked = site.enabled === true;
   openModal('site-modal');
 }
 
@@ -441,7 +436,7 @@ async function submitSiteForm() {
   }
 
   const siteData = {
-    id: isEdit ? (sites[editIndex].id || 'site_' + Date.now()) : 'site_' + Date.now(),
+    id: isEdit ? sites[editIndex].id : 'site_' + Date.now(),
     name,
     type,
     base_url,
@@ -479,10 +474,6 @@ async function recheckInSite(index) {
   const site = sites[index];
   if (!site) return false;
   const siteId = getSiteId(site);
-  if (!siteId) {
-    showToast('站点 ID 不可用，请先保存站点', 'warning');
-    return false;
-  }
 
   const confirmed = await showConfirm(`确定要重新签到“${site.name}”吗？这会再次请求签到接口。`);
   if (!confirmed) return false;
@@ -558,14 +549,14 @@ async function loadSettings() {
 }
 
 function renderSettingsForm() {
-  document.getElementById('setting-enabled').checked = settings.enabled !== false;
-  const isRandom = settings.random_enabled !== false;
+  document.getElementById('setting-enabled').checked = settings.enabled === true;
+  const isRandom = settings.random_enabled === true;
   document.getElementById('setting-random').checked = isRandom;
-  document.getElementById('setting-start-time').value = settings.start_time || '08:00';
-  document.getElementById('setting-end-time').value = settings.end_time || '10:30';
-  document.getElementById('setting-fixed-time').value = settings.checkin_time || '08:30';
+  document.getElementById('setting-start-time').value = settings.start_time;
+  document.getElementById('setting-end-time').value = settings.end_time;
+  document.getElementById('setting-fixed-time').value = settings.checkin_time;
   document.getElementById('setting-http-ssl-verify').checked = settings.http_ssl_verify === true;
-  document.getElementById('setting-http-timeout').value = settings.http_timeout_seconds || 15;
+  document.getElementById('setting-http-timeout').value = settings.http_timeout_seconds;
   renderImpersonateOptions();
   toggleRandomMode();
 }
@@ -574,16 +565,11 @@ function renderImpersonateOptions() {
   const select = document.getElementById('setting-http-impersonate');
   if (!select) return;
 
-  const maxOptions = 128;
   const values = Array.isArray(settings.http_impersonate_options)
     ? settings.http_impersonate_options.map(normalizeImpersonateValue).filter(Boolean)
     : [];
   const normalizedCurrent = normalizeImpersonateValue(settings.http_impersonate);
-  const currentValueMissing = normalizedCurrent && !values.includes(normalizedCurrent);
-  if (currentValueMissing) {
-    values.unshift(normalizedCurrent);
-  }
-  const options = [...new Set(values)].slice(0, maxOptions);
+  const options = [...new Set(values)];
 
   select.replaceChildren();
   if (options.length === 0) {
@@ -599,16 +585,10 @@ function renderImpersonateOptions() {
   options.forEach(value => {
     const option = document.createElement('option');
     option.value = value;
-    option.textContent = currentValueMissing && value === normalizedCurrent
-      ? `${value}（当前配置，当前版本不可用）`
-      : value;
+    option.textContent = value;
     select.appendChild(option);
   });
-  if (options.includes(normalizedCurrent)) {
-    select.value = normalizedCurrent;
-  } else {
-    select.value = options[0];
-  }
+  select.value = options.includes(normalizedCurrent) ? normalizedCurrent : options[0];
 }
 
 function toggleRandomMode() {
@@ -636,7 +616,7 @@ async function saveSettings() {
     : 15;
   timeoutInputElement.value = String(http_timeout_seconds);
   const httpImpersonateSelect = document.getElementById('setting-http-impersonate');
-  const http_impersonate = httpImpersonateSelect?.value || settings.http_impersonate || '';
+  const http_impersonate = httpImpersonateSelect.value;
 
   settings = {
     enabled,
