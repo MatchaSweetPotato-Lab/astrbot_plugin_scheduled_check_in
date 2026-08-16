@@ -762,4 +762,3 @@ document.addEventListener('DOMContentLoaded', () => {
   loadSettings();
   loadLogs();
 });
-

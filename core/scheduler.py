@@ -347,4 +347,3 @@ class CheckInScheduler:
         lines.append(summary_line)
 
         return "\n".join(lines)
-

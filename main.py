@@ -398,7 +398,6 @@ class ScheduledCheckInPlugin(Star):
         results = await self.scheduler.run_check_in_all(manual=True)
         report = CheckInScheduler.format_report(results)
         yield event.plain_result(report)
-
     @filter.command("签到状态")
     async def cmd_status(
         self,
@@ -421,4 +420,3 @@ class ScheduledCheckInPlugin(Star):
 
         report = CheckInScheduler.format_report(results)
         yield event.plain_result(report)
-
