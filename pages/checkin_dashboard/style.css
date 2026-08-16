@@ -118,6 +118,17 @@ body {
   border-color: var(--success-hover);
 }
 
+.btn-success-plain {
+  color: var(--success-hover);
+  border-color: #86efac;
+  background: #f0fdf4;
+}
+
+.btn-success-plain:hover {
+  background: #dcfce7;
+  border-color: var(--success);
+}
+
 .btn-danger-plain {
   color: var(--danger);
   border-color: #fca5a5;

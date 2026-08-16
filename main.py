@@ -182,6 +182,7 @@ class ScheduledCheckInPlugin(Star):
             ("/api/sites", self.api_get_sites, ["GET"], "获取站点列表"),
             ("/api/sites", self.api_save_sites, ["POST"], "保存站点配置"),
             ("/api/sites/test", self.api_test_site, ["POST"], "测试站点连接"),
+            ("/api/sites/recheckin", self.api_recheckin_site, ["POST"], "重新签到单个站点"),
             ("/api/checkin/run", self.api_run_checkin, ["POST"], "触发一键打卡"),
             ("/api/settings", self.api_get_settings, ["GET"], "获取设置"),
             ("/api/settings", self.api_save_settings, ["POST"], "保存设置"),
@@ -235,6 +236,19 @@ class ScheduledCheckInPlugin(Star):
             result = await adapter.test_connection()
             self.record_history([result], log_type="test")
             return json_response(result.to_dict())
+
+    async def api_recheckin_site(self) -> Any:
+        """Web API: Force a check-in for one configured site."""
+        body = await request.json()
+        site_id = str(body.get("site_id", "")).strip()
+        if not site_id:
+            return json_response({"status": "error", "success": False, "message": "缺少站点 ID"})
+
+        result = await self.scheduler.run_check_in_site(site_id, manual=True)
+        if result is None:
+            return json_response({"status": "error", "success": False, "message": "站点不存在"})
+
+        return json_response({"status": "ok", "result": result.to_dict()})
 
     async def api_run_checkin(self) -> Any:
         """Web API: Trigger instant check-in.

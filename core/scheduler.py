@@ -261,6 +261,35 @@ class CheckInScheduler:
         self.plugin.record_history(results, log_type=log_type)
         return results
 
+    async def run_check_in_site(self, site_id: str, manual: bool = True) -> CheckInResult | None:
+        """Force a check-in for one configured site, ignoring today's skip state.
+
+        Args:
+            site_id: ID of the configured site to check in.
+            manual: Flag indicating whether this was triggered manually.
+
+        Returns:
+            The check-in result, or None if the site does not exist.
+        """
+        all_sites = self.plugin.get_sites()
+        site_config = next((s for s in all_sites if str(s.get("id", "")) == site_id), None)
+        if site_config is None:
+            return None
+
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
+            adapter = create_adapter(site_config, session)
+            result = await adapter.check_in()
+
+        now = datetime.now()
+        site_config["last_checkin_date"] = now.strftime("%Y-%m-%d")
+        site_config["last_checkin_time"] = now.strftime("%H:%M:%S")
+        site_config["last_checkin_success"] = result.success
+        site_config["last_quota"] = result.total_quota
+        self.plugin.save_sites(all_sites)
+        self.plugin.record_history([result], log_type="manual" if manual else "scheduled")
+        return result
+
     @staticmethod
     def format_report(results: list[CheckInResult]) -> str:
         """Format check-in results into a clean markdown report card.

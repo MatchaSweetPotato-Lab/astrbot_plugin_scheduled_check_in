@@ -184,6 +184,7 @@ function renderSitesTable() {
         </label>
       </td>
       <td style="text-align: right; padding-right: 24px;">
+        <button class="btn btn-sm btn-success-plain" style="margin-right: 6px;" onclick="recheckInSite(${index})">重新签到</button>
         <button class="btn btn-sm btn-primary-plain" style="margin-right: 6px;" onclick="testSingleSite(${index})">测试</button>
         <button class="btn btn-sm" style="margin-right: 6px;" onclick="openEditSiteModal(${index})">编辑</button>
         <button class="btn btn-sm btn-danger-plain" onclick="deleteSite(${index})">删除</button>
@@ -342,6 +343,27 @@ function deleteSite(index) {
     sites.splice(index, 1);
     renderSitesTable();
     await saveSites();
+  });
+}
+
+function recheckInSite(index) {
+  const site = sites[index];
+  if (!site) return;
+
+  showConfirm(`确定要重新签到“${site.name}”吗？这会再次请求签到接口。`, async () => {
+    try {
+      const data = await apiPost('/api/sites/recheckin', { site_id: site.id });
+      const result = data?.result;
+      if (result?.success) {
+        showToast(`${site.name}: ${result.message || '重新签到成功'}`, 'success');
+      } else {
+        showToast(`${site.name}: ${result?.message || data?.message || '重新签到失败'}`, 'error');
+      }
+      await loadSites();
+      await loadLogs();
+    } catch (e) {
+      showToast('重新签到请求失败', 'error');
+    }
   });
 }
 
