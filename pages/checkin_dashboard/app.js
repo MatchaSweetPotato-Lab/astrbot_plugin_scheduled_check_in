@@ -9,7 +9,7 @@ let settings = {
   start_time: '08:00',
   end_time: '10:30',
   checkin_time: '08:30',
-  http_ssl_verify: false,
+  http_ssl_verify: true,
   http_timeout_seconds: 15
 };
 let logs = [];

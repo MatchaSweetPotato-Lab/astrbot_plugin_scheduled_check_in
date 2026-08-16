@@ -23,7 +23,8 @@ def _get_timeout_seconds(settings: Mapping[str, Any]) -> float:
 def create_client_session(settings: Mapping[str, Any] | None = None) -> aiohttp.ClientSession:
     """Create an HTTP session from the shared plugin request settings."""
     settings = settings or {}
-    ssl_verify = settings.get("http_ssl_verify", False) is True
+    # Verify TLS certificates by default; callers must explicitly opt out.
+    ssl_verify = settings.get("http_ssl_verify", True) is True
     timeout_seconds = _get_timeout_seconds(settings)
     return aiohttp.ClientSession(
         connector=aiohttp.TCPConnector(ssl=ssl_verify),

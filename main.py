@@ -107,7 +107,7 @@ class ScheduledCheckInPlugin(Star):
             "start_time": "08:00",
             "end_time": "10:30",
             "checkin_time": "08:30",
-            "http_ssl_verify": False,
+            "http_ssl_verify": True,
             "http_timeout_seconds": 15,
         }
         if not self.settings_file.exists():
