@@ -148,7 +148,6 @@ class BaseCheckInAdapter(ABC):
         method: str,
         url: str,
         headers: dict[str, str],
-        timeout: int,
     ) -> _TextResponse:
         """Request text and optionally solve one inline ``acw_sc__v2`` challenge."""
         request_headers = self._merge_challenge_cookies(headers)
@@ -157,7 +156,6 @@ class BaseCheckInAdapter(ABC):
             url,
             headers=request_headers,
             proxy=self.proxy,
-            timeout=float(timeout),
             impersonate=self.impersonate,
         )
         status = response.status_code
@@ -191,7 +189,6 @@ class BaseCheckInAdapter(ABC):
             url,
             headers=retry_headers,
             proxy=self.proxy,
-            timeout=float(timeout),
             impersonate=self.impersonate,
         )
         retry_status = retry_response.status_code
@@ -250,7 +247,7 @@ class NewApiAdapter(BaseCheckInAdapter):
         """
         url = f"{self.base_url}/api/user/self"
         try:
-            response = await self._request_text("GET", url, headers, timeout=10)
+            response = await self._request_text("GET", url, headers)
             if response.status in (401, 403):
                 return 0.0, True, "鉴权失败：Token 或 Cookie 无效 (401/403)"
 
@@ -315,7 +312,7 @@ class NewApiAdapter(BaseCheckInAdapter):
 
         for endpoint in endpoints:
             try:
-                response = await self._request_text("POST", endpoint, headers, timeout=10)
+                response = await self._request_text("POST", endpoint, headers)
                 if response.status in (401, 403):
                     expired = True
                     last_message = "Token 或 Cookie 已失效 (401/403)"
@@ -324,7 +321,7 @@ class NewApiAdapter(BaseCheckInAdapter):
                 data = None
                 if response.status == 405:
                     # Fall back to GET if POST is not allowed (e.g., /api/user/self)
-                    get_response = await self._request_text("GET", endpoint, headers, timeout=10)
+                    get_response = await self._request_text("GET", endpoint, headers)
                     if is_acw_sc_v2_challenge(get_response.text):
                         last_message = self._waf_message(get_response)
                     elif get_response.status == 200 and "<html" not in get_response.text.lower():
@@ -382,7 +379,7 @@ class NewApiAdapter(BaseCheckInAdapter):
             # Fallback probe on /v1/models to verify if API key works
             models_url = f"{self.base_url}/v1/models"
             try:
-                models_response = await self._request_text("GET", models_url, headers, timeout=8)
+                models_response = await self._request_text("GET", models_url, headers)
                 if models_response.status == 200:
                     m_text = models_response.text
                     if "model" in m_text.lower() and "<html" not in m_text.lower():
@@ -420,7 +417,7 @@ class GenericRestAdapter(BaseCheckInAdapter):
         method = self.config.get("method", "POST").upper()
 
         try:
-            response = await self._request_text(method, url, headers, timeout=10)
+            response = await self._request_text(method, url, headers)
             status_code = response.status
             text_clean = response.text.strip()
 

@@ -28,6 +28,7 @@ class CheckInScheduler:
         self._today_target_time: str = ""
         self._tomorrow_target_time: str = ""
         self._today_date_str: str = ""
+        self._persistence_lock = asyncio.Lock()
 
     def reset_today_target_time(self) -> None:
         """Reset cached target time when settings are updated."""
@@ -176,17 +177,34 @@ class CheckInScheduler:
         """Record check-in results using the same log type for all flows."""
         self.plugin.record_history(results, log_type="manual" if manual else "scheduled")
 
-    def _persist_checkin_results(
+    async def _persist_checkin_results(
         self,
-        all_sites: list[dict[str, Any]],
         results: list[CheckInResult],
         manual: bool,
-        persist_sites: bool = True,
+        site_ids_to_update: set[str] | None = None,
+        checked_at: datetime | None = None,
     ) -> None:
-        """Persist site changes and record a history entry for check-in results."""
-        if persist_sites:
-            self.plugin.save_sites(all_sites)
-        self._record_checkin_history(results, manual)
+        """Merge results into the latest configuration and record history.
+
+        Check-in requests may run while the web UI edits sites or while another
+        check-in is completing.  Reloading under a scheduler-wide lock keeps
+        those operations from writing an older full-list snapshot over newer
+        configuration changes.
+        """
+        async with self._persistence_lock:
+            if site_ids_to_update:
+                latest_sites = self.plugin.get_sites()
+                result_by_site_id = {
+                    str(result.site_id): result
+                    for result in results
+                    if str(result.site_id) in site_ids_to_update
+                }
+                for site_config in latest_sites:
+                    result = result_by_site_id.get(str(site_config.get("id", "")))
+                    if result is not None:
+                        self._update_site_checkin_state(site_config, result, checked_at)
+                self.plugin.save_sites(latest_sites)
+            self._record_checkin_history(results, manual)
 
     async def _scheduler_loop(self) -> None:
         """Internal background loop running check-ins at configured daily time window."""
@@ -234,7 +252,7 @@ class CheckInScheduler:
 
         checked_at = datetime.now()
         today_str = checked_at.strftime("%Y-%m-%d")
-        sites_updated = False
+        site_ids_to_update: set[str] = set()
 
         async with create_client_session(settings) as session:
             for idx, site_config in enumerate(enabled_sites):
@@ -270,7 +288,7 @@ class CheckInScheduler:
                 results.append(result)
 
                 self._update_site_checkin_state(site_config, result, checked_at)
-                sites_updated = True
+                site_ids_to_update.add(str(site_id))
 
         # Clear temporary manual_target_time override after check-in execution
         if settings.get("manual_target_time"):
@@ -278,7 +296,7 @@ class CheckInScheduler:
             self.plugin.save_settings(settings)
             self.reset_today_target_time()
 
-        self._persist_checkin_results(all_sites, results, manual, persist_sites=sites_updated)
+        await self._persist_checkin_results(results, manual, site_ids_to_update, checked_at)
         return results
 
     async def run_check_in_site(self, site_id: str, manual: bool = True) -> CheckInResult | None:
@@ -304,8 +322,7 @@ class CheckInScheduler:
             )
             result = await adapter.check_in()
 
-        self._update_site_checkin_state(site_config, result)
-        self._persist_checkin_results(all_sites, [result], manual)
+        await self._persist_checkin_results([result], manual, {str(site_id)})
         return result
 
     @staticmethod

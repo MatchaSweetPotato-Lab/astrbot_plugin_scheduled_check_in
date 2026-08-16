@@ -24,7 +24,11 @@ def _get_timeout_seconds(settings: Mapping[str, Any]) -> float:
 
 def get_impersonate_options() -> list[str]:
     """Return the browser fingerprints exposed by the installed curl_cffi build."""
-    return list(_IMPERSONATE_OPTIONS)
+    options = list(_IMPERSONATE_OPTIONS)
+    if DEFAULT_IMPERSONATE in options:
+        options.remove(DEFAULT_IMPERSONATE)
+        options.insert(0, DEFAULT_IMPERSONATE)
+    return options
 
 
 def normalize_impersonate(value: Any) -> str:

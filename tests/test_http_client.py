@@ -33,6 +33,7 @@ class HttpClientConfigurationTests(unittest.IsolatedAsyncioTestCase):
     async def test_uses_configured_fingerprint_from_curl_cffi_options(self) -> None:
         options = get_impersonate_options()
         self.assertIn(DEFAULT_IMPERSONATE, options)
+        self.assertEqual(options[0], DEFAULT_IMPERSONATE)
 
         session = create_client_session({"http_impersonate": "chrome120"})
         try:

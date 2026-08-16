@@ -573,14 +573,7 @@ function renderImpersonateOptions() {
   const values = Array.isArray(settings.http_impersonate_options)
     ? settings.http_impersonate_options.filter(value => typeof value === 'string' && value.trim())
     : [];
-  const uniqueValues = [...new Set(values)];
-  const fallback = uniqueValues.includes('chrome131')
-    ? 'chrome131'
-    : (uniqueValues[0] || '');
-  const selected = uniqueValues.includes(settings.http_impersonate)
-    ? settings.http_impersonate
-    : fallback;
-  const options = [...new Set([fallback, selected, ...uniqueValues].filter(Boolean))].slice(0, maxOptions);
+  const options = [...new Set(values)].slice(0, maxOptions);
 
   select.replaceChildren();
   if (options.length === 0) {
@@ -596,10 +589,14 @@ function renderImpersonateOptions() {
   options.forEach(value => {
     const option = document.createElement('option');
     option.value = value;
-    option.textContent = value === fallback ? `${value}（默认）` : value;
+    option.textContent = value;
     select.appendChild(option);
   });
-  select.value = selected;
+  if (options.includes(settings.http_impersonate)) {
+    select.value = settings.http_impersonate;
+  } else {
+    select.value = options[0];
+  }
 }
 
 function toggleRandomMode() {
