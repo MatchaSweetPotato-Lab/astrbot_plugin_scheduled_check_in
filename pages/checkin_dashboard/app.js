@@ -574,6 +574,13 @@ function renderImpersonateOptions() {
   const values = Array.isArray(settings.http_impersonate_options)
     ? settings.http_impersonate_options.filter(value => typeof value === 'string' && value.trim())
     : [];
+  const normalizedCurrent = typeof settings.http_impersonate === 'string'
+    ? settings.http_impersonate.trim().toLowerCase()
+    : '';
+  const currentValueMissing = normalizedCurrent && !values.includes(normalizedCurrent);
+  if (currentValueMissing) {
+    values.unshift(normalizedCurrent);
+  }
   const options = [...new Set(values)].slice(0, maxOptions);
 
   select.replaceChildren();
@@ -590,7 +597,9 @@ function renderImpersonateOptions() {
   options.forEach(value => {
     const option = document.createElement('option');
     option.value = value;
-    option.textContent = value;
+    option.textContent = currentValueMissing && value === normalizedCurrent
+      ? `${value}（当前配置，当前版本不可用）`
+      : value;
     select.appendChild(option);
   });
   if (options.includes(settings.http_impersonate)) {
