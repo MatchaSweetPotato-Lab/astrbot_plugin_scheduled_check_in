@@ -89,12 +89,18 @@
           </div>
           <div class="form-group">
             <label>鉴权方式</label>
-            <div class="radio-group">
-              <label class="radio-label">
-                <input type="radio" name="auth_type" value="bearer_token" checked /> Bearer Token
-              </label>
-              <label class="radio-label">
-                <input type="radio" name="auth_type" value="cookie" /> Cookie
+            <div class="auth-options-row">
+              <div class="radio-group">
+                <label class="radio-label">
+                  <input type="radio" name="auth_type" value="bearer_token" checked /> Bearer Token
+                </label>
+                <label class="radio-label">
+                  <input type="radio" name="auth_type" value="cookie" /> Cookie
+                </label>
+              </div>
+              <label class="checkbox-label" title="遇到阿里云 WAF JavaScript 挑战时，使用纯 Python 解算并自动重试">
+                <input type="checkbox" id="site-solve-acw-sc-v2" />
+                <span>解算acw_sc__v2(Beta)</span>
               </label>
             </div>
           </div>

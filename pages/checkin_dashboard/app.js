@@ -351,6 +351,7 @@ function openAddSiteModal() {
   document.getElementById('site-type').value = 'new-api';
   document.getElementById('site-url').value = '';
   document.querySelector('input[name="auth_type"][value="bearer_token"]').checked = true;
+  document.getElementById('site-solve-acw-sc-v2').checked = false;
   document.getElementById('site-auth-value').value = '';
   document.getElementById('site-endpoint').value = '';
   document.getElementById('site-proxy').value = '';
@@ -370,6 +371,7 @@ function openEditSiteModal(index) {
   document.getElementById('site-url').value = site.base_url || '';
   const authType = site.auth_type === 'cookie' ? 'cookie' : 'bearer_token';
   document.querySelector(`input[name="auth_type"][value="${authType}"]`).checked = true;
+  document.getElementById('site-solve-acw-sc-v2').checked = site.solve_acw_sc_v2 === true;
   document.getElementById('site-auth-value').value = site.auth_value || '';
   document.getElementById('site-endpoint').value = site.checkin_endpoint || '';
   document.getElementById('site-proxy').value = site.proxy || '';
@@ -383,6 +385,7 @@ async function submitSiteForm() {
   const type = document.getElementById('site-type').value;
   const base_url = document.getElementById('site-url').value.trim();
   const auth_type = document.querySelector('input[name="auth_type"]:checked').value;
+  const solve_acw_sc_v2 = document.getElementById('site-solve-acw-sc-v2').checked;
   const auth_value = document.getElementById('site-auth-value').value.trim();
   const checkin_endpoint = document.getElementById('site-endpoint').value.trim();
   const proxy = document.getElementById('site-proxy').value.trim();
@@ -400,6 +403,7 @@ async function submitSiteForm() {
     type,
     base_url,
     auth_type,
+    solve_acw_sc_v2,
     auth_value,
     checkin_endpoint,
     proxy,
