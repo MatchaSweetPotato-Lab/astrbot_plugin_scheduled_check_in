@@ -15,6 +15,7 @@ let settings = {
 let logs = [];
 let isEdit = false;
 let editIndex = -1;
+let activeConfirmResolver = null;
 
 // Helper: Toast Notifications
 function showToast(message, type = 'success') {
@@ -33,14 +34,34 @@ function showToast(message, type = 'success') {
 function showConfirm(message, onConfirm) {
   const msgEl = document.getElementById('confirm-message');
   const okBtn = document.getElementById('confirm-ok-btn');
-  if (msgEl) msgEl.textContent = message;
-  if (okBtn) {
-    okBtn.onclick = () => {
-      closeModal('confirm-modal');
-      onConfirm();
-    };
+  if (activeConfirmResolver) {
+    activeConfirmResolver(false);
+    activeConfirmResolver = null;
   }
-  openModal('confirm-modal');
+  if (msgEl) msgEl.textContent = message;
+  return new Promise(resolve => {
+    activeConfirmResolver = resolve;
+    if (okBtn) {
+      okBtn.onclick = async () => {
+        activeConfirmResolver = null;
+        closeModal('confirm-modal');
+        if (onConfirm) await onConfirm();
+        resolve(true);
+      };
+    }
+    openModal('confirm-modal');
+  });
+}
+
+function cancelConfirm() {
+  if (activeConfirmResolver) {
+    const resolve = activeConfirmResolver;
+    activeConfirmResolver = null;
+    closeModal('confirm-modal');
+    resolve(false);
+    return;
+  }
+  closeModal('confirm-modal');
 }
 
 // Helper: Mask credentials
@@ -110,7 +131,11 @@ function closeModal(id) {
 
 function handleOverlayClick(event, id) {
   if (event.target.id === id) {
-    closeModal(id);
+    if (id === 'confirm-modal') {
+      cancelConfirm();
+    } else {
+      closeModal(id);
+    }
   }
 }
 
@@ -246,7 +271,19 @@ function renderSitesTable() {
     const recheckButton = createActionButton(
       '重新签到',
       'btn-success-plain',
-      () => recheckInSite(index)
+      async () => {
+        if (!siteId || recheckButton.dataset.rechecking === 'true') return;
+        recheckButton.disabled = true;
+        recheckButton.dataset.rechecking = 'true';
+        try {
+          await recheckInSite(index);
+        } finally {
+          if (getSiteId(sites[index]) === siteId) {
+            recheckButton.disabled = false;
+          }
+          delete recheckButton.dataset.rechecking;
+        }
+      }
     );
     if (!siteId) {
       recheckButton.disabled = true;
@@ -431,30 +468,32 @@ function deleteSite(index) {
   });
 }
 
-function recheckInSite(index) {
+async function recheckInSite(index) {
   const site = sites[index];
-  if (!site) return;
+  if (!site) return false;
   const siteId = getSiteId(site);
   if (!siteId) {
     showToast('站点 ID 不可用，请先保存站点', 'warning');
-    return;
+    return false;
   }
 
-  showConfirm(`确定要重新签到“${site.name}”吗？这会再次请求签到接口。`, async () => {
-    try {
-      const data = await apiPost('/api/sites/recheckin', { site_id: siteId });
-      const result = data?.result;
-      if (result?.success) {
-        showToast(`${site.name}: ${result.message || '重新签到成功'}`, 'success');
-      } else {
-        showToast(`${site.name}: ${result?.message || data?.message || '重新签到失败'}`, 'error');
-      }
-      await loadSites();
-      await loadLogs();
-    } catch (e) {
-      showToast('重新签到请求失败', 'error');
+  const confirmed = await showConfirm(`确定要重新签到“${site.name}”吗？这会再次请求签到接口。`);
+  if (!confirmed) return false;
+
+  try {
+    const data = await apiPost('/api/sites/recheckin', { site_id: siteId });
+    const result = data?.result;
+    if (result?.success) {
+      showToast(`${site.name}: ${result.message || '重新签到成功'}`, 'success');
+    } else {
+      showToast(`${site.name}: ${result?.message || data?.message || '重新签到失败'}`, 'error');
     }
-  });
+    await loadSites();
+    await loadLogs();
+  } catch (e) {
+    showToast('重新签到请求失败', 'error');
+  }
+  return true;
 }
 
 async function testSingleSite(index) {

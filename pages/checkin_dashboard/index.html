@@ -215,13 +215,13 @@
       <div class="modal-card" style="max-width: 400px;">
         <div class="modal-header">
           <h3 id="confirm-title">确认操作</h3>
-          <button class="modal-close" onclick="closeModal('confirm-modal')">&times;</button>
+          <button class="modal-close" onclick="cancelConfirm()">&times;</button>
         </div>
         <div class="modal-body">
           <p id="confirm-message" style="margin: 0; color: #475569; font-size: 14px;"></p>
         </div>
         <div class="modal-footer">
-          <button class="btn" onclick="closeModal('confirm-modal')">取消</button>
+          <button class="btn" onclick="cancelConfirm()">取消</button>
           <button id="confirm-ok-btn" class="btn btn-danger-plain">确定</button>
         </div>
       </div>
