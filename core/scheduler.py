@@ -207,7 +207,7 @@ class CheckInScheduler:
         self,
         results: list[CheckInResult],
         manual: bool,
-        site_ids_to_update: set[str] | None = None,
+        site_results_to_persist: list[CheckInResult] | None = None,
         checked_at: datetime | None = None,
     ) -> None:
         """Merge results into the latest configuration and record history.
@@ -218,20 +218,41 @@ class CheckInScheduler:
         configuration changes.
         """
         async with self._persistence_lock:
-            if site_ids_to_update:
+            if site_results_to_persist:
                 latest_sites = self.plugin.get_sites()
                 result_by_site_id = {
                     self._normalize_site_id(result.site_id): result
-                    for result in results
-                    if self._normalize_site_id(result.site_id) in site_ids_to_update
+                    for result in site_results_to_persist
+                    if self._normalize_site_id(result.site_id)
                 }
+                sites_changed = False
                 for site_config in latest_sites:
                     result = result_by_site_id.get(
                         self._normalize_site_id(site_config.get("id"))
                     )
                     if result is not None:
                         self._update_site_checkin_state(site_config, result, checked_at)
-                self.plugin.save_sites(latest_sites)
+                        sites_changed = True
+
+                anonymous_results = [
+                    result
+                    for result in site_results_to_persist
+                    if not self._normalize_site_id(result.site_id)
+                ]
+                anonymous_sites = [
+                    site
+                    for site in latest_sites
+                    if not self._normalize_site_id(site.get("id"))
+                ]
+                # Legacy ID-less sites have no stable join key; only merge
+                # them when the latest configuration has the same cardinality.
+                if anonymous_results and len(anonymous_results) == len(anonymous_sites):
+                    for site_config, result in zip(anonymous_sites, anonymous_results):
+                        self._update_site_checkin_state(site_config, result, checked_at)
+                    sites_changed = True
+
+                if sites_changed:
+                    self.plugin.save_sites(latest_sites)
             self._record_checkin_history(results, manual)
 
     async def _scheduler_loop(self) -> None:
@@ -280,7 +301,7 @@ class CheckInScheduler:
 
         checked_at = datetime.now()
         today_str = checked_at.strftime("%Y-%m-%d")
-        site_ids_to_update: set[str] = set()
+        site_results_to_persist: list[CheckInResult] = []
 
         async with create_client_session(settings) as session:
             for idx, site_config in enumerate(enabled_sites):
@@ -314,9 +335,7 @@ class CheckInScheduler:
                 )
                 result = await adapter.check_in()
                 results.append(result)
-
-                if site_id:
-                    site_ids_to_update.add(site_id)
+                site_results_to_persist.append(result)
 
         # Clear temporary manual_target_time override after check-in execution
         if settings.get("manual_target_time"):
@@ -324,7 +343,9 @@ class CheckInScheduler:
             self.plugin.save_settings(settings)
             self.reset_today_target_time()
 
-        await self._persist_checkin_results(results, manual, site_ids_to_update, checked_at)
+        await self._persist_checkin_results(
+            results, manual, site_results_to_persist, checked_at
+        )
         return results
 
     async def run_check_in_site(self, site_id: str, manual: bool = True) -> CheckInResult | None:
@@ -353,7 +374,7 @@ class CheckInScheduler:
             result = await adapter.check_in()
 
         await self._persist_checkin_results(
-            [result], manual, {normalized_site_id}, checked_at
+            [result], manual, [result], checked_at
         )
         return result
 
