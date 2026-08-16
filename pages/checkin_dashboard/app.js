@@ -202,15 +202,12 @@ function renderSitesTable() {
     row.appendChild(typeCell);
 
     const urlCell = document.createElement('td');
-    const urlLink = document.createElement('a');
-    urlLink.className = 'link';
-    urlLink.href = '#';
-    urlLink.textContent = site.base_url || '';
-    urlLink.addEventListener('click', event => {
-      event.preventDefault();
-      openUrl(site.base_url);
-    });
-    urlCell.appendChild(urlLink);
+    const urlButton = document.createElement('button');
+    urlButton.type = 'button';
+    urlButton.className = 'link link-button';
+    urlButton.textContent = site.base_url || '';
+    urlButton.addEventListener('click', () => openUrl(site.base_url));
+    urlCell.appendChild(urlButton);
     row.appendChild(urlCell);
 
     const statusCell = document.createElement('td');

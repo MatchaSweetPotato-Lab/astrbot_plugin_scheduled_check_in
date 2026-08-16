@@ -241,6 +241,14 @@ table.custom-table tr:last-child td {
   text-decoration: underline;
 }
 
+.link-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+}
+
 /* Switch Component */
 .switch {
   position: relative;
