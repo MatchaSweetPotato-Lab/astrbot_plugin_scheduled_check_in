@@ -33,9 +33,6 @@
   - 能精准识别阿里云 ESA / Tengine 等 WAF 返回的 HTML 验证页（`acw_sc`），杜绝“200 OK 假成功”误报。
   - 管理接口被拦截时，会自动尝试探测 `/v1/models` 模型接口，明确区分“API Key 有效”与“WAF 拦截”。
 
-- **🖥️ 浏览器指纹请求**
-  - 网络请求使用 `curl_cffi>=0.14.0,<1.0.0`，可在 Web「全局设置」中选择当前库支持的指纹，默认使用 `chrome131`。
-
 - **🧩 可选 acw_sc__v2 纯 Python 解算 (Beta)**
   - 在站点编辑页勾选 **`解算acw_sc__v2(Beta)`** 后，可把响应中的 JavaScript 重排与 XOR 算法转换成 Python 代码并自动重试原请求。
   - 转换结果按算法指纹缓存，动态 `arg1` 变化不会重复写入；仅在重排表或 XOR 密钥变化时新增缓存。
@@ -73,7 +70,7 @@
 `data/plugin_data/astrbot_plugin_scheduled_check_in/`
 
 - `sites.json`：保存中转站配置及今日打卡完成状态。
-- `settings.json`：保存定时打卡、时间窗口、HTTP 参数与浏览器指纹设置。
+- `settings.json`：保存定时打卡与时间窗口设置。
 - `history.json`：保存历史打卡/测试日志记录。
 - `acw_sc_v2_cache.json`：保存已验证算法转换生成的 Python 源码，仅在启用 Beta 解算后创建。
 

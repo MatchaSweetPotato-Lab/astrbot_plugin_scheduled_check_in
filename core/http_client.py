@@ -3,14 +3,12 @@
 from collections.abc import Mapping
 from typing import Any
 
-from curl_cffi.requests import AsyncSession, BrowserType
+import aiohttp
 
 
 DEFAULT_TIMEOUT_SECONDS = 15.0
 MIN_TIMEOUT_SECONDS = 1.0
 MAX_TIMEOUT_SECONDS = 300.0
-DEFAULT_IMPERSONATE = "chrome131"
-_IMPERSONATE_OPTIONS = tuple(browser.value for browser in BrowserType)
 
 
 def _get_timeout_seconds(settings: Mapping[str, Any]) -> float:
@@ -22,37 +20,14 @@ def _get_timeout_seconds(settings: Mapping[str, Any]) -> float:
     return max(MIN_TIMEOUT_SECONDS, min(timeout, MAX_TIMEOUT_SECONDS))
 
 
-def get_impersonate_options() -> list[str]:
-    """Return the browser fingerprints exposed by the installed curl_cffi build."""
-    options = list(_IMPERSONATE_OPTIONS)
-    if DEFAULT_IMPERSONATE in options:
-        options.remove(DEFAULT_IMPERSONATE)
-        options.insert(0, DEFAULT_IMPERSONATE)
-    return options
-
-
-def normalize_impersonate(value: Any) -> str:
-    """Validate a configured fingerprint and fall back to a supported default."""
-    if isinstance(value, str):
-        normalized_value = value.strip().lower()
-        if normalized_value in _IMPERSONATE_OPTIONS:
-            return normalized_value
-    if DEFAULT_IMPERSONATE in _IMPERSONATE_OPTIONS:
-        return DEFAULT_IMPERSONATE
-    if _IMPERSONATE_OPTIONS:
-        return _IMPERSONATE_OPTIONS[0]
-    return DEFAULT_IMPERSONATE
-
-
-def create_client_session(settings: Mapping[str, Any] | None = None) -> AsyncSession:
-    """Create a curl_cffi session with the plugin's shared request settings."""
+def create_client_session(settings: Mapping[str, Any] | None = None) -> aiohttp.ClientSession:
+    """Create an HTTP session from the shared plugin request settings."""
     settings = settings or {}
     # Verify TLS certificates by default; callers must explicitly opt out.
-    ssl_verify = settings.get("http_ssl_verify", True) is not False
+    ssl_verify = settings.get("http_ssl_verify", True) is True
     timeout_seconds = _get_timeout_seconds(settings)
-    return AsyncSession(
-        impersonate=normalize_impersonate(settings.get("http_impersonate")),
-        verify=ssl_verify,
+    return aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(ssl=ssl_verify),
         trust_env=True,
-        timeout=timeout_seconds,
+        timeout=aiohttp.ClientTimeout(total=timeout_seconds),
     )
