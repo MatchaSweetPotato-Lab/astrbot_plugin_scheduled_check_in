@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import unittest
+from http.cookies import SimpleCookie
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -150,9 +151,25 @@ document.cookie='acw_sc__v2='+result;
 
 class _FakeResponse:
     def __init__(self, status: int, text: str, cookies: dict[str, str] | None = None) -> None:
-        self.status_code = status
-        self.text = text
-        self.cookies = cookies or {}
+        self.status = status
+        self._text = text
+        self.cookies = SimpleCookie()
+        for name, value in (cookies or {}).items():
+            self.cookies[name] = value
+
+    async def text(self) -> str:
+        return self._text
+
+
+class _FakeRequestContext:
+    def __init__(self, response: _FakeResponse) -> None:
+        self.response = response
+
+    async def __aenter__(self) -> _FakeResponse:
+        return self.response
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        return None
 
 
 class _FakeSession:
@@ -160,9 +177,9 @@ class _FakeSession:
         self.responses = responses
         self.requests: list[dict[str, object]] = []
 
-    async def request(self, method: str, url: str, **kwargs) -> _FakeResponse:
+    def request(self, method: str, url: str, **kwargs) -> _FakeRequestContext:
         self.requests.append({"method": method, "url": url, **kwargs})
-        return self.responses.pop(0)
+        return _FakeRequestContext(self.responses.pop(0))
 
 
 class ChallengeAwareRequestTests(unittest.IsolatedAsyncioTestCase):
@@ -200,9 +217,6 @@ class ChallengeAwareRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.message, 'HTTP 401: {"success":false,"message":"unauthorized"}')
         self.assertEqual(len(session.requests), 2)
-        self.assertTrue(
-            all(request["impersonate"] == "chrome131" for request in session.requests)
-        )
         retry_headers = session.requests[1]["headers"]
         self.assertIsInstance(retry_headers, dict)
         cookie_headers = {
