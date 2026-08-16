@@ -49,6 +49,11 @@ function maskToken(val) {
   return token.substring(0, 4) + '***' + token.substring(token.length - 4);
 }
 
+function getSiteId(site) {
+  if (!site || site.id === undefined || site.id === null) return '';
+  return String(site.id).trim();
+}
+
 // Helper: Open URL
 function openUrl(url) {
   if (!url) return;
@@ -237,12 +242,24 @@ function renderSitesTable() {
     const actionsCell = document.createElement('td');
     actionsCell.style.textAlign = 'right';
     actionsCell.style.paddingRight = '24px';
-    actionsCell.append(
-      createActionButton('重新签到', 'btn-success-plain', () => recheckInSite(index)),
+    const actionButtons = [];
+    const siteId = getSiteId(site);
+    const recheckButton = createActionButton(
+      '重新签到',
+      'btn-success-plain',
+      () => recheckInSite(index)
+    );
+    if (!siteId) {
+      recheckButton.disabled = true;
+      recheckButton.title = '站点 ID 不可用，请先保存站点';
+    }
+    actionButtons.push(
+      recheckButton,
       createActionButton('测试', 'btn-primary-plain', () => testSingleSite(index)),
       createActionButton('编辑', '', () => openEditSiteModal(index)),
       createActionButton('删除', 'btn-danger-plain', () => deleteSite(index), false)
     );
+    actionsCell.append(...actionButtons);
     row.appendChild(actionsCell);
     tbody.appendChild(row);
   });
@@ -414,10 +431,15 @@ function deleteSite(index) {
 function recheckInSite(index) {
   const site = sites[index];
   if (!site) return;
+  const siteId = getSiteId(site);
+  if (!siteId) {
+    showToast('站点 ID 不可用，请先保存站点', 'warning');
+    return;
+  }
 
   showConfirm(`确定要重新签到“${site.name}”吗？这会再次请求签到接口。`, async () => {
     try {
-      const data = await apiPost('/api/sites/recheckin', { site_id: site.id });
+      const data = await apiPost('/api/sites/recheckin', { site_id: siteId });
       const result = data?.result;
       if (result?.success) {
         showToast(`${site.name}: ${result.message || '重新签到成功'}`, 'success');
