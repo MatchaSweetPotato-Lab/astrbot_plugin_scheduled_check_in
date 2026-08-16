@@ -173,6 +173,28 @@ class CheckInScheduler:
         site_config["last_checkin_success"] = result.success
         site_config["last_quota"] = result.total_quota
 
+    @staticmethod
+    def _normalize_site_id(value: Any) -> str:
+        """Normalize site IDs at the scheduler persistence boundary."""
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    @classmethod
+    def _find_site_config(
+        cls, sites: list[dict[str, Any]], site_id: Any
+    ) -> dict[str, Any] | None:
+        """Find a site using the same normalized ID rules as persistence."""
+        normalized_site_id = cls._normalize_site_id(site_id)
+        return next(
+            (
+                site
+                for site in sites
+                if cls._normalize_site_id(site.get("id")) == normalized_site_id
+            ),
+            None,
+        )
+
     def _record_checkin_history(self, results: list[CheckInResult], manual: bool) -> None:
         """Record check-in results using the same log type for all flows."""
         self.plugin.record_history(results, log_type="manual" if manual else "scheduled")
@@ -195,12 +217,14 @@ class CheckInScheduler:
             if site_ids_to_update:
                 latest_sites = self.plugin.get_sites()
                 result_by_site_id = {
-                    str(result.site_id): result
+                    self._normalize_site_id(result.site_id): result
                     for result in results
-                    if str(result.site_id) in site_ids_to_update
+                    if self._normalize_site_id(result.site_id) in site_ids_to_update
                 }
                 for site_config in latest_sites:
-                    result = result_by_site_id.get(str(site_config.get("id", "")))
+                    result = result_by_site_id.get(
+                        self._normalize_site_id(site_config.get("id"))
+                    )
                     if result is not None:
                         self._update_site_checkin_state(site_config, result, checked_at)
                 self.plugin.save_sites(latest_sites)
@@ -256,7 +280,7 @@ class CheckInScheduler:
 
         async with create_client_session(settings) as session:
             for idx, site_config in enumerate(enabled_sites):
-                site_id = site_config.get("id", "")
+                site_id = self._normalize_site_id(site_config.get("id"))
                 site_name = site_config.get("name", "Unknown Site")
                 last_date = site_config.get("last_checkin_date", "")
                 last_success = site_config.get("last_checkin_success", False)
@@ -288,7 +312,8 @@ class CheckInScheduler:
                 results.append(result)
 
                 self._update_site_checkin_state(site_config, result, checked_at)
-                site_ids_to_update.add(str(site_id))
+                if site_id:
+                    site_ids_to_update.add(site_id)
 
         # Clear temporary manual_target_time override after check-in execution
         if settings.get("manual_target_time"):
@@ -309,8 +334,10 @@ class CheckInScheduler:
         Returns:
             The check-in result, or None if the site does not exist.
         """
+        checked_at = datetime.now()
         all_sites = self.plugin.get_sites()
-        site_config = next((s for s in all_sites if str(s.get("id", "")) == site_id), None)
+        normalized_site_id = self._normalize_site_id(site_id)
+        site_config = self._find_site_config(all_sites, normalized_site_id)
         if site_config is None:
             return None
 
@@ -322,7 +349,9 @@ class CheckInScheduler:
             )
             result = await adapter.check_in()
 
-        await self._persist_checkin_results([result], manual, {str(site_id)})
+        await self._persist_checkin_results(
+            [result], manual, {normalized_site_id}, checked_at
+        )
         return result
 
     @staticmethod

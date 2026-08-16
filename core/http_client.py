@@ -33,8 +33,10 @@ def get_impersonate_options() -> list[str]:
 
 def normalize_impersonate(value: Any) -> str:
     """Validate a configured fingerprint and fall back to a supported default."""
-    if isinstance(value, str) and value in _IMPERSONATE_OPTIONS:
-        return value
+    if isinstance(value, str):
+        normalized_value = value.strip().lower()
+        if normalized_value in _IMPERSONATE_OPTIONS:
+            return normalized_value
     if DEFAULT_IMPERSONATE in _IMPERSONATE_OPTIONS:
         return DEFAULT_IMPERSONATE
     if _IMPERSONATE_OPTIONS:
@@ -46,7 +48,7 @@ def create_client_session(settings: Mapping[str, Any] | None = None) -> AsyncSes
     """Create a curl_cffi session with the plugin's shared request settings."""
     settings = settings or {}
     # Verify TLS certificates by default; callers must explicitly opt out.
-    ssl_verify = settings.get("http_ssl_verify", True) is True
+    ssl_verify = settings.get("http_ssl_verify", True) is not False
     timeout_seconds = _get_timeout_seconds(settings)
     return AsyncSession(
         impersonate=normalize_impersonate(settings.get("http_impersonate")),

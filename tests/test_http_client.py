@@ -48,6 +48,21 @@ class HttpClientConfigurationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await session.close()
 
+    async def test_normalizes_fingerprint_case_and_whitespace(self) -> None:
+        session = create_client_session({"http_impersonate": "  CHROME120  "})
+        try:
+            self.assertEqual(session.impersonate, "chrome120")
+        finally:
+            await session.close()
+
+    async def test_tls_verification_fails_closed_for_non_boolean_values(self) -> None:
+        for value in ("true", 1):
+            session = create_client_session({"http_ssl_verify": value})
+            try:
+                self.assertTrue(session.verify)
+            finally:
+                await session.close()
+
     def test_uses_first_supported_fingerprint_when_chrome131_is_unavailable(self) -> None:
         with patch.object(http_client, "_IMPERSONATE_OPTIONS", ("edge99",)):
             self.assertEqual(http_client.normalize_impersonate("not-a-browser"), "edge99")
