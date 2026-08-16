@@ -165,7 +165,9 @@ class CheckInScheduler:
 
     @staticmethod
     def _update_site_checkin_state(
-        site_config: dict[str, Any], result: CheckInResult, checked_at: datetime | None = None
+        site_config: dict[str, Any],
+        result: CheckInResult,
+        checked_at: datetime | None = None,
     ) -> None:
         """Apply a check-in result to a site configuration in memory."""
         checked_at = checked_at or datetime.now()
@@ -181,24 +183,30 @@ class CheckInScheduler:
         Site IDs are transported and compared as trimmed strings.  The
         dashboard's ``getSiteId`` helper follows the same contract.
         """
-        if value is None:
-            return ""
-        return str(value).strip()
+        return str(value or "").strip()
 
     @classmethod
     def _find_site_config(
-        cls, sites: list[dict[str, Any]], site_id: Any
+        cls, sites: list[dict[str, Any]], site_id: str
     ) -> dict[str, Any] | None:
         """Find a site using the same normalized ID rules as persistence."""
         normalized_site_id = cls._normalize_site_id(site_id)
-        return next(
-            (
-                site
-                for site in sites
-                if cls._normalize_site_id(site.get("id")) == normalized_site_id
-            ),
-            None,
-        )
+        if not normalized_site_id:
+            logger.warning("Skipping site lookup with an empty site ID")
+            return None
+
+        for site in sites:
+            current_site_id = cls._normalize_site_id(site.get("id"))
+            if not current_site_id:
+                logger.warning(
+                    "Skipping site without an ID while looking up site %s: %s",
+                    normalized_site_id,
+                    site.get("name", "<unnamed>"),
+                )
+                continue
+            if current_site_id == normalized_site_id:
+                return site
+        return None
 
     def _record_checkin_history(self, results: list[CheckInResult], manual: bool) -> None:
         """Record check-in results using the same log type for all flows."""
@@ -221,36 +229,31 @@ class CheckInScheduler:
         async with self._persistence_lock:
             if site_results_to_persist:
                 latest_sites = self.plugin.get_sites()
-                result_by_site_id = {
-                    self._normalize_site_id(result.site_id): result
-                    for result in site_results_to_persist
-                    if self._normalize_site_id(result.site_id)
-                }
+                result_by_site_id: dict[str, CheckInResult] = {}
+                for result in site_results_to_persist:
+                    result_site_id = self._normalize_site_id(result.site_id)
+                    if not result_site_id:
+                        logger.warning(
+                            "Skipping check-in result without a site ID: %s",
+                            result.site_name,
+                        )
+                        continue
+                    result_by_site_id[result_site_id] = result
                 sites_changed = False
                 for site_config in latest_sites:
+                    site_id = self._normalize_site_id(site_config.get("id"))
+                    if not site_id:
+                        logger.warning(
+                            "Skipping persistence for site without an ID: %s",
+                            site_config.get("name", "<unnamed>"),
+                        )
+                        continue
                     result = result_by_site_id.get(
-                        self._normalize_site_id(site_config.get("id"))
+                        site_id
                     )
                     if result is not None:
                         self._update_site_checkin_state(site_config, result, checked_at)
                         sites_changed = True
-
-                anonymous_results = [
-                    result
-                    for result in site_results_to_persist
-                    if not self._normalize_site_id(result.site_id)
-                ]
-                anonymous_sites = [
-                    site
-                    for site in latest_sites
-                    if not self._normalize_site_id(site.get("id"))
-                ]
-                # Legacy ID-less sites have no stable join key; only merge
-                # them when the latest configuration has the same cardinality.
-                if anonymous_results and len(anonymous_results) == len(anonymous_sites):
-                    for site_config, result in zip(anonymous_sites, anonymous_results):
-                        self._update_site_checkin_state(site_config, result, checked_at)
-                    sites_changed = True
 
                 if sites_changed:
                     self.plugin.save_sites(latest_sites)
@@ -293,7 +296,22 @@ class CheckInScheduler:
             List of CheckInResult objects.
         """
         all_sites = self.plugin.get_sites()
-        enabled_sites = [s for s in all_sites if s.get("enabled", True)]
+        enabled_sites: list[dict[str, Any]] = []
+        for site_config in all_sites:
+            site_id = self._normalize_site_id(site_config.get("id"))
+            if not site_id:
+                logger.warning(
+                    "Skipping site without an ID: %s",
+                    site_config.get("name", "<unnamed>"),
+                )
+                continue
+            if site_config.get("enabled") is not True:
+                logger.info(
+                    "Skipping site %s because enabled is not true",
+                    site_id,
+                )
+                continue
+            enabled_sites.append(site_config)
         results: list[CheckInResult] = []
         settings = self.plugin.get_settings()
 
@@ -308,7 +326,7 @@ class CheckInScheduler:
         async with create_client_session(settings) as session:
             for idx, site_config in enumerate(enabled_sites):
                 site_id = self._normalize_site_id(site_config.get("id"))
-                site_name = site_config.get("name", "Unknown Site")
+                site_name = site_config.get("name", "<unnamed>")
                 last_date = site_config.get("last_checkin_date", "")
                 last_success = site_config.get("last_checkin_success", False)
 

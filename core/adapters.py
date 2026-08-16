@@ -9,14 +9,12 @@ from typing import Any
 from curl_cffi.requests import AsyncSession
 
 from .acw_sc_v2 import AcwScV2Error, AcwScV2SolverCache, is_acw_sc_v2_challenge
-from .http_client import DEFAULT_IMPERSONATE, normalize_impersonate
+from .http_client import normalize_impersonate
 
 logger = logging.getLogger("astrbot")
 
 # Standard conversion: 1 USD = 500,000 raw quota points in One-API / New-API
 QUOTA_CONVERSION_FACTOR = 500000.0
-
-
 @dataclass
 class CheckInResult:
     """Dataclass storing the result of a site check-in or status check."""
@@ -74,16 +72,14 @@ class BaseCheckInAdapter(ABC):
         """
         self.config = site_config
         self.session = session
-        self.impersonate = normalize_impersonate(
-            getattr(session, "impersonate", DEFAULT_IMPERSONATE)
-        )
-        self.site_id: str = site_config.get("id", "")
-        self.site_name: str = site_config.get("name", "Unknown Site")
-        self.base_url: str = site_config.get("base_url", "").rstrip("/")
-        self.auth_type: str = site_config.get("auth_type", "bearer_token")
-        self.auth_value: str = site_config.get("auth_value", "")
-        self.proxy: str | None = site_config.get("proxy", "").strip() or None
-        self.solve_acw_sc_v2: bool = bool(site_config.get("solve_acw_sc_v2", False))
+        self.impersonate = normalize_impersonate(session.impersonate)
+        self.site_id: str = site_config["id"]
+        self.site_name: str = site_config["name"]
+        self.base_url: str = site_config["base_url"].rstrip("/")
+        self.auth_type: str = site_config["auth_type"]
+        self.auth_value: str = site_config["auth_value"]
+        self.proxy: str | None = site_config["proxy"].strip() or None
+        self.solve_acw_sc_v2: bool = site_config["solve_acw_sc_v2"]
         self._acw_solver = AcwScV2SolverCache(acw_cache_file)
         self._challenge_cookies: dict[str, str] = {}
 
@@ -108,7 +104,7 @@ class BaseCheckInAdapter(ABC):
         elif self.auth_type == "cookie" and self.auth_value:
             headers["Cookie"] = self.auth_value.strip().replace("\n", "").replace("\r", "")
 
-        custom_headers = self.config.get("custom_headers", "")
+        custom_headers = self.config["custom_headers"]
         if isinstance(custom_headers, str) and custom_headers.strip():
             for line in custom_headers.strip().splitlines():
                 if ":" in line:
@@ -295,7 +291,7 @@ class NewApiAdapter(BaseCheckInAdapter):
             )
 
         # Step 2: Determine endpoints to attempt
-        custom_endpoint = self.config.get("checkin_endpoint", "").strip()
+        custom_endpoint = self.config["checkin_endpoint"].strip()
         if custom_endpoint:
             endpoints = [f"{self.base_url}/{custom_endpoint.lstrip('/')}"]
         else:
@@ -410,7 +406,7 @@ class GenericRestAdapter(BaseCheckInAdapter):
     async def _execute_request(self) -> CheckInResult:
         """Execute request and return exact HTTP status code and raw response text."""
         headers = self._get_headers()
-        endpoint = self.config.get("checkin_endpoint", "").strip()
+        endpoint = self.config["checkin_endpoint"].strip()
         if not endpoint:
             endpoint = "/api/user/checkin"
         url = f"{self.base_url}{endpoint}" if endpoint.startswith("/") else f"{self.base_url}/{endpoint}"
@@ -494,7 +490,7 @@ def create_adapter(
     Returns:
         Subclass instance of BaseCheckInAdapter.
     """
-    site_type = site_config.get("type", "new-api").lower()
+    site_type = site_config["type"].lower()
     if site_type in ("new-api", "one-api"):
         return NewApiAdapter(site_config, session, acw_cache_file)
     return GenericRestAdapter(site_config, session, acw_cache_file)

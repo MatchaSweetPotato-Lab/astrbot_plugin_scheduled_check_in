@@ -413,10 +413,22 @@ class ScheduledCheckInPlugin(Star):
         results = []
         async with create_client_session(self.get_settings()) as session:
             for site in sites:
-                if site.get("enabled", True):
-                    adapter = create_adapter(site, session, self.acw_cache_file)
-                    res = await adapter.test_connection()
-                    results.append(res)
+                site_id = str(site.get("id", "")).strip()
+                if not site_id:
+                    logger.warning(
+                        "Skipping status check for site without an ID: %s",
+                        site.get("name", "<unnamed>"),
+                    )
+                    continue
+                if site.get("enabled") is not True:
+                    logger.info(
+                        "Skipping status check for site %s because enabled is not true",
+                        site_id,
+                    )
+                    continue
+                adapter = create_adapter(site, session, self.acw_cache_file)
+                res = await adapter.test_connection()
+                results.append(res)
 
         report = CheckInScheduler.format_report(results)
         yield event.plain_result(report)

@@ -159,6 +159,7 @@ class _FakeSession:
     def __init__(self, responses: list[_FakeResponse]) -> None:
         self.responses = responses
         self.requests: list[dict[str, object]] = []
+        self.impersonate = "chrome131"
 
     async def request(self, method: str, url: str, **kwargs) -> _FakeResponse:
         self.requests.append({"method": method, "url": url, **kwargs})
@@ -180,13 +181,16 @@ class ChallengeAwareRequestTests(unittest.IsolatedAsyncioTestCase):
         config = {
             "id": "site-1",
             "name": "Example",
+            "type": "generic",
             "base_url": "https://example.test",
             "checkin_endpoint": "/api/user/sign_in",
             "method": "GET",
             "auth_type": "cookie",
             "auth_value": "session=auth-value",
             "custom_headers": {"cookie": "custom=header-value"},
+            "proxy": "",
             "solve_acw_sc_v2": True,
+            "enabled": True,
         }
 
         with TemporaryDirectory() as temp_dir:
@@ -225,11 +229,16 @@ class ChallengeAwareRequestTests(unittest.IsolatedAsyncioTestCase):
         config = {
             "id": "site-2",
             "name": "Example",
+            "type": "generic",
             "base_url": "https://example.test",
             "checkin_endpoint": "/api/user/sign_in",
             "method": "GET",
             "auth_type": "bearer_token",
             "auth_value": "invalid-token",
+            "custom_headers": "",
+            "proxy": "",
+            "solve_acw_sc_v2": False,
+            "enabled": True,
         }
         adapter = GenericRestAdapter(config, session)  # type: ignore[arg-type]
 

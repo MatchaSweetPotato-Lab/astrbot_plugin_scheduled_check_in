@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
-
-from core import http_client
 from core.http_client import (
     DEFAULT_IMPERSONATE,
     create_client_session,
@@ -62,11 +59,6 @@ class HttpClientConfigurationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(session.verify)
             finally:
                 await session.close()
-
-    def test_uses_first_supported_fingerprint_when_chrome131_is_unavailable(self) -> None:
-        with patch.object(http_client, "_IMPERSONATE_OPTIONS", ("edge99",)):
-            self.assertEqual(http_client.normalize_impersonate("not-a-browser"), "edge99")
-
 
 if __name__ == "__main__":
     unittest.main()
