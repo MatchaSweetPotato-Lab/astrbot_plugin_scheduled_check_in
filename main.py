@@ -13,7 +13,12 @@ from astrbot.api.web import error_response, json_response, request
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .core.adapters import create_adapter
-from .core.http_client import create_client_session
+from .core.http_client import (
+    DEFAULT_IMPERSONATE,
+    create_client_session,
+    get_impersonate_options,
+    normalize_impersonate,
+)
 from .core.scheduler import CheckInScheduler
 
 logger = logging.getLogger("astrbot")
@@ -109,6 +114,7 @@ class ScheduledCheckInPlugin(Star):
             "checkin_time": "08:30",
             "http_ssl_verify": True,
             "http_timeout_seconds": 15,
+            "http_impersonate": DEFAULT_IMPERSONATE,
         }
         if not self.settings_file.exists():
             return default_settings
@@ -116,6 +122,9 @@ class ScheduledCheckInPlugin(Star):
             with open(self.settings_file, encoding="utf-8") as f:
                 data = json.load(f)
                 default_settings.update(data)
+                default_settings["http_impersonate"] = normalize_impersonate(
+                    default_settings.get("http_impersonate")
+                )
                 return default_settings
         except Exception as e:
             logger.error(f"Error reading settings.json: {e}")
@@ -301,6 +310,7 @@ class ScheduledCheckInPlugin(Star):
         target_info = self.scheduler.get_next_target_info()
         settings["target_info"] = target_info
         settings["today_target_time"] = target_info.get("display_text", "")
+        settings["http_impersonate_options"] = get_impersonate_options()
         return json_response(settings)
 
     async def api_save_settings(self) -> Any:
@@ -316,6 +326,9 @@ class ScheduledCheckInPlugin(Star):
             return error_response("全局设置必须是对象")
         settings = self.get_settings()
         settings.update(data)
+        settings["http_impersonate"] = normalize_impersonate(
+            settings.get("http_impersonate")
+        )
         self.save_settings(settings)
         self.scheduler.reset_today_target_time()
         return json_response({"status": "ok", "message": "全局设置已更新"})

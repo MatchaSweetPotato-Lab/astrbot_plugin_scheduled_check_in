@@ -10,7 +10,9 @@ let settings = {
   end_time: '10:30',
   checkin_time: '08:30',
   http_ssl_verify: true,
-  http_timeout_seconds: 15
+  http_timeout_seconds: 15,
+  http_impersonate: 'chrome131',
+  http_impersonate_options: []
 };
 let logs = [];
 let isEdit = false;
@@ -559,7 +561,31 @@ function renderSettingsForm() {
   document.getElementById('setting-fixed-time').value = settings.checkin_time || '08:30';
   document.getElementById('setting-http-ssl-verify').checked = settings.http_ssl_verify === true;
   document.getElementById('setting-http-timeout').value = settings.http_timeout_seconds || 15;
+  renderImpersonateOptions();
   toggleRandomMode();
+}
+
+function renderImpersonateOptions() {
+  const select = document.getElementById('setting-http-impersonate');
+  if (!select) return;
+
+  const values = Array.isArray(settings.http_impersonate_options)
+    ? settings.http_impersonate_options.filter(value => typeof value === 'string' && value.trim())
+    : [];
+  const options = [...new Set(values)];
+  if (!options.includes('chrome131')) options.unshift('chrome131');
+
+  const selected = options.includes(settings.http_impersonate)
+    ? settings.http_impersonate
+    : 'chrome131';
+  select.replaceChildren();
+  options.forEach(value => {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = value === 'chrome131' ? `${value}（默认）` : value;
+    select.appendChild(option);
+  });
+  select.value = selected;
 }
 
 function toggleRandomMode() {
@@ -584,6 +610,8 @@ async function saveSettings() {
   const http_timeout_seconds = Number.isFinite(timeoutInput)
     ? Math.min(300, Math.max(1, Math.round(timeoutInput)))
     : 15;
+  const httpImpersonateSelect = document.getElementById('setting-http-impersonate');
+  const http_impersonate = httpImpersonateSelect?.value || 'chrome131';
 
   settings = {
     enabled,
@@ -592,7 +620,8 @@ async function saveSettings() {
     end_time,
     checkin_time,
     http_ssl_verify,
-    http_timeout_seconds
+    http_timeout_seconds,
+    http_impersonate
   };
 
   try {
