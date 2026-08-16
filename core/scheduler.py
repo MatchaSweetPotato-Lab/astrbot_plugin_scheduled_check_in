@@ -226,6 +226,7 @@ class CheckInScheduler:
         all_sites = self.plugin.get_sites()
         enabled_sites = [s for s in all_sites if s.get("enabled", True)]
         results: list[CheckInResult] = []
+        settings = self.plugin.get_settings()
 
         if not enabled_sites:
             logger.info("No enabled check-in sites configured.")
@@ -235,7 +236,7 @@ class CheckInScheduler:
         today_str = checked_at.strftime("%Y-%m-%d")
         sites_updated = False
 
-        async with create_client_session() as session:
+        async with create_client_session(settings) as session:
             for idx, site_config in enumerate(enabled_sites):
                 site_id = site_config.get("id", "")
                 site_name = site_config.get("name", "Unknown Site")
@@ -272,7 +273,6 @@ class CheckInScheduler:
                 sites_updated = True
 
         # Clear temporary manual_target_time override after check-in execution
-        settings = self.plugin.get_settings()
         if settings.get("manual_target_time"):
             settings["manual_target_time"] = ""
             self.plugin.save_settings(settings)
@@ -296,7 +296,7 @@ class CheckInScheduler:
         if site_config is None:
             return None
 
-        async with create_client_session() as session:
+        async with create_client_session(self.plugin.get_settings()) as session:
             adapter = create_adapter(
                 site_config,
                 session,

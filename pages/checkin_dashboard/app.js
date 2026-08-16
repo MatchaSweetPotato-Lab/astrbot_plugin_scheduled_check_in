@@ -8,7 +8,9 @@ let settings = {
   random_enabled: true,
   start_time: '08:00',
   end_time: '10:30',
-  checkin_time: '08:30'
+  checkin_time: '08:30',
+  http_ssl_verify: false,
+  http_timeout_seconds: 15
 };
 let logs = [];
 let isEdit = false;
@@ -516,6 +518,8 @@ function renderSettingsForm() {
   document.getElementById('setting-start-time').value = settings.start_time || '08:00';
   document.getElementById('setting-end-time').value = settings.end_time || '10:30';
   document.getElementById('setting-fixed-time').value = settings.checkin_time || '08:30';
+  document.getElementById('setting-http-ssl-verify').checked = settings.http_ssl_verify === true;
+  document.getElementById('setting-http-timeout').value = settings.http_timeout_seconds || 15;
   toggleRandomMode();
 }
 
@@ -536,13 +540,20 @@ async function saveSettings() {
   const start_time = document.getElementById('setting-start-time').value;
   const end_time = document.getElementById('setting-end-time').value;
   const checkin_time = document.getElementById('setting-fixed-time').value;
+  const http_ssl_verify = document.getElementById('setting-http-ssl-verify').checked;
+  const timeoutInput = Number(document.getElementById('setting-http-timeout').value);
+  const http_timeout_seconds = Number.isFinite(timeoutInput)
+    ? Math.min(300, Math.max(1, Math.round(timeoutInput)))
+    : 15;
 
   settings = {
     enabled,
     random_enabled,
     start_time,
     end_time,
-    checkin_time
+    checkin_time,
+    http_ssl_verify,
+    http_timeout_seconds
   };
 
   try {

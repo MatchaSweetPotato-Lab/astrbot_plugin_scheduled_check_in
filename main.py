@@ -107,6 +107,8 @@ class ScheduledCheckInPlugin(Star):
             "start_time": "08:00",
             "end_time": "10:30",
             "checkin_time": "08:30",
+            "http_ssl_verify": False,
+            "http_timeout_seconds": 15,
         }
         if not self.settings_file.exists():
             return default_settings
@@ -251,7 +253,7 @@ class ScheduledCheckInPlugin(Star):
             return error_response("请求体必须是合法 JSON")
         if not isinstance(site_config, dict):
             return error_response("站点配置必须是对象")
-        async with create_client_session() as session:
+        async with create_client_session(self.get_settings()) as session:
             adapter = create_adapter(site_config, session, self.acw_cache_file)
             result = await adapter.test_connection()
             self.record_history([result], log_type="test")
@@ -266,11 +268,11 @@ class ScheduledCheckInPlugin(Star):
             return error_response("重新签到请求必须是对象")
         site_id = str(body.get("site_id", "")).strip()
         if not site_id:
-            return json_response({"status": "error", "success": False, "message": "缺少站点 ID"})
+            return error_response("缺少站点 ID")
 
         result = await self.scheduler.run_check_in_site(site_id, manual=True)
         if result is None:
-            return json_response({"status": "error", "success": False, "message": "站点不存在"})
+            return error_response("站点不存在")
 
         return json_response({"status": "ok", "result": result.to_dict()})
 
@@ -312,7 +314,9 @@ class ScheduledCheckInPlugin(Star):
             return error_response("请求体必须是合法 JSON")
         if not isinstance(data, dict):
             return error_response("全局设置必须是对象")
-        self.save_settings(data)
+        settings = self.get_settings()
+        settings.update(data)
+        self.save_settings(settings)
         self.scheduler.reset_today_target_time()
         return json_response({"status": "ok", "message": "全局设置已更新"})
 
@@ -395,7 +399,7 @@ class ScheduledCheckInPlugin(Star):
 
         yield event.plain_result("正在查询各中转站余额与连通性...")
         results = []
-        async with create_client_session() as session:
+        async with create_client_session(self.get_settings()) as session:
             for site in sites:
                 if site.get("enabled", True):
                     adapter = create_adapter(site, session, self.acw_cache_file)
