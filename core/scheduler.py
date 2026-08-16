@@ -29,6 +29,7 @@ class CheckInScheduler:
         self._tomorrow_target_time: str = ""
         self._today_date_str: str = ""
         self._persistence_lock = asyncio.Lock()
+        self._history_lock = asyncio.Lock()
 
     def reset_today_target_time(self) -> None:
         """Reset cached target time when settings are updated."""
@@ -253,6 +254,7 @@ class CheckInScheduler:
 
                 if sites_changed:
                     self.plugin.save_sites(latest_sites)
+        async with self._history_lock:
             self._record_checkin_history(results, manual)
 
     async def _scheduler_loop(self) -> None:

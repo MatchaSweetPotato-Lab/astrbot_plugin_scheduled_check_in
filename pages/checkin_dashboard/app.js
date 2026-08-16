@@ -80,6 +80,10 @@ function getSiteId(site) {
   return String(site.id).trim();
 }
 
+function normalizeImpersonateValue(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
 // Helper: Open URL
 function openUrl(url) {
   if (!url) return;
@@ -572,11 +576,9 @@ function renderImpersonateOptions() {
 
   const maxOptions = 128;
   const values = Array.isArray(settings.http_impersonate_options)
-    ? settings.http_impersonate_options.filter(value => typeof value === 'string' && value.trim())
+    ? settings.http_impersonate_options.map(normalizeImpersonateValue).filter(Boolean)
     : [];
-  const normalizedCurrent = typeof settings.http_impersonate === 'string'
-    ? settings.http_impersonate.trim().toLowerCase()
-    : '';
+  const normalizedCurrent = normalizeImpersonateValue(settings.http_impersonate);
   const currentValueMissing = normalizedCurrent && !values.includes(normalizedCurrent);
   if (currentValueMissing) {
     values.unshift(normalizedCurrent);
@@ -602,8 +604,8 @@ function renderImpersonateOptions() {
       : value;
     select.appendChild(option);
   });
-  if (options.includes(settings.http_impersonate)) {
-    select.value = settings.http_impersonate;
+  if (options.includes(normalizedCurrent)) {
+    select.value = normalizedCurrent;
   } else {
     select.value = options[0];
   }
