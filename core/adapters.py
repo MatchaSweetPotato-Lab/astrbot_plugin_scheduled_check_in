@@ -6,9 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import aiohttp
+from curl_cffi.requests import AsyncSession
 
 from .acw_sc_v2 import AcwScV2Error, AcwScV2SolverCache, is_acw_sc_v2_challenge
+from .http_client import DEFAULT_IMPERSONATE, normalize_impersonate
 
 logger = logging.getLogger("astrbot")
 
@@ -61,18 +62,21 @@ class BaseCheckInAdapter(ABC):
     def __init__(
         self,
         site_config: dict[str, Any],
-        session: aiohttp.ClientSession,
+        session: AsyncSession,
         acw_cache_file: Path | None = None,
     ) -> None:
         """Initialize site adapter.
 
         Args:
             site_config: Configuration dictionary for the target site.
-            session: Active aiohttp ClientSession instance.
+            session: Active curl_cffi AsyncSession instance.
             acw_cache_file: Optional persistent translated-algorithm cache path.
         """
         self.config = site_config
         self.session = session
+        self.impersonate = normalize_impersonate(
+            getattr(session, "impersonate", DEFAULT_IMPERSONATE)
+        )
         self.site_id: str = site_config.get("id", "")
         self.site_name: str = site_config.get("name", "Unknown Site")
         self.base_url: str = site_config.get("base_url", "").rstrip("/")
@@ -90,7 +94,8 @@ class BaseCheckInAdapter(ABC):
             Header dictionary.
         """
         headers: dict[str, str] = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            # Leave User-Agent generation to curl_cffi so it stays consistent with
+            # the configured browser impersonation.
             "Content-Type": "application/json",
             "Referer": f"{self.base_url}/console/personal",
             "Accept": "application/json, text/plain, */*",
@@ -147,19 +152,20 @@ class BaseCheckInAdapter(ABC):
     ) -> _TextResponse:
         """Request text and optionally solve one inline ``acw_sc__v2`` challenge."""
         request_headers = self._merge_challenge_cookies(headers)
-        request_timeout = aiohttp.ClientTimeout(total=timeout)
-        async with self.session.request(
+        response = await self.session.request(
             method,
             url,
             headers=request_headers,
             proxy=self.proxy,
-            timeout=request_timeout,
-        ) as response:
-            status = response.status
-            text = await response.text()
-            response_cookies = {
-                name: morsel.value for name, morsel in response.cookies.items()
-            }
+            timeout=float(timeout),
+            impersonate=self.impersonate,
+        )
+        status = response.status_code
+        text = response.text
+        response_cookies = {
+            name: getattr(value, "value", str(value))
+            for name, value in response.cookies.items()
+        }
 
         if not self.solve_acw_sc_v2 or not is_acw_sc_v2_challenge(text):
             return _TextResponse(status=status, text=text)
@@ -180,17 +186,18 @@ class BaseCheckInAdapter(ABC):
             "cache hit" if solution.cache_hit else "translated",
         )
 
-        async with self.session.request(
+        retry_response = await self.session.request(
             method,
             url,
             headers=retry_headers,
             proxy=self.proxy,
-            timeout=request_timeout,
-        ) as retry_response:
-            retry_status = retry_response.status
-            retry_text = await retry_response.text()
-            for name, morsel in retry_response.cookies.items():
-                self._challenge_cookies[name] = morsel.value
+            timeout=float(timeout),
+            impersonate=self.impersonate,
+        )
+        retry_status = retry_response.status_code
+        retry_text = retry_response.text
+        for name, value in retry_response.cookies.items():
+            self._challenge_cookies[name] = getattr(value, "value", str(value))
 
         if is_acw_sc_v2_challenge(retry_text):
             return _TextResponse(
@@ -477,14 +484,14 @@ class GenericRestAdapter(BaseCheckInAdapter):
 
 def create_adapter(
     site_config: dict[str, Any],
-    session: aiohttp.ClientSession,
+    session: AsyncSession,
     acw_cache_file: Path | None = None,
 ) -> BaseCheckInAdapter:
     """Factory function creating appropriate site adapter.
 
     Args:
         site_config: Site configuration.
-        session: Active aiohttp ClientSession.
+        session: Active curl_cffi AsyncSession.
         acw_cache_file: Optional persistent translated-algorithm cache path.
 
     Returns:

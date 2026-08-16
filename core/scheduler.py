@@ -6,9 +6,8 @@ import random
 from datetime import datetime
 from typing import Any
 
-import aiohttp
-
 from .adapters import CheckInResult, create_adapter
+from .http_client import create_client_session
 
 logger = logging.getLogger("astrbot")
 
@@ -162,6 +161,33 @@ class CheckInScheduler:
             self._task.cancel()
             logger.info("CheckInScheduler task cancelled.")
 
+    @staticmethod
+    def _update_site_checkin_state(
+        site_config: dict[str, Any], result: CheckInResult, checked_at: datetime | None = None
+    ) -> None:
+        """Apply a check-in result to a site configuration in memory."""
+        checked_at = checked_at or datetime.now()
+        site_config["last_checkin_date"] = checked_at.strftime("%Y-%m-%d")
+        site_config["last_checkin_time"] = checked_at.strftime("%H:%M:%S")
+        site_config["last_checkin_success"] = result.success
+        site_config["last_quota"] = result.total_quota
+
+    def _record_checkin_history(self, results: list[CheckInResult], manual: bool) -> None:
+        """Record check-in results using the same log type for all flows."""
+        self.plugin.record_history(results, log_type="manual" if manual else "scheduled")
+
+    def _persist_checkin_results(
+        self,
+        all_sites: list[dict[str, Any]],
+        results: list[CheckInResult],
+        manual: bool,
+        persist_sites: bool = True,
+    ) -> None:
+        """Persist site changes and record a history entry for check-in results."""
+        if persist_sites:
+            self.plugin.save_sites(all_sites)
+        self._record_checkin_history(results, manual)
+
     async def _scheduler_loop(self) -> None:
         """Internal background loop running check-ins at configured daily time window."""
         while self._running:
@@ -200,17 +226,17 @@ class CheckInScheduler:
         all_sites = self.plugin.get_sites()
         enabled_sites = [s for s in all_sites if s.get("enabled", True)]
         results: list[CheckInResult] = []
+        settings = self.plugin.get_settings()
 
         if not enabled_sites:
             logger.info("No enabled check-in sites configured.")
             return results
 
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        now_time_str = datetime.now().strftime("%H:%M:%S")
+        checked_at = datetime.now()
+        today_str = checked_at.strftime("%Y-%m-%d")
         sites_updated = False
 
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
+        async with create_client_session(settings) as session:
             for idx, site_config in enumerate(enabled_sites):
                 site_id = site_config.get("id", "")
                 site_name = site_config.get("name", "Unknown Site")
@@ -243,27 +269,44 @@ class CheckInScheduler:
                 result = await adapter.check_in()
                 results.append(result)
 
-                # Update site's check-in status
-                site_config["last_checkin_date"] = today_str
-                site_config["last_checkin_time"] = now_time_str
-                site_config["last_checkin_success"] = result.success
-                site_config["last_quota"] = result.total_quota
+                self._update_site_checkin_state(site_config, result, checked_at)
                 sites_updated = True
 
-        if sites_updated:
-            self.plugin.save_sites(all_sites)
-
         # Clear temporary manual_target_time override after check-in execution
-        settings = self.plugin.get_settings()
         if settings.get("manual_target_time"):
             settings["manual_target_time"] = ""
             self.plugin.save_settings(settings)
             self.reset_today_target_time()
 
-        # Record history log
-        log_type = "manual" if manual else "scheduled"
-        self.plugin.record_history(results, log_type=log_type)
+        self._persist_checkin_results(all_sites, results, manual, persist_sites=sites_updated)
         return results
+
+    async def run_check_in_site(self, site_id: str, manual: bool = True) -> CheckInResult | None:
+        """Force a check-in for one configured site, ignoring today's skip state.
+
+        Args:
+            site_id: ID of the configured site to check in.
+            manual: Flag indicating whether this was triggered manually.
+
+        Returns:
+            The check-in result, or None if the site does not exist.
+        """
+        all_sites = self.plugin.get_sites()
+        site_config = next((s for s in all_sites if str(s.get("id", "")) == site_id), None)
+        if site_config is None:
+            return None
+
+        async with create_client_session(self.plugin.get_settings()) as session:
+            adapter = create_adapter(
+                site_config,
+                session,
+                getattr(self.plugin, "acw_cache_file", None),
+            )
+            result = await adapter.check_in()
+
+        self._update_site_checkin_state(site_config, result)
+        self._persist_checkin_results(all_sites, [result], manual)
+        return result
 
     @staticmethod
     def format_report(results: list[CheckInResult]) -> str:
@@ -304,3 +347,4 @@ class CheckInScheduler:
         lines.append(summary_line)
 
         return "\n".join(lines)
+

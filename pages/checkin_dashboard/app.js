@@ -8,11 +8,16 @@ let settings = {
   random_enabled: true,
   start_time: '08:00',
   end_time: '10:30',
-  checkin_time: '08:30'
+  checkin_time: '08:30',
+  http_ssl_verify: true,
+  http_timeout_seconds: 15,
+  http_impersonate: 'chrome131',
+  http_impersonate_options: []
 };
 let logs = [];
 let isEdit = false;
 let editIndex = -1;
+let activeConfirmResolver = null;
 
 // Helper: Toast Notifications
 function showToast(message, type = 'success') {
@@ -31,21 +36,47 @@ function showToast(message, type = 'success') {
 function showConfirm(message, onConfirm) {
   const msgEl = document.getElementById('confirm-message');
   const okBtn = document.getElementById('confirm-ok-btn');
-  if (msgEl) msgEl.textContent = message;
-  if (okBtn) {
-    okBtn.onclick = () => {
-      closeModal('confirm-modal');
-      onConfirm();
-    };
+  if (activeConfirmResolver) {
+    activeConfirmResolver(false);
+    activeConfirmResolver = null;
   }
-  openModal('confirm-modal');
+  if (msgEl) msgEl.textContent = message;
+  return new Promise(resolve => {
+    activeConfirmResolver = resolve;
+    if (okBtn) {
+      okBtn.onclick = async () => {
+        activeConfirmResolver = null;
+        closeModal('confirm-modal');
+        if (onConfirm) await onConfirm();
+        resolve(true);
+      };
+    }
+    openModal('confirm-modal');
+  });
+}
+
+function cancelConfirm() {
+  if (activeConfirmResolver) {
+    const resolve = activeConfirmResolver;
+    activeConfirmResolver = null;
+    closeModal('confirm-modal');
+    resolve(false);
+    return;
+  }
+  closeModal('confirm-modal');
 }
 
 // Helper: Mask credentials
 function maskToken(val) {
   if (!val) return '未配置';
-  if (val.length <= 10) return '******';
-  return val.substring(0, 4) + '***' + val.substring(val.length - 4);
+  const token = String(val);
+  if (token.length <= 10) return '******';
+  return token.substring(0, 4) + '***' + token.substring(token.length - 4);
+}
+
+function getSiteId(site) {
+  if (!site || site.id === undefined || site.id === null) return '';
+  return String(site.id).trim();
 }
 
 // Helper: Open URL
@@ -56,17 +87,6 @@ function openUrl(url) {
     target = 'https://' + target;
   }
   window.open(target, '_blank');
-}
-
-// Helper: Escape HTML
-function escapeHtml(str) {
-  if (!str) return '';
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
 }
 
 // API Bridge Wrappers
@@ -113,7 +133,11 @@ function closeModal(id) {
 
 function handleOverlayClick(event, id) {
   if (event.target.id === id) {
-    closeModal(id);
+    if (id === 'confirm-modal') {
+      cancelConfirm();
+    } else {
+      closeModal(id);
+    }
   }
 }
 
@@ -125,7 +149,7 @@ async function loadSites() {
     sites = Array.isArray(data) ? data : [];
     renderSitesTable();
   } catch (e) {
-    if (tbody) tbody.innerHTML = `<tr><td colspan="7" class="empty-text">读取站点列表失败</td></tr>`;
+    renderTableMessage(tbody, '读取站点列表失败');
     showToast('读取站点列表失败', 'error');
   }
 }
@@ -140,15 +164,44 @@ function getTodayStr() {
 
 function renderCheckInStatus(site) {
   const todayStr = getTodayStr();
+  const badge = document.createElement('span');
+  const timeStr = site.last_checkin_time ? String(site.last_checkin_time).substring(0, 5) : '';
+
   if (site.last_checkin_date === todayStr && site.last_checkin_success) {
-    const timeStr = site.last_checkin_time ? site.last_checkin_time.substring(0, 5) : '';
-    return `<span class="badge badge-success">已签到${timeStr ? ' (' + timeStr + ')' : ''}</span>`;
+    badge.className = 'badge badge-success';
+    badge.textContent = `已签到${timeStr ? ' (' + timeStr + ')' : ''}`;
+    return badge;
   }
   if (site.last_checkin_date === todayStr && site.last_checkin_success === false) {
-    const timeStr = site.last_checkin_time ? site.last_checkin_time.substring(0, 5) : '';
-    return `<span class="badge" style="background:#fee2e2;color:#991b1b;">失败${timeStr ? ' (' + timeStr + ')' : ''}</span>`;
+    badge.className = 'badge badge-failure';
+    badge.textContent = `失败${timeStr ? ' (' + timeStr + ')' : ''}`;
+    return badge;
   }
-  return `<span class="badge badge-warning">未签到</span>`;
+  badge.className = 'badge badge-warning';
+  badge.textContent = '未签到';
+  return badge;
+}
+
+function renderTableMessage(tbody, message) {
+  if (!tbody) return;
+  tbody.replaceChildren();
+  const row = document.createElement('tr');
+  const cell = document.createElement('td');
+  cell.colSpan = 7;
+  cell.className = 'empty-text';
+  cell.textContent = message;
+  row.appendChild(cell);
+  tbody.appendChild(row);
+}
+
+function createActionButton(label, className, handler, addMargin = true) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `btn btn-sm${className ? ` ${className}` : ''}`;
+  button.textContent = label;
+  if (addMargin) button.style.marginRight = '6px';
+  button.addEventListener('click', handler);
+  return button;
 }
 
 function renderSitesTable() {
@@ -156,40 +209,98 @@ function renderSitesTable() {
   if (!tbody) return;
 
   if (sites.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="7" class="empty-text">暂无中转站，请点击右上角添加</td></tr>`;
+    renderTableMessage(tbody, '暂无中转站，请点击右上角添加');
     return;
   }
 
-  tbody.innerHTML = sites.map((site, index) => `
-    <tr>
-      <td><strong>${escapeHtml(site.name)}</strong></td>
-      <td>
-        <span class="badge ${site.type === 'new-api' ? 'badge-success' : 'badge-info'}">
-          ${escapeHtml(site.type || 'new-api')}
-        </span>
-      </td>
-      <td>
-        <a class="link" onclick="openUrl('${escapeHtml(site.base_url)}')">${escapeHtml(site.base_url)}</a>
-      </td>
-      <td>
-        ${renderCheckInStatus(site)}
-      </td>
-      <td>
-        <span class="token-mask">${maskToken(site.auth_value)}</span>
-      </td>
-      <td>
-        <label class="switch">
-          <input type="checkbox" ${site.enabled !== false ? 'checked' : ''} onchange="toggleSiteEnabled(${index}, this.checked)" />
-          <span class="slider"></span>
-        </label>
-      </td>
-      <td style="text-align: right; padding-right: 24px;">
-        <button class="btn btn-sm btn-primary-plain" style="margin-right: 6px;" onclick="testSingleSite(${index})">测试</button>
-        <button class="btn btn-sm" style="margin-right: 6px;" onclick="openEditSiteModal(${index})">编辑</button>
-        <button class="btn btn-sm btn-danger-plain" onclick="deleteSite(${index})">删除</button>
-      </td>
-    </tr>
-  `).join('');
+  tbody.replaceChildren();
+  sites.forEach((site, index) => {
+    const row = document.createElement('tr');
+
+    const nameCell = document.createElement('td');
+    const name = document.createElement('strong');
+    name.textContent = site.name || '';
+    nameCell.appendChild(name);
+    row.appendChild(nameCell);
+
+    const typeCell = document.createElement('td');
+    const typeBadge = document.createElement('span');
+    typeBadge.className = `badge ${site.type === 'new-api' ? 'badge-success' : 'badge-info'}`;
+    typeBadge.textContent = site.type || 'new-api';
+    typeCell.appendChild(typeBadge);
+    row.appendChild(typeCell);
+
+    const urlCell = document.createElement('td');
+    const urlButton = document.createElement('button');
+    urlButton.type = 'button';
+    urlButton.className = 'link link-button';
+    urlButton.textContent = site.base_url || '';
+    urlButton.addEventListener('click', () => openUrl(site.base_url));
+    urlCell.appendChild(urlButton);
+    row.appendChild(urlCell);
+
+    const statusCell = document.createElement('td');
+    statusCell.appendChild(renderCheckInStatus(site));
+    row.appendChild(statusCell);
+
+    const tokenCell = document.createElement('td');
+    const token = document.createElement('span');
+    token.className = 'token-mask';
+    token.textContent = maskToken(site.auth_value);
+    tokenCell.appendChild(token);
+    row.appendChild(tokenCell);
+
+    const enabledCell = document.createElement('td');
+    const switchLabel = document.createElement('label');
+    switchLabel.className = 'switch';
+    const enabledInput = document.createElement('input');
+    enabledInput.type = 'checkbox';
+    enabledInput.checked = site.enabled !== false;
+    enabledInput.addEventListener('change', event => {
+      toggleSiteEnabled(index, event.currentTarget.checked);
+    });
+    const slider = document.createElement('span');
+    slider.className = 'slider';
+    switchLabel.append(enabledInput, slider);
+    enabledCell.appendChild(switchLabel);
+    row.appendChild(enabledCell);
+
+    const actionsCell = document.createElement('td');
+    actionsCell.style.textAlign = 'right';
+    actionsCell.style.paddingRight = '24px';
+    const actionButtons = [];
+    const siteId = getSiteId(site);
+    const recheckButton = createActionButton(
+      '重新签到',
+      'btn-success-plain',
+      async () => {
+        if (!siteId || recheckButton.dataset.rechecking === 'true') return;
+        recheckButton.disabled = true;
+        recheckButton.dataset.rechecking = 'true';
+        try {
+          await recheckInSite(index);
+        } finally {
+          if (getSiteId(sites[index]) === siteId) {
+            recheckButton.disabled = false;
+          }
+          delete recheckButton.dataset.rechecking;
+        }
+      }
+    );
+    if (!siteId) {
+      recheckButton.disabled = true;
+      recheckButton.title = '站点 ID 不可用，请先保存站点';
+    }
+    actionButtons.push(
+      recheckButton,
+      createActionButton('测试', 'btn-primary-plain', () => testSingleSite(index)),
+      createActionButton('编辑', '', () => openEditSiteModal(index)),
+      createActionButton('删除', 'btn-danger-plain', () => deleteSite(index), false)
+    );
+    actionsCell.append(...actionButtons);
+    row.appendChild(actionsCell);
+    tbody.appendChild(row);
+  });
 }
 
 async function toggleSiteEnabled(index, enabled) {
@@ -215,17 +326,27 @@ function addHeaderRow(key = '', value = '') {
 
   const row = document.createElement('div');
   row.className = 'kv-row';
-  row.innerHTML = `
-    <input type="text" class="form-control kv-key" placeholder="" value="${escapeHtml(key)}" />
-    <input type="text" class="form-control kv-value" placeholder="" value="${escapeHtml(value)}" />
-    <button type="button" class="btn-icon-danger" onclick="this.parentElement.remove()" title="删除此 Header">&times;</button>
-  `;
+  const keyInput = document.createElement('input');
+  keyInput.type = 'text';
+  keyInput.className = 'form-control kv-key';
+  keyInput.value = key;
+  const valueInput = document.createElement('input');
+  valueInput.type = 'text';
+  valueInput.className = 'form-control kv-value';
+  valueInput.value = value;
+  const removeButton = document.createElement('button');
+  removeButton.type = 'button';
+  removeButton.className = 'btn-icon-danger';
+  removeButton.title = '删除此 Header';
+  removeButton.textContent = '×';
+  removeButton.addEventListener('click', () => row.remove());
+  row.append(keyInput, valueInput, removeButton);
   container.appendChild(row);
 }
 
 function clearHeaderRows() {
   const container = document.getElementById('headers-list-container');
-  if (container) container.innerHTML = '';
+  if (container) container.replaceChildren();
 }
 
 function setHeadersFromText(text) {
@@ -349,6 +470,34 @@ function deleteSite(index) {
   });
 }
 
+async function recheckInSite(index) {
+  const site = sites[index];
+  if (!site) return false;
+  const siteId = getSiteId(site);
+  if (!siteId) {
+    showToast('站点 ID 不可用，请先保存站点', 'warning');
+    return false;
+  }
+
+  const confirmed = await showConfirm(`确定要重新签到“${site.name}”吗？这会再次请求签到接口。`);
+  if (!confirmed) return false;
+
+  try {
+    const data = await apiPost('/api/sites/recheckin', { site_id: siteId });
+    const result = data?.result;
+    if (result?.success) {
+      showToast(`${site.name}: ${result.message || '重新签到成功'}`, 'success');
+    } else {
+      showToast(`${site.name}: ${result?.message || data?.message || '重新签到失败'}`, 'error');
+    }
+    await loadSites();
+    await loadLogs();
+  } catch (e) {
+    showToast('重新签到请求失败', 'error');
+  }
+  return true;
+}
+
 async function testSingleSite(index) {
   const site = sites[index];
   if (!site) return;
@@ -410,7 +559,33 @@ function renderSettingsForm() {
   document.getElementById('setting-start-time').value = settings.start_time || '08:00';
   document.getElementById('setting-end-time').value = settings.end_time || '10:30';
   document.getElementById('setting-fixed-time').value = settings.checkin_time || '08:30';
+  document.getElementById('setting-http-ssl-verify').checked = settings.http_ssl_verify === true;
+  document.getElementById('setting-http-timeout').value = settings.http_timeout_seconds || 15;
+  renderImpersonateOptions();
   toggleRandomMode();
+}
+
+function renderImpersonateOptions() {
+  const select = document.getElementById('setting-http-impersonate');
+  if (!select) return;
+
+  const values = Array.isArray(settings.http_impersonate_options)
+    ? settings.http_impersonate_options.filter(value => typeof value === 'string' && value.trim())
+    : [];
+  const options = [...new Set(values)];
+  if (!options.includes('chrome131')) options.unshift('chrome131');
+
+  const selected = options.includes(settings.http_impersonate)
+    ? settings.http_impersonate
+    : 'chrome131';
+  select.replaceChildren();
+  options.forEach(value => {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = value === 'chrome131' ? `${value}（默认）` : value;
+    select.appendChild(option);
+  });
+  select.value = selected;
 }
 
 function toggleRandomMode() {
@@ -430,13 +605,23 @@ async function saveSettings() {
   const start_time = document.getElementById('setting-start-time').value;
   const end_time = document.getElementById('setting-end-time').value;
   const checkin_time = document.getElementById('setting-fixed-time').value;
+  const http_ssl_verify = document.getElementById('setting-http-ssl-verify').checked;
+  const timeoutInput = Number(document.getElementById('setting-http-timeout').value);
+  const http_timeout_seconds = Number.isFinite(timeoutInput)
+    ? Math.min(300, Math.max(1, Math.round(timeoutInput)))
+    : 15;
+  const httpImpersonateSelect = document.getElementById('setting-http-impersonate');
+  const http_impersonate = httpImpersonateSelect?.value || 'chrome131';
 
   settings = {
     enabled,
     random_enabled,
     start_time,
     end_time,
-    checkin_time
+    checkin_time,
+    http_ssl_verify,
+    http_timeout_seconds,
+    http_impersonate
   };
 
   try {
@@ -497,7 +682,7 @@ async function loadLogs() {
     logs = Array.isArray(data) ? data : [];
     renderLogs();
   } catch (e) {
-    if (container) container.innerHTML = `<div class="empty-text">读取日志失败</div>`;
+    renderLogMessage(container, '读取日志失败');
   }
 }
 
@@ -507,28 +692,50 @@ function getLogTitle(log) {
   return '自动定时签到';
 }
 
+function renderLogMessage(container, message) {
+  if (!container) return;
+  container.replaceChildren();
+  const empty = document.createElement('div');
+  empty.className = 'empty-text';
+  empty.textContent = message;
+  container.appendChild(empty);
+}
+
 function renderLogs() {
   const container = document.getElementById('logs-body');
   if (!container) return;
 
   if (logs.length === 0) {
-    container.innerHTML = `<div class="empty-text">暂无签到历史记录</div>`;
+    renderLogMessage(container, '暂无签到历史记录');
     return;
   }
 
-  container.innerHTML = `
-    <div class="timeline">
-      ${logs.map(log => `
-        <div class="timeline-item">
-          <div class="timeline-header">
-            <span class="timeline-title">${getLogTitle(log)}</span>
-            <span class="timeline-time">${escapeHtml(log.timestamp)}</span>
-          </div>
-          <div class="timeline-content">${escapeHtml(log.report)}</div>
-        </div>
-      `).join('')}
-    </div>
-  `;
+  container.replaceChildren();
+  const timeline = document.createElement('div');
+  timeline.className = 'timeline';
+
+  logs.forEach(log => {
+    const item = document.createElement('div');
+    item.className = 'timeline-item';
+
+    const header = document.createElement('div');
+    header.className = 'timeline-header';
+    const title = document.createElement('span');
+    title.className = 'timeline-title';
+    title.textContent = getLogTitle(log);
+    const time = document.createElement('span');
+    time.className = 'timeline-time';
+    time.textContent = log.timestamp || '';
+    header.append(title, time);
+
+    const content = document.createElement('div');
+    content.className = 'timeline-content';
+    content.textContent = log.report || '';
+    item.append(header, content);
+    timeline.appendChild(item);
+  });
+
+  container.appendChild(timeline);
 }
 
 function openLogsDrawer() {
@@ -555,3 +762,4 @@ document.addEventListener('DOMContentLoaded', () => {
   loadSettings();
   loadLogs();
 });
+
