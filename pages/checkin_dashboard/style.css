@@ -118,6 +118,17 @@ body {
   border-color: var(--success-hover);
 }
 
+.btn-success-plain {
+  color: var(--success-hover);
+  border-color: #86efac;
+  background: #f0fdf4;
+}
+
+.btn-success-plain:hover {
+  background: #dcfce7;
+  border-color: var(--success);
+}
+
 .btn-danger-plain {
   color: var(--danger);
   border-color: #fca5a5;
@@ -206,6 +217,11 @@ table.custom-table tr:last-child td {
   color: #92400e;
 }
 
+.badge-failure {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
 .token-mask {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   background-color: #f1f5f9;
@@ -223,6 +239,14 @@ table.custom-table tr:last-child td {
 
 .link:hover {
   text-decoration: underline;
+}
+
+.link-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  text-align: left;
 }
 
 /* Switch Component */
