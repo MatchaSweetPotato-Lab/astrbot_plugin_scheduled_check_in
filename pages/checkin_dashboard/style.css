@@ -506,6 +506,8 @@ input:checked + .slider:before {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  max-width: min(420px, calc(100vw - 40px));
+  pointer-events: none;
 }
 
 .toast {
@@ -517,7 +519,18 @@ input:checked + .slider:before {
   border-left: 4px solid var(--primary);
   font-size: 14px;
   font-weight: 500;
+  line-height: 1.45;
   animation: slideIn 0.3s ease;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: auto;
+  cursor: pointer;
+  user-select: none;
 }
 
 .toast-success { border-left-color: var(--success); }
@@ -612,5 +625,48 @@ input:checked + .slider:before {
 .btn-icon-danger:hover {
   background: #fef2f2;
   border-color: #fca5a5;
+}
+
+/* Infinite Scroll Loading & Endline */
+.logs-loading-more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 16px 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid #e2e8f0;
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.logs-end-line {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 16px 0 8px 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}
+
+.logs-end-line::before,
+.logs-end-line::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background-color: var(--border);
 }
 

@@ -194,6 +194,11 @@
             </select>
             <div class="form-hint">选项及默认值由服务端根据当前 curl_cffi 版本动态提供。</div>
           </div>
+          <div class="form-group">
+            <label for="setting-max-history-records">历史日志保留上限（条数）</label>
+            <input type="number" id="setting-max-history-records" class="form-control" min="0" max="1000000" step="1" value="0" />
+            <div class="form-hint">设为 0 表示不设上限（全部保留）。配置大于 0 时，超出条数的旧日志将被自动清理。</div>
+          </div>
         </div>
         <div class="modal-footer">
           <button class="btn" onclick="closeModal('settings-modal')">取消</button>

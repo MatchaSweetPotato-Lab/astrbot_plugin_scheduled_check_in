@@ -7,6 +7,7 @@ import unittest
 from datetime import datetime
 from typing import Any
 
+import tests  # noqa: F401
 from core.adapters import CheckInResult
 from core.scheduler import CheckInScheduler
 
@@ -28,7 +29,53 @@ class _FakePlugin:
         self.history.append((results, log_type))
 
 
+class _PluginWithDirectUpdate:
+    def __init__(self) -> None:
+        self.updates: list[dict[str, Any]] = []
+        self.history: list[tuple[list[CheckInResult], str]] = []
+
+    def update_site_checkin_state(
+        self,
+        site_id: str,
+        last_checkin_date: str,
+        last_checkin_time: str,
+        last_checkin_success: bool,
+        last_quota: float | None = None,
+    ) -> None:
+        self.updates.append({
+            "site_id": site_id,
+            "last_checkin_date": last_checkin_date,
+            "last_checkin_time": last_checkin_time,
+            "last_checkin_success": last_checkin_success,
+            "last_quota": last_quota,
+        })
+
+    def record_history(self, results: list[CheckInResult], log_type: str) -> None:
+        self.history.append((results, log_type))
+
+
 class SchedulerPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_update_site_checkin_state_called(self) -> None:
+        plugin = _PluginWithDirectUpdate()
+        scheduler = CheckInScheduler(plugin)
+        result = CheckInResult("site-123", "Site 123", True, "ok", total_quota=88.8)
+        checked_at = datetime(2026, 8, 16, 15, 30, 0)
+
+        await scheduler._persist_checkin_results(
+            [result],
+            True,
+            [result],
+            checked_at,
+        )
+
+        self.assertEqual(len(plugin.updates), 1)
+        self.assertEqual(plugin.updates[0]["site_id"], "site-123")
+        self.assertEqual(plugin.updates[0]["last_checkin_date"], "2026-08-16")
+        self.assertEqual(plugin.updates[0]["last_checkin_time"], "15:30:00")
+        self.assertEqual(plugin.updates[0]["last_checkin_success"], True)
+        self.assertEqual(plugin.updates[0]["last_quota"], 88.8)
+        self.assertEqual(len(plugin.history), 1)
+
     async def test_merges_result_into_latest_site_configuration(self) -> None:
         plugin = _FakePlugin(
             [
