@@ -75,6 +75,7 @@ function maskToken(val) {
 }
 
 function getSiteId(site) {
+  // Site IDs are transported as trimmed strings, matching the scheduler API.
   if (!site || site.id === undefined || site.id === null) return '';
   return String(site.id).trim();
 }

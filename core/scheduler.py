@@ -175,7 +175,11 @@ class CheckInScheduler:
 
     @staticmethod
     def _normalize_site_id(value: Any) -> str:
-        """Normalize site IDs at the scheduler persistence boundary."""
+        """Normalize the shared site-ID contract used by the web API.
+
+        Site IDs are transported and compared as trimmed strings.  The
+        dashboard's ``getSiteId`` helper follows the same contract.
+        """
         if value is None:
             return ""
         return str(value).strip()
@@ -311,7 +315,6 @@ class CheckInScheduler:
                 result = await adapter.check_in()
                 results.append(result)
 
-                self._update_site_checkin_state(site_config, result, checked_at)
                 if site_id:
                     site_ids_to_update.add(site_id)
 
