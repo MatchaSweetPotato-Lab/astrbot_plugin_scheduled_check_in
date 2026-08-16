@@ -11,7 +11,7 @@ let settings = {
   checkin_time: '08:30',
   http_ssl_verify: true,
   http_timeout_seconds: 15,
-  http_impersonate: 'chrome131',
+  http_impersonate: '',
   http_impersonate_options: []
 };
 let logs = [];
@@ -569,20 +569,34 @@ function renderImpersonateOptions() {
   const select = document.getElementById('setting-http-impersonate');
   if (!select) return;
 
+  const maxOptions = 128;
   const values = Array.isArray(settings.http_impersonate_options)
     ? settings.http_impersonate_options.filter(value => typeof value === 'string' && value.trim())
     : [];
-  const options = [...new Set(values)];
-  if (!options.includes('chrome131')) options.unshift('chrome131');
-
-  const selected = options.includes(settings.http_impersonate)
+  const uniqueValues = [...new Set(values)];
+  const fallback = uniqueValues.includes('chrome131')
+    ? 'chrome131'
+    : (uniqueValues[0] || '');
+  const selected = uniqueValues.includes(settings.http_impersonate)
     ? settings.http_impersonate
-    : 'chrome131';
+    : fallback;
+  const options = [...new Set([fallback, selected, ...uniqueValues].filter(Boolean))].slice(0, maxOptions);
+
   select.replaceChildren();
+  if (options.length === 0) {
+    const emptyOption = document.createElement('option');
+    emptyOption.value = '';
+    emptyOption.textContent = '当前版本未提供可用指纹';
+    emptyOption.disabled = true;
+    emptyOption.selected = true;
+    select.appendChild(emptyOption);
+    return;
+  }
+
   options.forEach(value => {
     const option = document.createElement('option');
     option.value = value;
-    option.textContent = value === 'chrome131' ? `${value}（默认）` : value;
+    option.textContent = value === fallback ? `${value}（默认）` : value;
     select.appendChild(option);
   });
   select.value = selected;
@@ -611,7 +625,7 @@ async function saveSettings() {
     ? Math.min(300, Math.max(1, Math.round(timeoutInput)))
     : 15;
   const httpImpersonateSelect = document.getElementById('setting-http-impersonate');
-  const http_impersonate = httpImpersonateSelect?.value || 'chrome131';
+  const http_impersonate = httpImpersonateSelect?.value || settings.http_impersonate || '';
 
   settings = {
     enabled,

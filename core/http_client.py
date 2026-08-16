@@ -10,6 +10,7 @@ DEFAULT_TIMEOUT_SECONDS = 15.0
 MIN_TIMEOUT_SECONDS = 1.0
 MAX_TIMEOUT_SECONDS = 300.0
 DEFAULT_IMPERSONATE = "chrome131"
+_IMPERSONATE_OPTIONS = tuple(browser.value for browser in BrowserType)
 
 
 def _get_timeout_seconds(settings: Mapping[str, Any]) -> float:
@@ -23,13 +24,17 @@ def _get_timeout_seconds(settings: Mapping[str, Any]) -> float:
 
 def get_impersonate_options() -> list[str]:
     """Return the browser fingerprints exposed by the installed curl_cffi build."""
-    return [browser.value for browser in BrowserType]
+    return list(_IMPERSONATE_OPTIONS)
 
 
 def normalize_impersonate(value: Any) -> str:
-    """Validate a configured fingerprint and fall back to chrome131."""
-    if isinstance(value, str) and value in get_impersonate_options():
+    """Validate a configured fingerprint and fall back to a supported default."""
+    if isinstance(value, str) and value in _IMPERSONATE_OPTIONS:
         return value
+    if DEFAULT_IMPERSONATE in _IMPERSONATE_OPTIONS:
+        return DEFAULT_IMPERSONATE
+    if _IMPERSONATE_OPTIONS:
+        return _IMPERSONATE_OPTIONS[0]
     return DEFAULT_IMPERSONATE
 
 
