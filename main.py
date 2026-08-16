@@ -7,14 +7,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import aiohttp
-
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.api.web import error_response, json_response, request
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .core.adapters import create_adapter
+from .core.http_client import create_client_session
 from .core.scheduler import CheckInScheduler
 
 logger = logging.getLogger("astrbot")
@@ -108,6 +107,8 @@ class ScheduledCheckInPlugin(Star):
             "start_time": "08:00",
             "end_time": "10:30",
             "checkin_time": "08:30",
+            "http_ssl_verify": True,
+            "http_timeout_seconds": 15,
         }
         if not self.settings_file.exists():
             return default_settings
@@ -194,6 +195,7 @@ class ScheduledCheckInPlugin(Star):
             ("/api/sites", self.api_get_sites, ["GET"], "获取站点列表"),
             ("/api/sites", self.api_save_sites, ["POST"], "保存站点配置"),
             ("/api/sites/test", self.api_test_site, ["POST"], "测试站点连接"),
+            ("/api/sites/recheckin", self.api_recheckin_site, ["POST"], "重新签到单个站点"),
             ("/api/checkin/run", self.api_run_checkin, ["POST"], "触发一键打卡"),
             ("/api/settings", self.api_get_settings, ["GET"], "获取设置"),
             ("/api/settings", self.api_save_settings, ["POST"], "保存设置"),
@@ -251,12 +253,28 @@ class ScheduledCheckInPlugin(Star):
             return error_response("请求体必须是合法 JSON")
         if not isinstance(site_config, dict):
             return error_response("站点配置必须是对象")
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
+        async with create_client_session(self.get_settings()) as session:
             adapter = create_adapter(site_config, session, self.acw_cache_file)
             result = await adapter.test_connection()
             self.record_history([result], log_type="test")
             return json_response(result.to_dict())
+
+    async def api_recheckin_site(self) -> Any:
+        """Web API: Force a check-in for one configured site."""
+        parsed, body = await _read_json_body()
+        if not parsed:
+            return error_response("请求体必须是合法 JSON")
+        if not isinstance(body, dict):
+            return error_response("重新签到请求必须是对象")
+        site_id = str(body.get("site_id", "")).strip()
+        if not site_id:
+            return error_response("缺少站点 ID")
+
+        result = await self.scheduler.run_check_in_site(site_id, manual=True)
+        if result is None:
+            return error_response("站点不存在")
+
+        return json_response({"status": "ok", "result": result.to_dict()})
 
     async def api_run_checkin(self) -> Any:
         """Web API: Trigger instant check-in.
@@ -296,7 +314,9 @@ class ScheduledCheckInPlugin(Star):
             return error_response("请求体必须是合法 JSON")
         if not isinstance(data, dict):
             return error_response("全局设置必须是对象")
-        self.save_settings(data)
+        settings = self.get_settings()
+        settings.update(data)
+        self.save_settings(settings)
         self.scheduler.reset_today_target_time()
         return json_response({"status": "ok", "message": "全局设置已更新"})
 
@@ -379,8 +399,7 @@ class ScheduledCheckInPlugin(Star):
 
         yield event.plain_result("正在查询各中转站余额与连通性...")
         results = []
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
+        async with create_client_session(self.get_settings()) as session:
             for site in sites:
                 if site.get("enabled", True):
                     adapter = create_adapter(site, session, self.acw_cache_file)
