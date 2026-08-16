@@ -6,13 +6,12 @@ import logging
 from pathlib import Path
 from typing import Any
 
-import aiohttp
-
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.api.web import json_response, request
 
 from .core.adapters import create_adapter
+from .core.http_client import create_client_session
 from .core.scheduler import CheckInScheduler
 
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
@@ -230,8 +229,7 @@ class ScheduledCheckInPlugin(Star):
             JSON response with connection test result.
         """
         site_config = await request.json()
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
+        async with create_client_session() as session:
             adapter = create_adapter(site_config, session)
             result = await adapter.test_connection()
             self.record_history([result], log_type="test")
@@ -354,8 +352,7 @@ class ScheduledCheckInPlugin(Star):
 
         yield event.plain_result("正在查询各中转站余额与连通性...")
         results = []
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
+        async with create_client_session() as session:
             for site in sites:
                 if site.get("enabled", True):
                     adapter = create_adapter(site, session)
