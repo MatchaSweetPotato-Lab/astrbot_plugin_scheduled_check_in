@@ -618,10 +618,12 @@ async function saveSettings() {
   const end_time = document.getElementById('setting-end-time').value;
   const checkin_time = document.getElementById('setting-fixed-time').value;
   const http_ssl_verify = document.getElementById('setting-http-ssl-verify').checked;
-  const timeoutInput = Number(document.getElementById('setting-http-timeout').value);
+  const timeoutInputElement = document.getElementById('setting-http-timeout');
+  const timeoutInput = Number(timeoutInputElement.value);
   const http_timeout_seconds = Number.isFinite(timeoutInput)
     ? Math.min(300, Math.max(1, Math.round(timeoutInput)))
     : 15;
+  timeoutInputElement.value = String(http_timeout_seconds);
   const httpImpersonateSelect = document.getElementById('setting-http-impersonate');
   const http_impersonate = httpImpersonateSelect?.value || settings.http_impersonate || '';
 
