@@ -20,7 +20,7 @@ from .core.http_client import (
     normalize_impersonate,
 )
 from .core.scheduler import CheckInScheduler
-from .core.storage import DatabaseManager
+from .core.storage import DEFAULT_SETTINGS, DatabaseManager
 
 logger = logging.getLogger("astrbot")
 
@@ -136,18 +136,7 @@ class ScheduledCheckInPlugin(Star):
             return self.db.get_settings()
         except Exception as e:
             logger.error(f"Error reading settings from database: {e}", exc_info=True)
-            return {
-                "enabled": True,
-                "random_enabled": True,
-                "start_time": "08:00",
-                "end_time": "10:30",
-                "checkin_time": "08:30",
-                "http_ssl_verify": True,
-                "http_timeout_seconds": 15,
-                "http_impersonate": DEFAULT_IMPERSONATE,
-                "manual_target_time": "",
-                "max_history_records": 0,
-            }
+            return dict(DEFAULT_SETTINGS)
 
     def save_settings(self, settings_data: dict[str, Any]) -> None:
         """Write settings to SQLite database.
@@ -398,16 +387,19 @@ class ScheduledCheckInPlugin(Star):
             logger.warning(f"Failed to parse query params for /api/logs: {e}")
 
         logs = self.read_history_logs(limit=limit, before_id=before_id)
-        total = self.count_history_logs()
+        total = self.count_history_logs() if before_id is None else None
         has_more = len(logs) == limit
         next_before_id = logs[-1]["id"] if (has_more and logs) else None
 
-        return json_response({
+        response_data: dict[str, Any] = {
             "items": logs,
             "has_more": has_more,
-            "total": total,
             "next_before_id": next_before_id,
-        })
+        }
+        if total is not None:
+            response_data["total"] = total
+
+        return json_response(response_data)
 
     async def api_clear_logs(self) -> Any:
         """Web API: Clear history logs.
