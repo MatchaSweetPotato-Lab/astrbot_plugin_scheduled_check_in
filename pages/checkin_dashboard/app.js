@@ -10,7 +10,9 @@ let settings = {
   end_time: '10:30',
   checkin_time: '08:30',
   http_ssl_verify: true,
-  http_timeout_seconds: 15
+  http_timeout_seconds: 15,
+  http_impersonate: '',
+  http_impersonate_options: []
 };
 let logs = [];
 let isEdit = false;
@@ -73,8 +75,13 @@ function maskToken(val) {
 }
 
 function getSiteId(site) {
+  // Site IDs are transported as trimmed strings, matching the scheduler API.
   if (!site || site.id === undefined || site.id === null) return '';
   return String(site.id).trim();
+}
+
+function normalizeImpersonateValue(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
 
 // Helper: Open URL
@@ -559,7 +566,49 @@ function renderSettingsForm() {
   document.getElementById('setting-fixed-time').value = settings.checkin_time || '08:30';
   document.getElementById('setting-http-ssl-verify').checked = settings.http_ssl_verify === true;
   document.getElementById('setting-http-timeout').value = settings.http_timeout_seconds || 15;
+  renderImpersonateOptions();
   toggleRandomMode();
+}
+
+function renderImpersonateOptions() {
+  const select = document.getElementById('setting-http-impersonate');
+  if (!select) return;
+
+  const maxOptions = 128;
+  const values = Array.isArray(settings.http_impersonate_options)
+    ? settings.http_impersonate_options.map(normalizeImpersonateValue).filter(Boolean)
+    : [];
+  const normalizedCurrent = normalizeImpersonateValue(settings.http_impersonate);
+  const currentValueMissing = normalizedCurrent && !values.includes(normalizedCurrent);
+  if (currentValueMissing) {
+    values.unshift(normalizedCurrent);
+  }
+  const options = [...new Set(values)].slice(0, maxOptions);
+
+  select.replaceChildren();
+  if (options.length === 0) {
+    const emptyOption = document.createElement('option');
+    emptyOption.value = '';
+    emptyOption.textContent = '当前版本未提供可用指纹';
+    emptyOption.disabled = true;
+    emptyOption.selected = true;
+    select.appendChild(emptyOption);
+    return;
+  }
+
+  options.forEach(value => {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = currentValueMissing && value === normalizedCurrent
+      ? `${value}（当前配置，当前版本不可用）`
+      : value;
+    select.appendChild(option);
+  });
+  if (options.includes(normalizedCurrent)) {
+    select.value = normalizedCurrent;
+  } else {
+    select.value = options[0];
+  }
 }
 
 function toggleRandomMode() {
@@ -580,10 +629,14 @@ async function saveSettings() {
   const end_time = document.getElementById('setting-end-time').value;
   const checkin_time = document.getElementById('setting-fixed-time').value;
   const http_ssl_verify = document.getElementById('setting-http-ssl-verify').checked;
-  const timeoutInput = Number(document.getElementById('setting-http-timeout').value);
+  const timeoutInputElement = document.getElementById('setting-http-timeout');
+  const timeoutInput = Number(timeoutInputElement.value);
   const http_timeout_seconds = Number.isFinite(timeoutInput)
     ? Math.min(300, Math.max(1, Math.round(timeoutInput)))
     : 15;
+  timeoutInputElement.value = String(http_timeout_seconds);
+  const httpImpersonateSelect = document.getElementById('setting-http-impersonate');
+  const http_impersonate = httpImpersonateSelect?.value || settings.http_impersonate || '';
 
   settings = {
     enabled,
@@ -592,7 +645,8 @@ async function saveSettings() {
     end_time,
     checkin_time,
     http_ssl_verify,
-    http_timeout_seconds
+    http_timeout_seconds,
+    http_impersonate
   };
 
   try {
