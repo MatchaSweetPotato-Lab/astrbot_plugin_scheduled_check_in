@@ -446,6 +446,13 @@ input:checked + .slider:before {
   box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
 }
 
+.form-hint {
+  margin-top: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .radio-group {
   display: flex;
   gap: 16px;
