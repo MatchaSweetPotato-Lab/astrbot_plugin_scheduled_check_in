@@ -217,6 +217,11 @@ table.custom-table tr:last-child td {
   color: #92400e;
 }
 
+.badge-failure {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
 .token-mask {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   background-color: #f1f5f9;
