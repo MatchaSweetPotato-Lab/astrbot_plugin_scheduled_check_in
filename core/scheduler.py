@@ -222,41 +222,61 @@ class CheckInScheduler:
         """Merge results into the latest configuration and record history.
 
         Check-in requests may run while the web UI edits sites or while another
-        check-in is completing.  Reloading under a scheduler-wide lock keeps
-        those operations from writing an older full-list snapshot over newer
-        configuration changes.
+        check-in is completing. Direct site state updates or reloading under a
+        scheduler-wide lock keeps those operations consistent.
         """
+        checked_at = checked_at or datetime.now()
+        date_str = checked_at.strftime("%Y-%m-%d")
+        time_str = checked_at.strftime("%H:%M:%S")
+
         async with self._persistence_lock:
             if site_results_to_persist:
-                latest_sites = self.plugin.get_sites()
-                result_by_site_id: dict[str, CheckInResult] = {}
-                for result in site_results_to_persist:
-                    result_site_id = self._normalize_site_id(result.site_id)
-                    if not result_site_id:
-                        logger.warning(
-                            "Skipping check-in result without a site ID: %s",
-                            result.site_name,
+                if hasattr(self.plugin, "update_site_checkin_state"):
+                    for result in site_results_to_persist:
+                        result_site_id = self._normalize_site_id(result.site_id)
+                        if not result_site_id:
+                            logger.warning(
+                                "Skipping check-in result without a site ID: %s",
+                                result.site_name,
+                            )
+                            continue
+                        self.plugin.update_site_checkin_state(
+                            site_id=result_site_id,
+                            last_checkin_date=date_str,
+                            last_checkin_time=time_str,
+                            last_checkin_success=result.success,
+                            last_quota=result.total_quota,
                         )
-                        continue
-                    result_by_site_id[result_site_id] = result
-                sites_changed = False
-                for site_config in latest_sites:
-                    site_id = self._normalize_site_id(site_config.get("id"))
-                    if not site_id:
-                        logger.warning(
-                            "Skipping persistence for site without an ID: %s",
-                            site_config.get("name", "<unnamed>"),
+                else:
+                    latest_sites = self.plugin.get_sites()
+                    result_by_site_id: dict[str, CheckInResult] = {}
+                    for result in site_results_to_persist:
+                        result_site_id = self._normalize_site_id(result.site_id)
+                        if not result_site_id:
+                            logger.warning(
+                                "Skipping check-in result without a site ID: %s",
+                                result.site_name,
+                            )
+                            continue
+                        result_by_site_id[result_site_id] = result
+                    sites_changed = False
+                    for site_config in latest_sites:
+                        site_id = self._normalize_site_id(site_config.get("id"))
+                        if not site_id:
+                            logger.warning(
+                                "Skipping persistence for site without an ID: %s",
+                                site_config.get("name", "<unnamed>"),
+                            )
+                            continue
+                        result = result_by_site_id.get(
+                            site_id
                         )
-                        continue
-                    result = result_by_site_id.get(
-                        site_id
-                    )
-                    if result is not None:
-                        self._update_site_checkin_state(site_config, result, checked_at)
-                        sites_changed = True
+                        if result is not None:
+                            self._update_site_checkin_state(site_config, result, checked_at)
+                            sites_changed = True
 
-                if sites_changed:
-                    self.plugin.save_sites(latest_sites)
+                    if sites_changed:
+                        self.plugin.save_sites(latest_sites)
         async with self._history_lock:
             self._record_checkin_history(results, manual)
 

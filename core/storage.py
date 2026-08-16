@@ -209,11 +209,21 @@ class DatabaseManager:
             site_dict["last_checkin_success"] = bool(row["last_checkin_success"])
         if row["last_quota"] is not None:
             site_dict["last_quota"] = row["last_quota"]
+        if "created_at" in row.keys() and row["created_at"]:
+            site_dict["created_at"] = row["created_at"]
+        if "updated_at" in row.keys() and row["updated_at"]:
+            site_dict["updated_at"] = row["updated_at"]
         return site_dict
 
-    def _insert_sites_records(self, conn: sqlite3.Connection, sites_data: list[dict[str, Any]]) -> None:
+    def _insert_sites_records(
+        self,
+        conn: sqlite3.Connection,
+        sites_data: list[dict[str, Any]],
+        existing_created_at: dict[str, str] | None = None,
+    ) -> None:
         """Insert or replace a list of site dicts into the database."""
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        existing_created_at = existing_created_at or {}
         for order, site in enumerate(sites_data):
             site_id = str(site.get("id") or f"site_{int(datetime.now().timestamp() * 1000)}_{order}").strip()
             name = str(site.get("name", "")).strip()
@@ -232,6 +242,7 @@ class DatabaseManager:
             if "last_checkin_success" in site and site["last_checkin_success"] is not None:
                 last_success = 1 if site["last_checkin_success"] else 0
             last_quota = site.get("last_quota")
+            created_at = site.get("created_at") or existing_created_at.get(site_id) or now_str
 
             conn.execute(
                 """
@@ -264,7 +275,7 @@ class DatabaseManager:
                     site_id, name, stype, base_url, auth_type, auth_value, solve_acw,
                     endpoint, proxy, headers, enabled,
                     last_date, last_time, last_success, last_quota,
-                    order, now_str, now_str
+                    order, created_at, now_str
                 ),
             )
 
@@ -279,7 +290,7 @@ class DatabaseManager:
             return [self._site_row_to_dict(row) for row in cursor.fetchall()]
 
     def save_sites(self, sites_data: list[dict[str, Any]]) -> None:
-        """Replace the full sites configuration atomically.
+        """Replace the full sites configuration atomically while preserving created_at.
 
         Args:
             sites_data: New list of site dictionaries.
@@ -287,8 +298,10 @@ class DatabaseManager:
         with self._lock, self._get_connection() as conn:
             conn.execute("BEGIN TRANSACTION")
             try:
+                cursor = conn.execute("SELECT id, created_at FROM sites")
+                existing_created_at = {row["id"]: row["created_at"] for row in cursor.fetchall()}
                 conn.execute("DELETE FROM sites")
-                self._insert_sites_records(conn, sites_data)
+                self._insert_sites_records(conn, sites_data, existing_created_at=existing_created_at)
                 conn.commit()
             except Exception:
                 conn.rollback()

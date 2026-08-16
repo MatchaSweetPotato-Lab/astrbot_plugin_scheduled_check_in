@@ -98,6 +98,34 @@ class ScheduledCheckInPlugin(Star):
         except Exception as e:
             logger.error(f"Error saving sites to database: {e}", exc_info=True)
 
+    def update_site_checkin_state(
+        self,
+        site_id: str,
+        last_checkin_date: str,
+        last_checkin_time: str,
+        last_checkin_success: bool,
+        last_quota: float | None = None,
+    ) -> None:
+        """Update check-in status and quota for a single site in SQLite database.
+
+        Args:
+            site_id: ID of the site to update.
+            last_checkin_date: YYYY-MM-DD string.
+            last_checkin_time: HH:MM:SS string.
+            last_checkin_success: Success boolean flag.
+            last_quota: Balance quota float.
+        """
+        try:
+            self.db.update_site_checkin_state(
+                site_id=site_id,
+                last_checkin_date=last_checkin_date,
+                last_checkin_time=last_checkin_time,
+                last_checkin_success=last_checkin_success,
+                last_quota=last_quota,
+            )
+        except Exception as e:
+            logger.error(f"Error updating site check-in state in database: {e}", exc_info=True)
+
     def get_settings(self) -> dict[str, Any]:
         """Read plugin settings from SQLite database.
 

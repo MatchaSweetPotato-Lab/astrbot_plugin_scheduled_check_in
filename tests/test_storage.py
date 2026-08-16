@@ -91,6 +91,32 @@ class DatabaseManagerTests(unittest.TestCase):
         self.assertEqual(updated[0]["last_checkin_success"], True)
         self.assertEqual(updated[0]["last_quota"], 100.5)
 
+        # Verify created_at preservation across save_sites
+        orig_created_at_1 = updated[0]["created_at"]
+        orig_created_at_2 = updated[1]["created_at"]
+        self.assertTrue(bool(orig_created_at_1))
+        self.assertTrue(bool(orig_created_at_2))
+
+        # Re-save with modifications and a new site
+        modified_sites = list(updated)
+        modified_sites[0]["name"] = "Site One Renamed"
+        modified_sites.append({
+            "id": "site_3",
+            "name": "Site Three",
+            "type": "new-api",
+            "base_url": "https://site3.example.com",
+            "auth_type": "bearer_token",
+            "auth_value": "token_3",
+            "enabled": True,
+        })
+        self.db.save_sites(modified_sites)
+        reloaded = self.db.get_sites()
+        self.assertEqual(len(reloaded), 3)
+        self.assertEqual(reloaded[0]["name"], "Site One Renamed")
+        self.assertEqual(reloaded[0]["created_at"], orig_created_at_1)
+        self.assertEqual(reloaded[1]["created_at"], orig_created_at_2)
+        self.assertTrue(bool(reloaded[2]["created_at"]))
+
     def test_settings_crud_and_defaults(self) -> None:
         """Test reading default settings and saving updated settings."""
         settings = self.db.get_settings()
