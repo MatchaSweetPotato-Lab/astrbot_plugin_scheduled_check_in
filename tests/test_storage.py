@@ -468,6 +468,77 @@ class DatabaseManagerTests(unittest.TestCase):
         self.assertEqual(self.db.count_history_logs(), 1)
         self.assertEqual(self.db.read_history_logs()[0]["report"], "Enabled")
 
+    def test_auto_cleanup_per_call_overrides_global_settings(self) -> None:
+        """Per-call cleanup values override global numeric settings when enabled."""
+        self.db.clear_history_logs()
+        settings = self.db.get_settings()
+        settings["auto_cleanup_logs"] = True
+        settings["history_retention_days"] = 0
+        settings["max_history_records"] = 10
+        self.db.save_settings(settings)
+
+        for index in range(5):
+            self.db.record_history({
+                "timestamp": f"2026-08-16 13:0{index}:00",
+                "type": "scheduled",
+                "manual": False,
+                "success": True,
+                "report": f"Report {index}",
+                "details": [],
+            })
+        self.db.record_history(
+            {
+                "timestamp": "2026-08-16 13:05:00",
+                "type": "scheduled",
+                "manual": False,
+                "success": True,
+                "report": "Final",
+                "details": [],
+            },
+            max_records=3,
+        )
+
+        logs = self.db.read_history_logs()
+        self.assertEqual([log["report"] for log in logs], ["Final", "Report 4", "Report 3"])
+
+        self.db.clear_history_logs()
+        settings["history_retention_days"] = 30
+        settings["max_history_records"] = 100
+        self.db.save_settings(settings)
+        old_timestamp = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S")
+        self.db.record_history({
+            "timestamp": old_timestamp,
+            "type": "scheduled",
+            "manual": False,
+            "success": True,
+            "report": "Old",
+            "details": [],
+        })
+        self.db.record_history({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "type": "scheduled",
+            "manual": False,
+            "success": True,
+            "report": "New",
+            "details": [],
+        })
+        self.db.record_history(
+            {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "type": "scheduled",
+                "manual": False,
+                "success": True,
+                "report": "Trigger cleanup",
+                "details": [],
+            },
+            retention_days=7,
+        )
+
+        reports = [log["report"] for log in self.db.read_history_logs()]
+        self.assertNotIn("Old", reports)
+        self.assertIn("New", reports)
+        self.assertIn("Trigger cleanup", reports)
+
 
 if __name__ == "__main__":
     unittest.main()
