@@ -417,34 +417,36 @@ class ScheduledCheckInPlugin(Star):
                 "status": "success" if event["success"] else "failure",
                 "message": event["message"],
                 "gained_quota": event["gained_quota"],
+                "balance": None,
             }
 
-        daily_balances: dict[str, float] = {}
-        for event in events:
-            if event["balance"] is not None:
-                daily_balances[event["date"]] = event["balance"]
-        for date_str, day in daily_checkins.items():
-            day["balance"] = daily_balances.get(date_str)
-
         balance_history: list[dict[str, Any]] = []
-        previous_balance: float | None = None
-        for event in events:
-            balance = event["balance"]
-            if balance is None:
-                continue
-            change = None if previous_balance is None else round(balance - previous_balance, 3)
-            balance_history.append(
-                {
-                    "timestamp": event["timestamp"],
-                    "date": event["date"],
-                    "time": event["time"],
-                    "type": event["type"],
-                    "message": event["message"],
-                    "balance": balance,
-                    "change": change,
-                }
-            )
-            previous_balance = balance
+        if supports_balance:
+            daily_balances: dict[str, float] = {}
+            for event in events:
+                if event["balance"] is not None:
+                    daily_balances[event["date"]] = event["balance"]
+            for date_str, day in daily_checkins.items():
+                day["balance"] = daily_balances.get(date_str)
+
+            previous_balance: float | None = None
+            for event in events:
+                balance = event["balance"]
+                if balance is None:
+                    continue
+                change = None if previous_balance is None else round(balance - previous_balance, 3)
+                balance_history.append(
+                    {
+                        "timestamp": event["timestamp"],
+                        "date": event["date"],
+                        "time": event["time"],
+                        "type": event["type"],
+                        "message": event["message"],
+                        "balance": balance,
+                        "change": change,
+                    }
+                )
+                previous_balance = balance
 
         current_balance = as_balance(site.get("last_quota"))
         current_balance_timestamp = " ".join(

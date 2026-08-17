@@ -72,6 +72,7 @@ class _QuotaFetchResult:
     total_quota: float = 0.0
     expired: bool = False
     available: bool = False
+    waf_intercepted: bool = False
     message: str = ""
 
 
@@ -442,7 +443,7 @@ class _NewApiQuotaService:
                     message=message,
                     response_text=text,
                 )
-                return _QuotaFetchResult(message=message)
+                return _QuotaFetchResult(waf_intercepted=True, message=message)
 
             data: Any = None
             if response.status == 200:
@@ -839,8 +840,8 @@ class NewApiAdapter(BaseCheckInAdapter):
         attempts: list[dict[str, Any]] = []
         quota_service = _NewApiQuotaService(self, headers, attempts)
         quota_result = await quota_service.fetch("测试鉴权/余额")
-        if quota_result.expired:
-            # Fallback probe on /v1/models to verify if API key works
+        if quota_result.expired or quota_result.waf_intercepted:
+            # Probe /v1/models when auth or the management endpoint is blocked.
             models_url = f"{self.base_url}/v1/models"
             model_status: int | None = None
             fallback_message = quota_result.message
@@ -886,7 +887,7 @@ class NewApiAdapter(BaseCheckInAdapter):
                 site_name=self.site_name,
                 success=False,
                 message=fallback_message,
-                expired=True,
+                expired=quota_result.expired,
                 error_detail=self._format_attempts(attempts),
                 attempts=attempts,
             )

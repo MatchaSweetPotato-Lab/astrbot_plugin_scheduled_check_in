@@ -204,13 +204,29 @@ class DatabaseManager:
             if marker:
                 return
 
-            rows = conn.execute("SELECT id, details FROM history_logs").fetchall()
-            for row in rows:
-                try:
-                    details = json.loads(row["details"])
-                except Exception:
-                    details = []
-                self._index_history_entry_sites(conn, int(row["id"]), details)
+            batch_size = 1000
+            last_id = 0
+            while True:
+                rows = conn.execute(
+                    """
+                    SELECT id, details
+                    FROM history_logs
+                    WHERE id > ?
+                    ORDER BY id
+                    LIMIT ?
+                    """,
+                    (last_id, batch_size),
+                ).fetchall()
+                if not rows:
+                    break
+
+                for row in rows:
+                    try:
+                        details = json.loads(row["details"])
+                    except Exception:
+                        details = []
+                    self._index_history_entry_sites(conn, int(row["id"]), details)
+                last_id = int(rows[-1]["id"])
 
             conn.execute(
                 "INSERT INTO storage_metadata (key, value) VALUES (?, ?)",
@@ -607,32 +623,51 @@ class DatabaseManager:
             site_filter = str(site_id).strip() if site_id is not None else None
             if not site_filter:
                 site_filter = None
-            conditions: list[str] = []
-            query_parameters: list[Any] = []
-            if start_bound:
-                conditions.append("history_logs.timestamp >= ?")
-                query_parameters.append(start_bound)
-            if end_bound:
-                conditions.append("history_logs.timestamp <= ?")
-                query_parameters.append(end_bound)
-            if before_id is not None:
-                conditions.append("history_logs.id < ?")
-                query_parameters.append(before_id)
-
-            from_clause = "history_logs"
             if site_filter:
-                from_clause += " INNER JOIN history_log_sites AS indexed_sites ON indexed_sites.history_id = history_logs.id"
-                conditions.append("indexed_sites.site_id = ?")
-                query_parameters.append(site_filter)
-
-            query = f"SELECT history_logs.* FROM {from_clause}"
-            if conditions:
-                query += " WHERE " + " AND ".join(conditions)
-            query += " ORDER BY history_logs.id DESC"
-            if limit is not None:
-                query += " LIMIT ?"
-                query_parameters.append(limit)
-            cursor = conn.execute(query, query_parameters)
+                cursor = conn.execute(
+                    """
+                    SELECT history_logs.*
+                    FROM history_logs
+                    INNER JOIN history_log_sites AS indexed_sites
+                        ON indexed_sites.history_id = history_logs.id
+                    WHERE indexed_sites.site_id = ?
+                      AND (? IS NULL OR history_logs.timestamp >= ?)
+                      AND (? IS NULL OR history_logs.timestamp <= ?)
+                      AND (? IS NULL OR history_logs.id < ?)
+                    ORDER BY history_logs.id DESC
+                    LIMIT ?
+                    """,
+                    (
+                        site_filter,
+                        start_bound,
+                        start_bound,
+                        end_bound,
+                        end_bound,
+                        before_id,
+                        before_id,
+                        limit if limit is not None else -1,
+                    ),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    SELECT * FROM history_logs
+                    WHERE (? IS NULL OR timestamp >= ?)
+                      AND (? IS NULL OR timestamp <= ?)
+                      AND (? IS NULL OR id < ?)
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (
+                        start_bound,
+                        start_bound,
+                        end_bound,
+                        end_bound,
+                        before_id,
+                        before_id,
+                        limit if limit is not None else -1,
+                    ),
+                )
             logs = []
             for row in cursor.fetchall():
                 try:

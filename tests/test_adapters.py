@@ -67,6 +67,29 @@ class AdapterBalanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.gained_quota, 0.0)
         self.assertIn("查询最终余额", result.error_detail)
 
+    async def test_waf_quota_query_uses_models_fallback(self) -> None:
+        """Probe the model endpoint when the management endpoint is WAF-blocked."""
+        adapter = self._make_adapter()
+        responses = iter(
+            [
+                _TextResponse(status=200, text="<html>WAF challenge</html>"),
+                _TextResponse(status=200, text='{"data":[{"model":"gpt-test"}]}'),
+            ]
+        )
+
+        async def fake_request_text(method: str, url: str, headers: dict[str, str]) -> _TextResponse:
+            del method, url, headers
+            return next(responses)
+
+        adapter._request_text = fake_request_text  # type: ignore[method-assign]
+
+        result = await adapter.test_connection()
+
+        self.assertFalse(result.success)
+        self.assertFalse(result.expired)
+        self.assertIn("API Key 有效", result.message)
+        self.assertIn("API 接口兜底探测", result.error_detail)
+
     async def test_attempt_trace_is_bounded(self) -> None:
         """Keep repeated endpoint failures from growing one history record forever."""
         adapter = self._make_adapter()

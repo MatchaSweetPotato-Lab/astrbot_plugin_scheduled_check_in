@@ -438,6 +438,35 @@ class DatabaseManagerTests(unittest.TestCase):
         self.assertFalse(history_file.exists())
         self.assertTrue(history_file.with_suffix(".json.bak").exists())
 
+    def test_existing_sqlite_history_site_index_backfill(self) -> None:
+        """Backfill site associations when upgrading an existing SQLite database."""
+        self.db.clear_history_logs()
+        details = [{"site_id": "existing_site", "success": True, "message": "签到成功"}]
+        with self.db._connection() as conn:
+            conn.execute(
+                "DELETE FROM storage_metadata WHERE key = ?",
+                ("history_site_index_version",),
+            )
+            conn.execute(
+                """
+                INSERT INTO history_logs (timestamp, type, manual, success, report, details)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "2026-08-18 08:30:00",
+                    "scheduled",
+                    0,
+                    1,
+                    "Existing SQLite history",
+                    json.dumps(details, ensure_ascii=False),
+                ),
+            )
+
+        reopened = DatabaseManager(self.db_path)
+        indexed_logs = reopened.read_history_logs(site_id="existing_site")
+        self.assertEqual(len(indexed_logs), 1)
+        self.assertEqual(indexed_logs[0]["report"], "Existing SQLite history")
+
     def test_string_auto_cleanup_setting_is_normalized(self) -> None:
         """Normalize string values when enabling or disabling automatic cleanup."""
         self.db.clear_history_logs()
