@@ -171,7 +171,7 @@ class ScheduledCheckInPlugin(Star):
 
     def read_history_logs(
         self,
-        limit: int = 100,
+        limit: int | None = 100,
         before_id: int | None = None,
         start_date: str | None = None,
         end_date: str | None = None,
@@ -179,7 +179,7 @@ class ScheduledCheckInPlugin(Star):
         """Read history log entries from SQLite database.
 
         Args:
-            limit: Maximum number of logs to return.
+            limit: Maximum number of logs to return. ``None`` returns all matching logs.
             before_id: Optional log ID cursor.
             start_date: Optional inclusive start date in YYYY-MM-DD format.
             end_date: Optional inclusive end date in YYYY-MM-DD format.
@@ -298,7 +298,10 @@ class ScheduledCheckInPlugin(Star):
         site_type = str(site.get("type") or "").strip().lower()
         supports_balance = site_type in {"new-api", "one-api"}
         logs = self.read_history_logs(
-            limit=5000,
+            # A month can legitimately contain more than 5000 test/check-in logs.
+            # This endpoint aggregates the complete selected month and therefore
+            # deliberately does not use the paginated log-list limit.
+            limit=None,
             start_date=month_start_str,
             end_date=month_end_str,
         )

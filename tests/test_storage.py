@@ -176,6 +176,14 @@ class DatabaseManagerTests(unittest.TestCase):
             self.db.count_history_logs(start_date="2026-08-16", end_date="2026-08-16"),
             15,
         )
+        self.assertEqual(
+            len(self.db.read_history_logs(
+                limit=None,
+                start_date="2026-08-16",
+                end_date="2026-08-16",
+            )),
+            15,
+        )
 
         # 2. Test pagination with before_id
         page1 = self.db.read_history_logs(limit=5)
@@ -434,6 +442,18 @@ class DatabaseManagerTests(unittest.TestCase):
                 "details": [],
             })
         self.assertEqual(self.db.count_history_logs(), 2)
+
+        # The global switch remains authoritative even when a caller supplies
+        # explicit numeric cleanup values.
+        self.db.record_history({
+            "timestamp": "2020-01-01 00:00:00",
+            "type": "scheduled",
+            "manual": False,
+            "success": True,
+            "report": "Explicit values ignored",
+            "details": [],
+        }, max_records=1, retention_days=1)
+        self.assertEqual(self.db.count_history_logs(), 3)
 
         settings["auto_cleanup_logs"] = "yes"
         self.db.save_settings(settings)

@@ -452,18 +452,22 @@ class DatabaseManager:
 
         Args:
             entry: Log dictionary with keys timestamp, type, manual, success, report, details.
-            max_records: Maximum number of history records to retain. If None, read from
-                settings ("auto_cleanup_logs" and "max_history_records"). A value of 0
-                disables row-count cleanup without affecting age-based cleanup.
-            retention_days: Maximum age of history records in days. If None, read from
-                settings ("history_retention_days"). A value of 0 disables age-based
-                cleanup without affecting row-count cleanup.
+            max_records: Maximum number of history records to retain. If None, use the
+                global "max_history_records" setting. A value of 0 disables row-count
+                cleanup without affecting age-based cleanup.
+            retention_days: Maximum age of history records in days. If None, use the
+                global "history_retention_days" setting. A value of 0 disables age-based
+                cleanup without affecting row-count cleanup. The global
+                "auto_cleanup_logs" setting is the master switch: when disabled, it
+                suppresses both global and per-call cleanup values.
         """
         cleanup_enabled, configured_max_records, configured_retention_days = self._get_cleanup_settings()
         if max_records is None:
             max_records = configured_max_records
         if retention_days is None:
             retention_days = configured_retention_days
+        # Per-call values only override their corresponding numeric settings. The
+        # global auto_cleanup_logs switch remains authoritative for every write.
         if not cleanup_enabled:
             max_records = 0
             retention_days = 0
@@ -508,7 +512,7 @@ class DatabaseManager:
 
     def read_history_logs(
         self,
-        limit: int = 100,
+        limit: int | None = 100,
         before_id: int | None = None,
         start_date: str | None = None,
         end_date: str | None = None,
@@ -516,7 +520,7 @@ class DatabaseManager:
         """Read recent history log records ordered from newest to oldest.
 
         Args:
-            limit: Maximum number of logs to return.
+            limit: Maximum number of logs to return. ``None`` returns all matching logs.
             before_id: Optional log ID cursor for pagination. When provided, returns logs with id < before_id.
             start_date: Optional inclusive start date in YYYY-MM-DD format.
             end_date: Optional inclusive end date in YYYY-MM-DD format.
@@ -527,25 +531,37 @@ class DatabaseManager:
         with self._lock, self._connection() as conn:
             start_bound = f"{str(start_date).strip()} 00:00:00" if start_date else None
             end_bound = f"{str(end_date).strip()} 23:59:59" if end_date else None
-            cursor = conn.execute(
-                """
-                SELECT * FROM history_logs
-                WHERE (? IS NULL OR timestamp >= ?)
-                  AND (? IS NULL OR timestamp <= ?)
-                  AND (? IS NULL OR id < ?)
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (
-                    start_bound,
-                    start_bound,
-                    end_bound,
-                    end_bound,
-                    before_id,
-                    before_id,
-                    limit,
-                ),
+            query_parameters = (
+                start_bound,
+                start_bound,
+                end_bound,
+                end_bound,
+                before_id,
+                before_id,
             )
+            if limit is None:
+                cursor = conn.execute(
+                    """
+                    SELECT * FROM history_logs
+                    WHERE (? IS NULL OR timestamp >= ?)
+                      AND (? IS NULL OR timestamp <= ?)
+                      AND (? IS NULL OR id < ?)
+                    ORDER BY id DESC
+                    """,
+                    query_parameters,
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    SELECT * FROM history_logs
+                    WHERE (? IS NULL OR timestamp >= ?)
+                      AND (? IS NULL OR timestamp <= ?)
+                      AND (? IS NULL OR id < ?)
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (*query_parameters, limit),
+                )
             logs = []
             for row in cursor.fetchall():
                 try:
