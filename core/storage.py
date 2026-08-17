@@ -45,6 +45,7 @@ class DatabaseManager:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._cleanup_settings_cache: tuple[bool, int, int] | None = None
 
         self._init_db()
         if legacy_data_dir:
@@ -80,6 +81,30 @@ class DatabaseManager:
             return max(0, int(value))
         except (TypeError, ValueError):
             return 0
+
+    @staticmethod
+    def _normalize_cleanup_enabled(value: Any) -> bool:
+        """Normalize boolean values used by automatic history cleanup."""
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _get_cleanup_settings(self) -> tuple[bool, int, int]:
+        """Read and cache the settings used by the history cleanup hot path."""
+        with self._lock:
+            if self._cleanup_settings_cache is not None:
+                return self._cleanup_settings_cache
+
+        settings = self.get_settings()
+        cleanup_settings = (
+            self._normalize_cleanup_enabled(settings.get("auto_cleanup_logs", True)),
+            self._normalize_nonnegative_int(settings.get("max_history_records", 0)),
+            self._normalize_nonnegative_int(settings.get("history_retention_days", 0)),
+        )
+        with self._lock:
+            if self._cleanup_settings_cache is None:
+                self._cleanup_settings_cache = cleanup_settings
+            return self._cleanup_settings_cache
 
     def _init_db(self) -> None:
         """Create necessary database tables and indices if not already present."""
@@ -409,6 +434,7 @@ class DatabaseManager:
             try:
                 self._save_settings_records(conn, settings_data)
                 conn.commit()
+                self._cleanup_settings_cache = None
             except Exception:
                 conn.rollback()
                 raise
@@ -433,14 +459,11 @@ class DatabaseManager:
                 settings ("history_retention_days"). A value of 0 disables age-based
                 cleanup without affecting row-count cleanup.
         """
-        settings = self.get_settings()
-        cleanup_enabled = settings.get("auto_cleanup_logs", True)
-        if isinstance(cleanup_enabled, str):
-            cleanup_enabled = cleanup_enabled.strip().lower() in {"1", "true", "yes", "on"}
+        cleanup_enabled, configured_max_records, configured_retention_days = self._get_cleanup_settings()
         if max_records is None:
-            max_records = settings.get("max_history_records", 0)
+            max_records = configured_max_records
         if retention_days is None:
-            retention_days = settings.get("history_retention_days", 0)
+            retention_days = configured_retention_days
         if not cleanup_enabled:
             max_records = 0
             retention_days = 0
@@ -502,22 +525,27 @@ class DatabaseManager:
             List of history log dictionaries.
         """
         with self._lock, self._connection() as conn:
-            conditions: list[str] = []
-            parameters: list[Any] = []
-            if start_date:
-                conditions.append("timestamp >= ?")
-                parameters.append(f"{str(start_date).strip()} 00:00:00")
-            if end_date:
-                conditions.append("timestamp <= ?")
-                parameters.append(f"{str(end_date).strip()} 23:59:59")
-            if before_id is not None:
-                conditions.append("id < ?")
-                parameters.append(before_id)
-
-            where_clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
-            query = f"SELECT * FROM history_logs{where_clause} ORDER BY id DESC LIMIT ?"
-            parameters.append(limit)
-            cursor = conn.execute(query, tuple(parameters))
+            start_bound = f"{str(start_date).strip()} 00:00:00" if start_date else None
+            end_bound = f"{str(end_date).strip()} 23:59:59" if end_date else None
+            cursor = conn.execute(
+                """
+                SELECT * FROM history_logs
+                WHERE (? IS NULL OR timestamp >= ?)
+                  AND (? IS NULL OR timestamp <= ?)
+                  AND (? IS NULL OR id < ?)
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (
+                    start_bound,
+                    start_bound,
+                    end_bound,
+                    end_bound,
+                    before_id,
+                    before_id,
+                    limit,
+                ),
+            )
             logs = []
             for row in cursor.fetchall():
                 try:
@@ -547,19 +575,18 @@ class DatabaseManager:
             Total record count integer.
         """
         with self._lock, self._connection() as conn:
-            conditions: list[str] = []
-            parameters: list[Any] = []
-            if start_date:
-                conditions.append("timestamp >= ?")
-                parameters.append(f"{str(start_date).strip()} 00:00:00")
-            if end_date:
-                conditions.append("timestamp <= ?")
-                parameters.append(f"{str(end_date).strip()} 23:59:59")
-
-            where_clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
             cursor = conn.execute(
-                f"SELECT COUNT(*) FROM history_logs{where_clause}",
-                tuple(parameters),
+                """
+                SELECT COUNT(*) FROM history_logs
+                WHERE (? IS NULL OR timestamp >= ?)
+                  AND (? IS NULL OR timestamp <= ?)
+                """,
+                (
+                    f"{str(start_date).strip()} 00:00:00" if start_date else None,
+                    f"{str(start_date).strip()} 00:00:00" if start_date else None,
+                    f"{str(end_date).strip()} 23:59:59" if end_date else None,
+                    f"{str(end_date).strip()} 23:59:59" if end_date else None,
+                ),
             )
             row = cursor.fetchone()
             return int(row[0]) if row else 0

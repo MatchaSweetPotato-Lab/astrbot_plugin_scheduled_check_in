@@ -63,6 +63,16 @@ class _TextResponse:
     challenge_solved: bool = False
 
 
+@dataclass
+class _QuotaFetchResult:
+    """Result of a quota query, including whether failure means auth expiry."""
+
+    total_quota: float = 0.0
+    expired: bool = False
+    available: bool = False
+    message: str = ""
+
+
 class BaseCheckInAdapter(ABC):
     """Abstract base class for all check-in site adapters."""
 
@@ -343,14 +353,14 @@ class NewApiAdapter(BaseCheckInAdapter):
         headers: dict[str, str],
         attempts: list[dict[str, Any]] | None = None,
         step: str = "查询余额",
-    ) -> tuple[float, bool, str]:
+    ) -> _QuotaFetchResult:
         """Fetch user profile and calculate remaining quota in USD.
 
         Args:
             headers: Prepared headers with authentication.
 
         Returns:
-            Tuple of (total_quota_usd, is_expired, status_message).
+            Quota value, availability, and whether the failure indicates expiry.
         """
         trace = attempts if attempts is not None else []
         url = f"{self.base_url}/api/user/self"
@@ -370,7 +380,7 @@ class NewApiAdapter(BaseCheckInAdapter):
                     message=message,
                     response_text=text,
                 )
-                return 0.0, True, message
+                return _QuotaFetchResult(expired=True, message=message)
 
             if "<html" in text.lower() or "acw_sc" in text.lower() or "denied by http_custom" in text.lower():
                 logger.warning(f"WAF intercepted request to {url}")
@@ -384,7 +394,7 @@ class NewApiAdapter(BaseCheckInAdapter):
                     message=message,
                     response_text=text,
                 )
-                return 0.0, True, message
+                return _QuotaFetchResult(message=message)
 
             data: Any = None
             if response.status == 200:
@@ -402,7 +412,7 @@ class NewApiAdapter(BaseCheckInAdapter):
                         response_text=text,
                         error=str(exc),
                     )
-                    return 0.0, True, message
+                    return _QuotaFetchResult(message=message)
 
                 if isinstance(data, dict) and (data.get("success") or "data" in data):
                     user_info = data.get("data", {})
@@ -423,7 +433,7 @@ class NewApiAdapter(BaseCheckInAdapter):
                             response_text=text,
                             error=str(exc),
                         )
-                        return 0.0, True, message
+                        return _QuotaFetchResult(message=message)
 
                     self._record_attempt(
                         trace,
@@ -435,7 +445,11 @@ class NewApiAdapter(BaseCheckInAdapter):
                         message="连接成功",
                         response_text=text,
                     )
-                    return total_quota, False, "连接成功"
+                    return _QuotaFetchResult(
+                        total_quota=total_quota,
+                        available=True,
+                        message="连接成功",
+                    )
 
             message = self._response_message(data, text) or f"HTTP {response.status}"
             self._record_attempt(
@@ -447,7 +461,7 @@ class NewApiAdapter(BaseCheckInAdapter):
                 message=message,
                 response_text=text,
             )
-            return 0.0, True, message
+            return _QuotaFetchResult(message=message)
         except Exception as e:
             logger.debug(f"Failed to fetch user quota from {url}: {e}")
             message = f"请求异常: {str(e)}"
@@ -460,7 +474,7 @@ class NewApiAdapter(BaseCheckInAdapter):
                 message=message,
                 error=str(e),
             )
-            return 0.0, True, message
+            return _QuotaFetchResult(message=message)
 
     async def check_in(self) -> CheckInResult:
         """Perform check-in on New-API / One-API station.
@@ -475,21 +489,22 @@ class NewApiAdapter(BaseCheckInAdapter):
         attempts: list[dict[str, Any]] = []
 
         # Step 1: Query initial quota
-        initial_quota, initial_expired, init_msg = await self._fetch_user_quota(
+        initial_result = await self._fetch_user_quota(
             headers,
             attempts,
             "查询初始余额",
         )
-        if initial_expired:
+        if initial_result.expired:
             return CheckInResult(
                 site_id=self.site_id,
                 site_name=self.site_name,
                 success=False,
-                message=init_msg,
+                message=initial_result.message,
                 expired=True,
                 error_detail=self._format_attempts(attempts),
                 attempts=attempts,
             )
+        initial_quota = initial_result.total_quota
 
         # Step 2: Determine endpoints to attempt
         custom_endpoint = self.config["checkin_endpoint"].strip()
@@ -703,25 +718,24 @@ class NewApiAdapter(BaseCheckInAdapter):
                 continue
 
         # Step 3: Query final quota
-        final_quota, quota_unavailable, final_msg = await self._fetch_user_quota(
+        final_result = await self._fetch_user_quota(
             headers,
             attempts,
             "查询最终余额",
         )
-        total_quota = final_quota
-        if quota_unavailable:
+        total_quota = final_result.total_quota if final_result.available else initial_quota
+        if not final_result.available:
             # The initial balance is still authoritative enough to avoid replacing
             # a known value with a misleading zero after a transient final-query
             # failure. The request trace retains the final-query error details.
-            total_quota = initial_quota
-            expired = True
+            expired = expired or final_result.expired
             if not success:
-                last_message = final_msg
-            elif final_msg:
-                last_message = f"{last_message}（签到后余额查询失败：{final_msg}）"
+                last_message = final_result.message
+            elif final_result.message:
+                last_message = f"{last_message}（签到后余额查询失败：{final_result.message}）"
 
         # Step 4: Check for login-triggered quota increases
-        if not quota_unavailable and total_quota > initial_quota:
+        if initial_result.available and final_result.available and total_quota > initial_quota:
             success = True
             gained = round(total_quota - initial_quota, 3)
             last_message = f"登录成功，自动获赠额度 (+$ {gained})"
@@ -748,15 +762,16 @@ class NewApiAdapter(BaseCheckInAdapter):
         """
         headers = self._get_headers()
         attempts: list[dict[str, Any]] = []
-        total_quota, expired, err_msg = await self._fetch_user_quota(
+        quota_result = await self._fetch_user_quota(
             headers,
             attempts,
             "测试鉴权/余额",
         )
-        if expired:
+        if quota_result.expired:
             # Fallback probe on /v1/models to verify if API key works
             models_url = f"{self.base_url}/v1/models"
             model_status: int | None = None
+            fallback_message = quota_result.message
             try:
                 models_response = await self._request_text("GET", models_url, headers)
                 model_status = models_response.status
@@ -782,7 +797,7 @@ class NewApiAdapter(BaseCheckInAdapter):
                     response_text=m_text,
                 )
                 if model_ok:
-                    err_msg = model_message
+                    fallback_message = model_message
             except Exception as exc:
                 self._record_attempt(
                     attempts,
@@ -798,8 +813,19 @@ class NewApiAdapter(BaseCheckInAdapter):
                 site_id=self.site_id,
                 site_name=self.site_name,
                 success=False,
-                message=err_msg,
+                message=fallback_message,
                 expired=True,
+                error_detail=self._format_attempts(attempts),
+                attempts=attempts,
+            )
+
+        if not quota_result.available:
+            return CheckInResult(
+                site_id=self.site_id,
+                site_name=self.site_name,
+                success=False,
+                message=quota_result.message or "余额查询失败",
+                expired=False,
                 error_detail=self._format_attempts(attempts),
                 attempts=attempts,
             )
@@ -809,7 +835,7 @@ class NewApiAdapter(BaseCheckInAdapter):
             site_name=self.site_name,
             success=True,
             message="连接成功",
-            total_quota=total_quota,
+            total_quota=quota_result.total_quota,
             error_detail=self._format_attempts(attempts),
             attempts=attempts,
         )

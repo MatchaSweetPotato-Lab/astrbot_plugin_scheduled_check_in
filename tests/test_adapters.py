@@ -53,6 +53,7 @@ class AdapterBalanceTests(unittest.IsolatedAsyncioTestCase):
         result = await adapter.check_in()
 
         self.assertTrue(result.success)
+        self.assertFalse(result.expired)
         self.assertEqual(result.total_quota, 10.0)
         self.assertEqual(result.gained_quota, 0.0)
         self.assertIn("查询最终余额", result.error_detail)

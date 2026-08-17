@@ -496,7 +496,9 @@ function renderSiteCalendar(days, month, currentBalance = null, showBalance = tr
     cell.className = 'analytics-calendar-cell';
     if (date === getTodayStr()) cell.classList.add('is-today');
     if (record) cell.classList.add(record.status === 'success' ? 'is-success' : 'is-failure');
-    cell.title = record?.message || (record ? '签到失败' : '当天没有签到记录');
+    cell.title = record?.message || (
+      record ? (record.status === 'success' ? '签到成功' : '签到失败') : '当天没有签到记录'
+    );
 
     const number = document.createElement('span');
     number.className = 'analytics-calendar-date';
@@ -542,32 +544,41 @@ function renderBalanceHistory(history) {
     return;
   }
 
-  const chartPoints = history.slice(-60);
-  const values = chartPoints.map(item => Number(item.balance)).filter(Number.isFinite);
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const span = max - min;
-  const chart = document.createElement('div');
-  chart.className = 'analytics-balance-chart';
-  chartPoints.forEach(item => {
-    const value = Number(item.balance);
-    const column = document.createElement('div');
-    column.className = 'analytics-balance-column';
-    column.title = `${item.timestamp || ''} · ${formatBalance(value)}`;
-    const barTrack = document.createElement('div');
-    barTrack.className = 'analytics-balance-bar-track';
-    const bar = document.createElement('div');
-    bar.className = 'analytics-balance-bar';
-    bar.style.height = `${span === 0 ? 52 : 18 + ((value - min) / span) * 82}%`;
-    barTrack.appendChild(bar);
-    const date = document.createElement('small');
-    date.textContent = String(item.date || '').substring(5);
-    const valueLabel = document.createElement('span');
-    valueLabel.textContent = formatBalance(value);
-    column.append(barTrack, valueLabel, date);
-    chart.appendChild(column);
-  });
-  chartContainer.appendChild(chart);
+  const chartPoints = history
+    .slice(-60)
+    .filter(item => Number.isFinite(Number(item.balance)));
+  if (chartPoints.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'analytics-empty';
+    empty.textContent = '本月没有可用的数值余额记录';
+    chartContainer.appendChild(empty);
+  } else {
+    const values = chartPoints.map(item => Number(item.balance));
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const span = max - min;
+    const chart = document.createElement('div');
+    chart.className = 'analytics-balance-chart';
+    chartPoints.forEach(item => {
+      const value = Number(item.balance);
+      const column = document.createElement('div');
+      column.className = 'analytics-balance-column';
+      column.title = `${item.timestamp || ''} · ${formatBalance(value)}`;
+      const barTrack = document.createElement('div');
+      barTrack.className = 'analytics-balance-bar-track';
+      const bar = document.createElement('div');
+      bar.className = 'analytics-balance-bar';
+      bar.style.height = `${span === 0 ? 52 : 18 + ((value - min) / span) * 82}%`;
+      barTrack.appendChild(bar);
+      const date = document.createElement('small');
+      date.textContent = String(item.date || '').substring(5);
+      const valueLabel = document.createElement('span');
+      valueLabel.textContent = formatBalance(value);
+      column.append(barTrack, valueLabel, date);
+      chart.appendChild(column);
+    });
+    chartContainer.appendChild(chart);
+  }
 
   const list = document.createElement('div');
   list.className = 'analytics-balance-list';

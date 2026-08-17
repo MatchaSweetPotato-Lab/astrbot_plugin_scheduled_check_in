@@ -415,6 +415,39 @@ class DatabaseManagerTests(unittest.TestCase):
         self.assertFalse(history_file.exists())
         self.assertTrue(history_file.with_suffix(".json.bak").exists())
 
+    def test_string_auto_cleanup_setting_is_normalized(self) -> None:
+        """Normalize string values when enabling or disabling automatic cleanup."""
+        self.db.clear_history_logs()
+        settings = self.db.get_settings()
+        settings["auto_cleanup_logs"] = "false"
+        settings["history_retention_days"] = 0
+        settings["max_history_records"] = 1
+        self.db.save_settings(settings)
+
+        for index in range(2):
+            self.db.record_history({
+                "timestamp": f"2026-08-16 12:0{index}:00",
+                "type": "scheduled",
+                "manual": False,
+                "success": True,
+                "report": f"Disabled {index}",
+                "details": [],
+            })
+        self.assertEqual(self.db.count_history_logs(), 2)
+
+        settings["auto_cleanup_logs"] = "yes"
+        self.db.save_settings(settings)
+        self.db.record_history({
+            "timestamp": "2026-08-16 12:02:00",
+            "type": "scheduled",
+            "manual": False,
+            "success": True,
+            "report": "Enabled",
+            "details": [],
+        })
+        self.assertEqual(self.db.count_history_logs(), 1)
+        self.assertEqual(self.db.read_history_logs()[0]["report"], "Enabled")
+
 
 if __name__ == "__main__":
     unittest.main()
