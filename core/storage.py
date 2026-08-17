@@ -6,7 +6,9 @@ import json
 import logging
 import sqlite3
 import threading
-from datetime import datetime
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "http_timeout_seconds": 15,
     "http_impersonate": DEFAULT_IMPERSONATE,
     "manual_target_time": "",
+    "auto_cleanup_logs": True,
+    "history_retention_days": 0,
     "max_history_records": 0,
 }
 
@@ -41,10 +45,12 @@ class DatabaseManager:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._cleanup_settings_cache: tuple[bool, int, int] | None = None
 
         self._init_db()
         if legacy_data_dir:
             self._migrate_legacy_json(Path(legacy_data_dir))
+        self._ensure_history_site_index()
 
     def _get_connection(self) -> sqlite3.Connection:
         """Create and configure a SQLite connection."""
@@ -59,9 +65,78 @@ class DatabaseManager:
         conn.execute("PRAGMA foreign_keys=ON;")
         return conn
 
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Provide a transaction-scoped connection that is always closed."""
+        conn = self._get_connection()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _normalize_nonnegative_int(value: Any) -> int:
+        """Normalize a user-provided non-negative integer setting."""
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _normalize_cleanup_enabled(value: Any) -> bool:
+        """Normalize boolean values used by automatic history cleanup."""
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @staticmethod
+    def _normalize_history_date(value: Any) -> str | None:
+        """Normalize a history date filter to YYYY-MM-DD or ignore it."""
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        if not normalized:
+            return None
+        try:
+            return datetime.strptime(normalized, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+
+    @classmethod
+    def _history_date_bounds(
+        cls,
+        start_date: Any,
+        end_date: Any,
+    ) -> tuple[str | None, str | None]:
+        """Build normalized inclusive timestamp bounds for history queries."""
+        normalized_start = cls._normalize_history_date(start_date)
+        normalized_end = cls._normalize_history_date(end_date)
+        return (
+            f"{normalized_start} 00:00:00" if normalized_start else None,
+            f"{normalized_end} 23:59:59" if normalized_end else None,
+        )
+
+    def _get_cleanup_settings(self) -> tuple[bool, int, int]:
+        """Read and cache the settings used by the history cleanup hot path."""
+        with self._lock:
+            if self._cleanup_settings_cache is not None:
+                return self._cleanup_settings_cache
+
+        settings = self.get_settings()
+        cleanup_settings = (
+            self._normalize_cleanup_enabled(settings.get("auto_cleanup_logs", True)),
+            self._normalize_nonnegative_int(settings.get("max_history_records", 0)),
+            self._normalize_nonnegative_int(settings.get("history_retention_days", 0)),
+        )
+        with self._lock:
+            if self._cleanup_settings_cache is None:
+                self._cleanup_settings_cache = cleanup_settings
+            return self._cleanup_settings_cache
+
     def _init_db(self) -> None:
         """Create necessary database tables and indices if not already present."""
-        with self._lock, self._get_connection() as conn:
+        with self._lock, self._connection() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS sites (
                     id TEXT PRIMARY KEY,
@@ -99,8 +174,91 @@ class DatabaseManager:
                     details TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS history_log_sites (
+                    history_id INTEGER NOT NULL,
+                    site_id TEXT NOT NULL,
+                    PRIMARY KEY (history_id, site_id),
+                    FOREIGN KEY (history_id) REFERENCES history_logs(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS storage_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_history_logs_id_desc ON history_logs(id DESC);
+                CREATE INDEX IF NOT EXISTS idx_history_logs_timestamp ON history_logs(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_history_log_sites_site_id
+                    ON history_log_sites(site_id, history_id);
             """)
+
+    @staticmethod
+    def _extract_site_ids(details: Any) -> set[str]:
+        """Extract configured site IDs from one history entry's result list."""
+        if not isinstance(details, list):
+            return set()
+        site_ids: set[str] = set()
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            site_id = str(detail.get("site_id") or "").strip()
+            if site_id:
+                site_ids.add(site_id)
+        return site_ids
+
+    def _index_history_entry_sites(
+        self,
+        conn: sqlite3.Connection,
+        history_id: int,
+        details: Any,
+    ) -> None:
+        """Store site IDs in the indexed history association table."""
+        site_ids = self._extract_site_ids(details)
+        if not site_ids:
+            return
+        conn.executemany(
+            "INSERT OR IGNORE INTO history_log_sites (history_id, site_id) VALUES (?, ?)",
+            [(history_id, site_id) for site_id in site_ids],
+        )
+
+    def _ensure_history_site_index(self) -> None:
+        """Backfill the site association index once for existing history rows."""
+        with self._lock, self._connection() as conn:
+            marker = conn.execute(
+                "SELECT value FROM storage_metadata WHERE key = ?",
+                ("history_site_index_version",),
+            ).fetchone()
+            if marker:
+                return
+
+            batch_size = 1000
+            last_id = 0
+            while True:
+                rows = conn.execute(
+                    """
+                    SELECT id, details
+                    FROM history_logs
+                    WHERE id > ?
+                    ORDER BY id
+                    LIMIT ?
+                    """,
+                    (last_id, batch_size),
+                ).fetchall()
+                if not rows:
+                    break
+
+                for row in rows:
+                    try:
+                        details = json.loads(row["details"])
+                    except Exception:
+                        details = []
+                    self._index_history_entry_sites(conn, int(row["id"]), details)
+                last_id = int(rows[-1]["id"])
+
+            conn.execute(
+                "INSERT INTO storage_metadata (key, value) VALUES (?, ?)",
+                ("history_site_index_version", "1"),
+            )
 
     def _migrate_legacy_json(self, legacy_dir: Path) -> None:
         """Migrate legacy JSON files into SQLite and rename them to .bak.
@@ -108,7 +266,7 @@ class DatabaseManager:
         Args:
             legacy_dir: Directory where legacy JSON files reside.
         """
-        with self._lock, self._get_connection() as conn:
+        with self._lock, self._connection() as conn:
             # 1. Migrate sites.json
             sites_file = legacy_dir / "sites.json"
             if sites_file.exists():
@@ -285,7 +443,7 @@ class DatabaseManager:
         Returns:
             List of site dictionaries.
         """
-        with self._lock, self._get_connection() as conn:
+        with self._lock, self._connection() as conn:
             cursor = conn.execute("SELECT * FROM sites ORDER BY display_order ASC, created_at ASC")
             return [self._site_row_to_dict(row) for row in cursor.fetchall()]
 
@@ -295,7 +453,7 @@ class DatabaseManager:
         Args:
             sites_data: New list of site dictionaries.
         """
-        with self._lock, self._get_connection() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute("BEGIN TRANSACTION")
             try:
                 cursor = conn.execute("SELECT id, created_at FROM sites")
@@ -325,7 +483,7 @@ class DatabaseManager:
             last_quota: Balance quota float.
         """
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with self._lock, self._get_connection() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute(
                 """
                 UPDATE sites
@@ -364,7 +522,7 @@ class DatabaseManager:
             Settings dictionary merged with defaults.
         """
         settings = dict(DEFAULT_SETTINGS)
-        with self._lock, self._get_connection() as conn:
+        with self._lock, self._connection() as conn:
             cursor = conn.execute("SELECT key, value FROM settings")
             for row in cursor.fetchall():
                 try:
@@ -381,11 +539,12 @@ class DatabaseManager:
         Args:
             settings_data: Settings dictionary.
         """
-        with self._lock, self._get_connection() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute("BEGIN TRANSACTION")
             try:
                 self._save_settings_records(conn, settings_data)
                 conn.commit()
+                self._cleanup_settings_cache = None
             except Exception:
                 conn.rollback()
                 raise
@@ -397,23 +556,38 @@ class DatabaseManager:
         self,
         entry: dict[str, Any],
         max_records: int | None = None,
+        retention_days: int | None = None,
     ) -> None:
         """Record a single check-in result history log and optionally prune old entries.
 
         Args:
             entry: Log dictionary with keys timestamp, type, manual, success, report, details.
-            max_records: Maximum number of history records to retain. If None, read from
-                settings ("max_history_records"). If <= 0, no pruning is performed (unlimited).
+            max_records: Maximum number of history records to retain. If None, use the
+                global "max_history_records" setting. A value of 0 disables row-count
+                cleanup without affecting age-based cleanup.
+            retention_days: Maximum age of history records in days. If None, use the
+                global "history_retention_days" setting. A value of 0 disables age-based
+                cleanup without affecting row-count cleanup. The global
+                "auto_cleanup_logs" setting is the master switch: when disabled, it
+                suppresses both global and per-call cleanup values.
         """
+        cleanup_enabled, configured_max_records, configured_retention_days = self._get_cleanup_settings()
         if max_records is None:
-            settings = self.get_settings()
-            try:
-                max_records = int(settings.get("max_history_records", 0))
-            except (ValueError, TypeError):
-                max_records = 0
+            max_records = configured_max_records
+        if retention_days is None:
+            retention_days = configured_retention_days
+        # Per-call values only override their corresponding numeric settings. The
+        # global auto_cleanup_logs switch remains authoritative for every write.
+        if not cleanup_enabled:
+            max_records = 0
+            retention_days = 0
+        max_records = self._normalize_nonnegative_int(max_records)
+        retention_days = self._normalize_nonnegative_int(retention_days)
 
-        with self._lock, self._get_connection() as conn:
-            conn.execute(
+        details = entry.get("details", [])
+        details_json = json.dumps(details, ensure_ascii=False)
+        with self._lock, self._connection() as conn:
+            cursor = conn.execute(
                 """
                 INSERT INTO history_logs (timestamp, type, manual, success, report, details)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -424,12 +598,22 @@ class DatabaseManager:
                     1 if entry.get("manual") else 0,
                     1 if entry.get("success") else 0,
                     entry.get("report", ""),
-                    json.dumps(entry.get("details", []), ensure_ascii=False),
+                    details_json,
                 ),
             )
+            if cursor.lastrowid is not None:
+                self._index_history_entry_sites(conn, int(cursor.lastrowid), details)
 
-            # Auto prune if max_records > 0
-            if isinstance(max_records, int) and max_records > 0:
+            if retention_days > 0:
+                cutoff = datetime.now() - timedelta(days=retention_days)
+                conn.execute(
+                    "DELETE FROM history_logs WHERE timestamp < ?",
+                    (cutoff.strftime("%Y-%m-%d %H:%M:%S"),),
+                )
+
+            # Apply the row limit as a separate rule. When both rules are configured,
+            # age cleanup runs first and the row limit then applies to the remaining logs.
+            if max_records > 0:
                 conn.execute(
                     """
                     DELETE FROM history_logs
@@ -442,28 +626,73 @@ class DatabaseManager:
 
     def read_history_logs(
         self,
-        limit: int = 100,
+        limit: int | None = 100,
         before_id: int | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        site_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Read recent history log records ordered from newest to oldest.
 
         Args:
-            limit: Maximum number of logs to return.
+            limit: Maximum number of logs to return. ``None`` returns all matching logs.
             before_id: Optional log ID cursor for pagination. When provided, returns logs with id < before_id.
+            start_date: Optional inclusive start date in YYYY-MM-DD format.
+            end_date: Optional inclusive end date in YYYY-MM-DD format.
+            site_id: Optional site ID used to filter through the indexed association table.
 
         Returns:
             List of history log dictionaries.
         """
-        with self._lock, self._get_connection() as conn:
-            if before_id is not None:
+        with self._lock, self._connection() as conn:
+            start_bound, end_bound = self._history_date_bounds(start_date, end_date)
+            site_filter = str(site_id).strip() if site_id is not None else None
+            if not site_filter:
+                site_filter = None
+            if site_filter:
                 cursor = conn.execute(
-                    "SELECT * FROM history_logs WHERE id < ? ORDER BY id DESC LIMIT ?",
-                    (before_id, limit),
+                    """
+                    SELECT history_logs.*
+                    FROM history_logs
+                    INNER JOIN history_log_sites AS indexed_sites
+                        ON indexed_sites.history_id = history_logs.id
+                    WHERE indexed_sites.site_id = ?
+                      AND (? IS NULL OR history_logs.timestamp >= ?)
+                      AND (? IS NULL OR history_logs.timestamp <= ?)
+                      AND (? IS NULL OR history_logs.id < ?)
+                    ORDER BY history_logs.id DESC
+                    LIMIT ?
+                    """,
+                    (
+                        site_filter,
+                        start_bound,
+                        start_bound,
+                        end_bound,
+                        end_bound,
+                        before_id,
+                        before_id,
+                        limit if limit is not None else -1,
+                    ),
                 )
             else:
                 cursor = conn.execute(
-                    "SELECT * FROM history_logs ORDER BY id DESC LIMIT ?",
-                    (limit,),
+                    """
+                    SELECT * FROM history_logs
+                    WHERE (? IS NULL OR timestamp >= ?)
+                      AND (? IS NULL OR timestamp <= ?)
+                      AND (? IS NULL OR id < ?)
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (
+                        start_bound,
+                        start_bound,
+                        end_bound,
+                        end_bound,
+                        before_id,
+                        before_id,
+                        limit if limit is not None else -1,
+                    ),
                 )
             logs = []
             for row in cursor.fetchall():
@@ -483,18 +712,35 @@ class DatabaseManager:
                 })
             return logs
 
-    def count_history_logs(self) -> int:
-        """Count the total number of history log records in SQLite.
+    def count_history_logs(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> int:
+        """Count history log records, optionally within an inclusive date range.
 
         Returns:
             Total record count integer.
         """
-        with self._lock, self._get_connection() as conn:
-            cursor = conn.execute("SELECT COUNT(*) FROM history_logs")
+        with self._lock, self._connection() as conn:
+            start_bound, end_bound = self._history_date_bounds(start_date, end_date)
+            cursor = conn.execute(
+                """
+                SELECT COUNT(*) FROM history_logs
+                WHERE (? IS NULL OR timestamp >= ?)
+                  AND (? IS NULL OR timestamp <= ?)
+                """,
+                (
+                    start_bound,
+                    start_bound,
+                    end_bound,
+                    end_bound,
+                ),
+            )
             row = cursor.fetchone()
             return int(row[0]) if row else 0
 
     def clear_history_logs(self) -> None:
         """Clear all history log records from SQLite."""
-        with self._lock, self._get_connection() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute("DELETE FROM history_logs")

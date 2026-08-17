@@ -5,7 +5,6 @@ from typing import Any
 
 from curl_cffi.requests import AsyncSession, BrowserType
 
-
 DEFAULT_TIMEOUT_SECONDS = 15.0
 MIN_TIMEOUT_SECONDS = 1.0
 MAX_TIMEOUT_SECONDS = 300.0

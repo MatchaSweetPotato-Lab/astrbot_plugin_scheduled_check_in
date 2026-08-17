@@ -13,6 +13,8 @@ let settings = {
   http_timeout_seconds: 15,
   http_impersonate: '',
   http_impersonate_options: [],
+  auto_cleanup_logs: true,
+  history_retention_days: 0,
   max_history_records: 0
 };
 let logItems = [];
@@ -20,6 +22,10 @@ let logsNextBeforeId = null;
 let logsHasMore = true;
 let logsLoading = false;
 let logsTotal = 0;
+let logsStartDate = '';
+let logsEndDate = '';
+let activeAnalyticsSite = null;
+let analyticsMonth = '';
 let isEdit = false;
 let editIndex = -1;
 let activeConfirmResolver = null;
@@ -174,24 +180,32 @@ function getTodayStr() {
   return `${year}-${month}-${day}`;
 }
 
+function getCurrentMonthStr() {
+  return getTodayStr().substring(0, 7);
+}
+
 function renderCheckInStatus(site) {
   const todayStr = getTodayStr();
-  const badge = document.createElement('span');
+  const statusButton = document.createElement('button');
+  statusButton.type = 'button';
+  statusButton.className = 'status-chip';
+  statusButton.title = '点击查看签到日历和余额变化';
+  statusButton.addEventListener('click', () => openSiteAnalytics(site));
   const timeStr = site.last_checkin_time ? String(site.last_checkin_time).substring(0, 5) : '';
 
   if (site.last_checkin_date === todayStr && site.last_checkin_success) {
-    badge.className = 'badge badge-success';
-    badge.textContent = `已签到${timeStr ? ' (' + timeStr + ')' : ''}`;
-    return badge;
+    statusButton.classList.add('status-chip-success');
+    statusButton.textContent = `已签到${timeStr ? ' (' + timeStr + ')' : ''}`;
+    return statusButton;
   }
   if (site.last_checkin_date === todayStr && site.last_checkin_success === false) {
-    badge.className = 'badge badge-failure';
-    badge.textContent = `失败${timeStr ? ' (' + timeStr + ')' : ''}`;
-    return badge;
+    statusButton.classList.add('status-chip-failure');
+    statusButton.textContent = `失败${timeStr ? ' (' + timeStr + ')' : ''}`;
+    return statusButton;
   }
-  badge.className = 'badge badge-warning';
-  badge.textContent = '未签到';
-  return badge;
+  statusButton.classList.add('status-chip-warning');
+  statusButton.textContent = '未签到';
+  return statusButton;
 }
 
 function renderTableMessage(tbody, message) {
@@ -309,6 +323,305 @@ function renderSitesTable() {
     row.appendChild(actionsCell);
     tbody.appendChild(row);
   });
+}
+
+function formatBalanceNumber(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  return Number(number.toFixed(3)).toString();
+}
+
+function formatBalance(value) {
+  if (value === null || value === undefined || value === '') return '暂无数据';
+  const formatted = formatBalanceNumber(value);
+  return formatted === null ? '暂无数据' : `$${formatted}`;
+}
+
+function formatBalanceChange(value) {
+  if (value === null || value === undefined || value === '') return '首次记录';
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '首次记录';
+  return `${number > 0 ? '+' : ''}$${formatBalanceNumber(number)}`;
+}
+
+function formatSignedBalance(value) {
+  if (value === null || value === undefined || value === '') return '—';
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '—';
+  return `${number >= 0 ? '+' : '-'}$${formatBalanceNumber(Math.abs(number))}`;
+}
+
+function getAnalyticsTypeLabel(type) {
+  if (type === 'test') return '测试连接';
+  if (type === 'manual') return '手动签到';
+  return '自动签到';
+}
+
+function formatAnalyticsMonth(month) {
+  const match = /^(\d{4})-(\d{2})$/.exec(month || '');
+  return match ? `${match[1]} 年 ${Number(match[2])} 月` : month || '签到日历';
+}
+
+function changeAnalyticsMonth(delta) {
+  if (!analyticsMonth) analyticsMonth = getCurrentMonthStr();
+  const [year, month] = analyticsMonth.split('-').map(Number);
+  const next = new Date(year, month - 1 + delta, 1);
+  analyticsMonth = `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, '0')}`;
+  loadSiteAnalytics();
+}
+
+function openSiteAnalytics(site) {
+  if (!site) return;
+  activeAnalyticsSite = site;
+  analyticsMonth = getCurrentMonthStr();
+  const title = document.getElementById('site-analytics-title');
+  if (title) title.textContent = `${site.name || '站点'} · 签到日历`;
+  openModal('site-analytics-modal');
+  loadSiteAnalytics();
+}
+
+async function loadSiteAnalytics() {
+  if (!activeAnalyticsSite) return;
+  const siteId = getSiteId(activeAnalyticsSite);
+  const requestedMonth = analyticsMonth || getCurrentMonthStr();
+  analyticsMonth = requestedMonth;
+  const calendar = document.getElementById('site-checkin-calendar');
+  const chart = document.getElementById('site-balance-chart');
+  const notice = document.getElementById('site-analytics-notice');
+  if (calendar) calendar.innerHTML = '<div class="analytics-loading">正在读取签到记录...</div>';
+  if (chart) chart.innerHTML = '<div class="analytics-loading">正在读取余额变化...</div>';
+  if (notice) {
+    notice.hidden = true;
+    notice.textContent = '';
+  }
+
+  try {
+    const data = await apiGet('/api/sites/activity', {
+      site_id: siteId,
+      month: requestedMonth
+    });
+    if (!data || data.error || data.status === 'error') {
+      throw new Error(data?.message || data?.error || '读取站点活动记录失败');
+    }
+    if (
+      !activeAnalyticsSite
+      || getSiteId(activeAnalyticsSite) !== siteId
+      || analyticsMonth !== requestedMonth
+    ) {
+      return;
+    }
+    renderSiteAnalytics(data);
+  } catch (e) {
+    console.error('loadSiteAnalytics error:', e);
+    if (calendar) calendar.innerHTML = '<div class="analytics-empty">暂时无法读取签到记录</div>';
+    if (chart) chart.innerHTML = '<div class="analytics-empty">暂时无法读取余额变化</div>';
+    showToast(e.message || '读取站点活动记录失败', 'error');
+  }
+}
+
+function renderSiteAnalytics(data) {
+  const monthLabel = document.getElementById('site-analytics-month');
+  if (monthLabel) monthLabel.textContent = formatAnalyticsMonth(data.month || analyticsMonth);
+
+  const supportsBalance = data.supports_balance === true
+    || ['new-api', 'one-api'].includes(String(data.site?.type || '').trim().toLowerCase());
+  const balanceSection = document.getElementById('site-balance-section');
+  if (balanceSection) balanceSection.hidden = !supportsBalance;
+
+  const notice = document.getElementById('site-analytics-notice');
+  if (notice) {
+    const truncated = data.history_truncated === true;
+    const limit = Number(data.history_record_limit || 0);
+    notice.hidden = !truncated;
+    notice.textContent = truncated
+      ? `本月日志超过 ${limit.toLocaleString()} 条，仅展示最近记录，统计可能不完整`
+      : '';
+  }
+
+  const summary = document.getElementById('site-analytics-summary');
+  if (summary) {
+    summary.replaceChildren();
+    const summaryItems = [
+      ['本月签到', `${Number(data.success_days || 0)} 天`, 'success'],
+      ['失败记录', `${Number(data.failure_days || 0)} 天`, 'failure'],
+    ];
+    if (supportsBalance) {
+      summaryItems.push([
+        '签到余额(总余额)',
+        formatBalance(data.current_balance !== undefined ? data.current_balance : data.latest_balance),
+        'balance'
+      ]);
+    }
+    summaryItems.forEach(([label, value, className]) => {
+      const item = document.createElement('div');
+      item.className = `analytics-stat ${className}`;
+      const labelElement = document.createElement('span');
+      labelElement.textContent = label;
+      const valueElement = document.createElement('strong');
+      valueElement.textContent = value;
+      item.append(labelElement, valueElement);
+      summary.appendChild(item);
+    });
+  }
+
+  renderSiteCalendar(
+    Array.isArray(data.days) ? data.days : [],
+    data.month || analyticsMonth,
+    supportsBalance ? data.current_balance : null,
+    supportsBalance
+  );
+  renderBalanceHistory(supportsBalance && Array.isArray(data.balance_history) ? data.balance_history : []);
+}
+
+function renderSiteCalendar(days, month, currentBalance = null, showBalance = true) {
+  const container = document.getElementById('site-checkin-calendar');
+  if (!container) return;
+  container.replaceChildren();
+
+  const match = /^(\d{4})-(\d{2})$/.exec(month || '');
+  if (!match) {
+    container.textContent = '月份格式无效';
+    return;
+  }
+  const year = Number(match[1]);
+  const monthNumber = Number(match[2]);
+  const firstDay = (new Date(year, monthNumber - 1, 1).getDay() + 6) % 7;
+  const daysInMonth = new Date(year, monthNumber, 0).getDate();
+  const dayMap = new Map(days.map(day => [day.date, day]));
+
+  const grid = document.createElement('div');
+  grid.className = 'analytics-calendar-grid';
+  ['一', '二', '三', '四', '五', '六', '日'].forEach(label => {
+    const weekday = document.createElement('div');
+    weekday.className = 'analytics-calendar-weekday';
+    weekday.textContent = label;
+    grid.appendChild(weekday);
+  });
+
+  for (let index = 0; index < firstDay; index += 1) {
+    const emptyCell = document.createElement('div');
+    emptyCell.className = 'analytics-calendar-cell is-empty';
+    grid.appendChild(emptyCell);
+  }
+
+  for (let dayNumber = 1; dayNumber <= daysInMonth; dayNumber += 1) {
+    const date = `${year}-${String(monthNumber).padStart(2, '0')}-${String(dayNumber).padStart(2, '0')}`;
+    const record = dayMap.get(date);
+    const cell = document.createElement('div');
+    cell.className = 'analytics-calendar-cell';
+    if (date === getTodayStr()) cell.classList.add('is-today');
+    if (record) cell.classList.add(record.status === 'success' ? 'is-success' : 'is-failure');
+    cell.title = record?.message || (
+      record ? (record.status === 'success' ? '签到成功' : '签到失败') : '当天没有签到记录'
+    );
+
+    const number = document.createElement('span');
+    number.className = 'analytics-calendar-date';
+    number.textContent = String(dayNumber);
+    const marker = document.createElement('span');
+    marker.className = 'analytics-calendar-marker';
+    marker.textContent = record ? (record.status === 'success' ? '✓' : '×') : '·';
+    cell.append(number, marker);
+
+    if (showBalance && record?.balance !== null && record?.balance !== undefined) {
+      const balanceRow = document.createElement('div');
+      balanceRow.className = 'analytics-calendar-balance-row';
+      balanceRow.title = '左侧为本次签到增量，括号内为记录总余额';
+      const gained = document.createElement('small');
+      gained.className = 'analytics-calendar-gain';
+      gained.textContent = formatSignedBalance(record.gained_quota);
+      const displayBalance = date === getTodayStr() && currentBalance !== null && currentBalance !== undefined
+        ? currentBalance
+        : record.balance;
+      const total = document.createElement('small');
+      total.className = 'analytics-calendar-total';
+      total.textContent = `(${formatBalance(displayBalance)})`;
+      balanceRow.append(gained, total);
+      cell.appendChild(balanceRow);
+    }
+    grid.appendChild(cell);
+  }
+  container.appendChild(grid);
+}
+
+function renderBalanceHistory(history) {
+  const chartContainer = document.getElementById('site-balance-chart');
+  const listContainer = document.getElementById('site-balance-list');
+  if (!chartContainer || !listContainer) return;
+  chartContainer.replaceChildren();
+  listContainer.replaceChildren();
+
+  if (history.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'analytics-empty';
+    empty.textContent = '本月没有可用的余额记录';
+    chartContainer.appendChild(empty);
+    return;
+  }
+
+  const chartPoints = history
+    .slice(-60)
+    .filter(item => Number.isFinite(Number(item.balance)));
+  if (chartPoints.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'analytics-empty';
+    empty.textContent = '本月没有可用的数值余额记录';
+    chartContainer.appendChild(empty);
+  } else {
+    const values = chartPoints.map(item => Number(item.balance));
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const span = max - min;
+    const chart = document.createElement('div');
+    chart.className = 'analytics-balance-chart';
+    chartPoints.forEach(item => {
+      const value = Number(item.balance);
+      const column = document.createElement('div');
+      column.className = 'analytics-balance-column';
+      column.title = `${item.timestamp || ''} · ${formatBalance(value)}`;
+      const barTrack = document.createElement('div');
+      barTrack.className = 'analytics-balance-bar-track';
+      const bar = document.createElement('div');
+      bar.className = 'analytics-balance-bar';
+      bar.style.height = `${span === 0 ? 52 : 18 + ((value - min) / span) * 82}%`;
+      barTrack.appendChild(bar);
+      const date = document.createElement('small');
+      date.textContent = String(item.date || '').substring(5);
+      const valueLabel = document.createElement('span');
+      valueLabel.textContent = formatBalance(value);
+      column.append(barTrack, valueLabel, date);
+      chart.appendChild(column);
+    });
+    chartContainer.appendChild(chart);
+  }
+
+  const list = document.createElement('div');
+  list.className = 'analytics-balance-list';
+  history.slice().reverse().forEach(item => {
+    const row = document.createElement('div');
+    row.className = 'analytics-balance-row';
+    const info = document.createElement('div');
+    info.className = 'analytics-balance-info';
+    const timestamp = document.createElement('strong');
+    timestamp.textContent = item.timestamp || '未记录时间';
+    const type = document.createElement('span');
+    type.textContent = getAnalyticsTypeLabel(item.type);
+    info.append(timestamp, type);
+    const value = document.createElement('div');
+    value.className = 'analytics-balance-value';
+    const balance = document.createElement('strong');
+    balance.textContent = formatBalance(item.balance);
+    const change = document.createElement('span');
+    const changeNumber = Number(item.change);
+    change.className = Number.isFinite(changeNumber)
+      ? (changeNumber > 0 ? 'is-increase' : changeNumber < 0 ? 'is-decrease' : 'is-flat')
+      : 'is-first';
+    change.textContent = formatBalanceChange(item.change);
+    value.append(balance, change);
+    row.append(info, value);
+    list.appendChild(row);
+  });
+  listContainer.appendChild(list);
 }
 
 async function toggleSiteEnabled(index, enabled) {
@@ -569,8 +882,17 @@ function renderSettingsForm() {
   if (maxRecordsInput) {
     maxRecordsInput.value = settings.max_history_records ?? 0;
   }
+  const retentionDaysInput = document.getElementById('setting-history-retention-days');
+  if (retentionDaysInput) {
+    retentionDaysInput.value = settings.history_retention_days ?? 0;
+  }
+  const autoCleanupInput = document.getElementById('setting-auto-cleanup-logs');
+  if (autoCleanupInput) {
+    autoCleanupInput.checked = settings.auto_cleanup_logs !== false;
+  }
   renderImpersonateOptions();
   toggleRandomMode();
+  toggleLogCleanupSettings();
 }
 
 function renderImpersonateOptions() {
@@ -609,6 +931,22 @@ function toggleRandomMode() {
   document.getElementById('fixed-time-field').style.display = isRandom ? 'none' : 'block';
 }
 
+function toggleLogCleanupSettings() {
+  const cleanupInput = document.getElementById('setting-auto-cleanup-logs');
+  const retentionDaysInput = document.getElementById('setting-history-retention-days');
+  const maxRecordsInput = document.getElementById('setting-max-history-records');
+  const retentionDaysField = document.getElementById('history-retention-field');
+  const recordsField = document.getElementById('history-records-field');
+  if (!cleanupInput || !retentionDaysInput || !maxRecordsInput) return;
+
+  const enabled = cleanupInput.checked;
+  retentionDaysInput.disabled = !enabled;
+  maxRecordsInput.disabled = !enabled;
+  [retentionDaysField, recordsField].forEach(field => {
+    if (field) field.classList.toggle('is-disabled', !enabled);
+  });
+}
+
 function openSettingsModal() {
   openModal('settings-modal');
   loadSettings();
@@ -629,6 +967,14 @@ async function saveSettings() {
   timeoutInputElement.value = String(http_timeout_seconds);
   const httpImpersonateSelect = document.getElementById('setting-http-impersonate');
   const http_impersonate = httpImpersonateSelect.value;
+  const autoCleanupInput = document.getElementById('setting-auto-cleanup-logs');
+  const auto_cleanup_logs = autoCleanupInput ? autoCleanupInput.checked : true;
+  const retentionDaysInput = document.getElementById('setting-history-retention-days');
+  const history_retention_days = Math.max(
+    0,
+    parseInt(retentionDaysInput ? retentionDaysInput.value : 0, 10) || 0
+  );
+  if (retentionDaysInput) retentionDaysInput.value = String(history_retention_days);
   const maxRecordsInput = document.getElementById('setting-max-history-records');
   const max_history_records = Math.max(0, parseInt(maxRecordsInput ? maxRecordsInput.value : 0, 10) || 0);
   if (maxRecordsInput) maxRecordsInput.value = String(max_history_records);
@@ -642,12 +988,14 @@ async function saveSettings() {
     http_ssl_verify,
     http_timeout_seconds,
     http_impersonate,
+    auto_cleanup_logs,
+    history_retention_days,
     max_history_records
   };
 
   try {
     await apiPost('/api/settings', settings);
-    showToast('定时设置更新成功', 'success');
+    showToast('全局设置更新成功', 'success');
     closeModal('settings-modal');
     loadSettings();
   } catch (e) {
@@ -719,8 +1067,176 @@ function createLogTimelineItem(log) {
   const content = document.createElement('div');
   content.className = 'timeline-content';
   content.textContent = log.report || '';
-  item.append(header, content);
+  const actions = document.createElement('div');
+  actions.className = 'timeline-actions';
+  actions.appendChild(
+    createActionButton('查看详情', 'btn-primary-plain', () => openLogDetail(log), false)
+  );
+  item.append(header, content, actions);
   return item;
+}
+
+function createLogDetailBlock(labelText, value, className = '') {
+  const block = document.createElement('div');
+  block.className = `log-detail-block${className ? ` ${className}` : ''}`;
+  const label = document.createElement('div');
+  label.className = 'log-detail-label';
+  label.textContent = labelText;
+  const pre = document.createElement('pre');
+  pre.className = 'log-detail-pre';
+  if (className.includes('log-detail-report') || className.includes('summary')) {
+    pre.classList.add('log-detail-summary');
+  }
+  pre.textContent = value || '';
+  block.append(label, pre);
+  return block;
+}
+
+function createLogAttemptElement(attempt, index) {
+  const item = attempt || {};
+  const attemptElement = document.createElement('div');
+  attemptElement.className = `log-attempt ${item.success === true ? 'success' : 'failed'}`;
+
+  const header = document.createElement('div');
+  header.className = 'log-attempt-header';
+  const step = document.createElement('span');
+  step.className = 'log-attempt-step';
+  step.textContent = item.step || `请求 ${index + 1}`;
+  const status = document.createElement('span');
+  status.className = 'log-attempt-status';
+  status.textContent = item.status !== null && item.status !== undefined
+    ? `HTTP ${item.status}`
+    : '未收到 HTTP 响应';
+  header.append(step, status);
+
+  const url = document.createElement('div');
+  url.className = 'log-attempt-url';
+  url.textContent = `${item.method || ''} ${item.url || ''}`.trim();
+  attemptElement.append(header, url);
+
+  if (item.message) {
+    const message = document.createElement('div');
+    message.className = 'log-detail-message';
+    message.textContent = item.message;
+    attemptElement.appendChild(message);
+  }
+  if (item.error) {
+    const error = document.createElement('div');
+    error.className = 'log-detail-error';
+    error.textContent = `异常：${item.error}`;
+    attemptElement.appendChild(error);
+  }
+  if (item.response) {
+    const responseLength = item.response_length ? `（${item.response_length} 字符）` : '';
+    attemptElement.appendChild(
+      createLogDetailBlock(`响应内容${responseLength}`, item.response)
+    );
+  }
+  return attemptElement;
+}
+
+function createLogResultElement(result, index) {
+  const item = result || {};
+  const resultElement = document.createElement('section');
+  resultElement.className = 'log-detail-result';
+
+  const resultHeader = document.createElement('div');
+  resultHeader.className = 'log-detail-result-header';
+  const siteInfo = document.createElement('div');
+  const site = document.createElement('div');
+  site.className = 'log-detail-site';
+  site.textContent = item.site_name || `站点 ${index + 1}`;
+  const siteId = document.createElement('div');
+  siteId.className = 'log-detail-site-id';
+  siteId.textContent = `ID：${item.site_id || '未记录'}`;
+  siteInfo.append(site, siteId);
+  const resultStatus = document.createElement('div');
+  resultStatus.className = `log-detail-status ${item.success ? 'success' : 'failed'}`;
+  resultStatus.textContent = item.success ? '成功' : (item.expired ? '鉴权失败' : '失败');
+  resultHeader.append(siteInfo, resultStatus);
+  resultElement.appendChild(resultHeader);
+
+  const message = document.createElement('div');
+  message.className = 'log-detail-message';
+  message.textContent = item.message || '未记录结果消息';
+  resultElement.appendChild(message);
+
+  const quota = Number(item.total_quota);
+  if (Number.isFinite(quota) && quota > 0) {
+    const balance = document.createElement('div');
+    balance.className = 'log-detail-balance';
+    balance.textContent = `余额：${formatBalance(quota)}`;
+    resultElement.appendChild(balance);
+  }
+
+  if (item.error_detail) {
+    resultElement.appendChild(
+      createLogDetailBlock('请求摘要', item.error_detail, 'log-detail-summary-block')
+    );
+  }
+
+  const attempts = Array.isArray(item.attempts) ? item.attempts : [];
+  const attemptsLabel = document.createElement('div');
+  attemptsLabel.className = 'log-detail-label log-detail-attempts-label';
+  attemptsLabel.textContent = `请求链路（${attempts.length} 次）`;
+  resultElement.appendChild(attemptsLabel);
+
+  const attemptList = document.createElement('div');
+  attemptList.className = 'log-attempt-list';
+  if (attempts.length > 0) {
+    attempts.forEach((attempt, attemptIndex) => {
+      attemptList.appendChild(createLogAttemptElement(attempt, attemptIndex));
+    });
+  } else {
+    const empty = document.createElement('div');
+    empty.className = 'log-detail-empty';
+    empty.textContent = '该条历史记录没有保存请求级详情（旧版本日志）。';
+    attemptList.appendChild(empty);
+  }
+  resultElement.appendChild(attemptList);
+  return resultElement;
+}
+
+function openLogDetail(log) {
+  if (!log) return;
+  const title = document.getElementById('log-detail-title');
+  const body = document.getElementById('log-detail-body');
+  if (!body) return;
+
+  if (title) title.textContent = `签到日志详情 · ${log.timestamp || ''}`;
+  body.replaceChildren();
+
+  const overview = document.createElement('div');
+  overview.className = 'log-detail-overview';
+  const overviewFields = [
+    ['类型', getLogTitle(log)],
+    ['时间', log.timestamp || '未记录']
+  ];
+  overviewFields.forEach(([labelText, value]) => {
+    const field = document.createElement('div');
+    const label = document.createElement('span');
+    label.textContent = labelText;
+    const strong = document.createElement('strong');
+    strong.textContent = value;
+    field.append(label, strong);
+    overview.appendChild(field);
+  });
+  body.appendChild(overview);
+
+  body.appendChild(createLogDetailBlock('汇总', log.report || '未记录汇总', 'log-detail-report'));
+
+  const details = Array.isArray(log.details) ? log.details : [];
+  if (details.length > 0) {
+    details.forEach((result, resultIndex) => {
+      body.appendChild(createLogResultElement(result, resultIndex));
+    });
+  } else {
+    const empty = document.createElement('div');
+    empty.className = 'log-detail-empty';
+    empty.textContent = '这条日志没有站点详情。';
+    body.appendChild(empty);
+  }
+  openModal('log-detail-modal');
 }
 
 function renderLogMessage(container, message) {
@@ -755,9 +1271,42 @@ function updateLogsFooter(isLoadingMore) {
   } else if (!logsHasMore) {
     const endDiv = document.createElement('div');
     endDiv.className = 'logs-end-line';
-    endDiv.textContent = `已加载全部日志 (共 ${logItems.length} 条)`;
+    const total = logsTotal || logItems.length;
+    endDiv.textContent = logsStartDate || logsEndDate
+      ? `筛选结果：共 ${total} 条日志`
+      : `已加载全部日志 (共 ${total} 条)`;
     container.appendChild(endDiv);
   }
+}
+
+function syncLogTimeFilterFields() {
+  const startInput = document.getElementById('logs-start-date');
+  const endInput = document.getElementById('logs-end-date');
+  if (startInput) startInput.value = logsStartDate;
+  if (endInput) endInput.value = logsEndDate;
+}
+
+function applyLogTimeFilter() {
+  const startInput = document.getElementById('logs-start-date');
+  const endInput = document.getElementById('logs-end-date');
+  const startDate = startInput?.value || '';
+  const endDate = endInput?.value || '';
+
+  if (startDate && endDate && startDate > endDate) {
+    showToast('开始日期不能晚于结束日期', 'warning');
+    return;
+  }
+
+  logsStartDate = startDate;
+  logsEndDate = endDate;
+  fetchLogsPage(true);
+}
+
+function resetLogTimeFilter() {
+  logsStartDate = '';
+  logsEndDate = '';
+  syncLogTimeFilterFields();
+  fetchLogsPage(true);
 }
 
 async function fetchLogsPage(isInitial = false) {
@@ -782,6 +1331,8 @@ async function fetchLogsPage(isInitial = false) {
     if (logsNextBeforeId !== null && logsNextBeforeId !== undefined) {
       params.before_id = logsNextBeforeId;
     }
+    if (logsStartDate) params.start_date = logsStartDate;
+    if (logsEndDate) params.end_date = logsEndDate;
 
     const data = await apiGet('/api/logs', params);
     let newItems = [];
@@ -839,6 +1390,7 @@ function handleLogsScroll() {
 }
 
 function openLogsDrawer() {
+  syncLogTimeFilterFields();
   openModal('logs-drawer');
   fetchLogsPage(true);
 }

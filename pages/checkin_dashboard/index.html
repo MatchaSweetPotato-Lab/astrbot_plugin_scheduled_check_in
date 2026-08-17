@@ -142,7 +142,7 @@
     <div id="settings-modal" class="modal-overlay" onclick="handleOverlayClick(event, 'settings-modal')">
       <div class="modal-card">
         <div class="modal-header">
-          <h3>定时签到设置</h3>
+          <h3>全局设置</h3>
           <button class="modal-close" onclick="closeModal('settings-modal')">&times;</button>
         </div>
         <div class="modal-body">
@@ -194,10 +194,24 @@
             </select>
             <div class="form-hint">选项及默认值由服务端根据当前 curl_cffi 版本动态提供。</div>
           </div>
-          <div class="form-group">
+          <div class="form-group settings-toggle-row">
+            <div class="settings-toggle-content">
+              <div class="settings-toggle-label">自动清理日志</div>
+              <div class="form-hint">开启后按下方天数和条数清理旧日志；关闭后不会自动删除日志。</div>
+            </div>
+            <label class="switch" aria-label="自动清理日志">
+              <input type="checkbox" id="setting-auto-cleanup-logs" onchange="toggleLogCleanupSettings()" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div id="history-retention-field" class="form-group settings-dependent-field">
+            <label for="setting-history-retention-days">历史日志保留天数</label>
+            <input type="number" id="setting-history-retention-days" class="form-control" min="0" max="36500" step="1" value="0" />
+            <div class="form-hint">设为 0 表示不按天清理。</div>
+          </div>
+          <div id="history-records-field" class="form-group settings-dependent-field">
             <label for="setting-max-history-records">历史日志保留上限（条数）</label>
             <input type="number" id="setting-max-history-records" class="form-control" min="0" max="1000000" step="1" value="0" />
-            <div class="form-hint">设为 0 表示不设上限（全部保留）。配置大于 0 时，超出条数的旧日志将被自动清理。</div>
           </div>
         </div>
         <div class="modal-footer">
@@ -217,11 +231,92 @@
             <button class="modal-close" onclick="closeModal('logs-drawer')">&times;</button>
           </div>
         </div>
+        <div class="logs-filter-bar">
+          <div class="logs-filter-title">时间筛选</div>
+          <div class="logs-filter-fields">
+            <label class="logs-filter-field">
+              <span>开始日期</span>
+              <input type="date" id="logs-start-date" class="form-control" />
+            </label>
+            <span class="logs-filter-separator">至</span>
+            <label class="logs-filter-field">
+              <span>结束日期</span>
+              <input type="date" id="logs-end-date" class="form-control" />
+            </label>
+            <div class="logs-filter-actions">
+              <button class="btn btn-sm btn-primary-plain" onclick="applyLogTimeFilter()">筛选</button>
+              <button class="btn btn-sm" onclick="resetLogTimeFilter()">重置</button>
+            </div>
+          </div>
+        </div>
         <div class="modal-body" id="logs-body">
           <div class="empty-text">加载中...</div>
         </div>
       </div>
     </div>
+
+    <!-- History Log Detail Modal -->
+    <div id="log-detail-modal" class="modal-overlay" onclick="handleOverlayClick(event, 'log-detail-modal')">
+      <div class="modal-card log-detail-modal-card">
+        <div class="modal-header">
+          <h3 id="log-detail-title">签到日志详情</h3>
+          <button class="modal-close" onclick="closeModal('log-detail-modal')">&times;</button>
+        </div>
+        <div class="modal-body" id="log-detail-body">
+          <div class="empty-text">选择一条日志查看详情</div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" onclick="closeModal('log-detail-modal')">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Site Check-In Calendar and Balance Modal -->
+    <div id="site-analytics-modal" class="modal-overlay" onclick="handleOverlayClick(event, 'site-analytics-modal')">
+      <div class="modal-card site-analytics-modal-card">
+        <div class="modal-header">
+          <h3 id="site-analytics-title">签到日历</h3>
+          <button class="modal-close" onclick="closeModal('site-analytics-modal')">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="site-analytics-month-toolbar">
+            <button class="btn btn-sm" type="button" onclick="changeAnalyticsMonth(-1)" aria-label="上个月">‹</button>
+            <strong id="site-analytics-month">----</strong>
+            <button class="btn btn-sm" type="button" onclick="changeAnalyticsMonth(1)" aria-label="下个月">›</button>
+          </div>
+          <div id="site-analytics-summary" class="analytics-summary"></div>
+          <div id="site-analytics-notice" class="analytics-notice" hidden></div>
+
+          <section class="analytics-section">
+            <div class="analytics-section-header">
+              <h4>签到日历</h4>
+              <div class="analytics-calendar-legend">
+                <span><i class="legend-dot success"></i>成功</span>
+                <span><i class="legend-dot failure"></i>失败</span>
+              </div>
+            </div>
+            <div id="site-checkin-calendar">
+              <div class="analytics-loading">正在读取签到记录...</div>
+            </div>
+          </section>
+
+          <section id="site-balance-section" class="analytics-section">
+            <div class="analytics-section-header">
+              <h4>余额变化</h4>
+              <span class="analytics-section-hint">按日志中的余额记录统计</span>
+            </div>
+            <div id="site-balance-chart">
+              <div class="analytics-loading">正在读取余额变化...</div>
+            </div>
+            <div id="site-balance-list"></div>
+          </section>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" onclick="closeModal('site-analytics-modal')">关闭</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Confirm Action Custom Modal -->
     <div id="confirm-modal" class="modal-overlay" onclick="handleOverlayClick(event, 'confirm-modal')">
       <div class="modal-card" style="max-width: 400px;">
