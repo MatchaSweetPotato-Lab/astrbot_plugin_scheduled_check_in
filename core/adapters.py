@@ -286,8 +286,11 @@ class BaseCheckInAdapter(ABC):
 
     @staticmethod
     def _message_indicates_checkin(message: str) -> bool:
-        """Recognize success messages used by different relay implementations."""
-        return any(marker in message for marker in ("重复", "已签到", "成功"))
+        """Recognize explicit check-in success messages without broad false positives."""
+        normalized = message.strip()
+        if any(marker in normalized for marker in ("签到失败", "未签到", "未成功", "未触发签到")):
+            return False
+        return any(marker in normalized for marker in ("签到成功", "已签到", "已经签到", "重复签到"))
 
     def _record_attempt(
         self,
@@ -303,25 +306,6 @@ class BaseCheckInAdapter(ABC):
         error: str = "",
     ) -> None:
         """Append one request trace while deliberately excluding request headers."""
-        if len(attempts) >= MAX_ATTEMPTS_PER_RUN:
-            return
-        if len(attempts) == MAX_ATTEMPTS_PER_RUN - 1:
-            attempts.append(
-                {
-                    "step": "请求追踪",
-                    "method": "",
-                    "url": "",
-                    "status": None,
-                    "success": False,
-                    "message": (
-                        f"已达到单次请求追踪上限（{MAX_ATTEMPTS_PER_RUN - 1}），"
-                        "后续尝试已省略"
-                    ),
-                    "truncated": True,
-                }
-            )
-            return
-
         item: dict[str, Any] = {
             "step": step,
             "method": method.upper(),
@@ -337,7 +321,30 @@ class BaseCheckInAdapter(ABC):
             item["response_length"] = len((response_text or "").strip())
         if error:
             item["error"] = str(error)
-        attempts.append(item)
+
+        # Keep the attempt that reaches the cap. A marker is added only when a
+        # later attempt is first omitted, so the trace has MAX_ATTEMPTS_PER_RUN
+        # real attempts plus at most one bounded marker.
+        if len(attempts) < MAX_ATTEMPTS_PER_RUN:
+            attempts.append(item)
+            return
+        if attempts and attempts[-1].get("truncated"):
+            return
+        if len(attempts) >= MAX_ATTEMPTS_PER_RUN:
+            attempts.append(
+                {
+                    "step": "请求追踪",
+                    "method": method.upper(),
+                    "url": self._safe_url(endpoint),
+                    "status": status,
+                    "success": False,
+                    "message": (
+                        f"已达到单次请求追踪上限（{MAX_ATTEMPTS_PER_RUN}），"
+                        "后续尝试已省略"
+                    ),
+                    "truncated": True,
+                }
+            )
 
     @staticmethod
     def _format_attempts(attempts: list[dict[str, Any]]) -> str:

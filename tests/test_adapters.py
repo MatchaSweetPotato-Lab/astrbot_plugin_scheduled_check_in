@@ -82,12 +82,23 @@ class AdapterBalanceTests(unittest.IsolatedAsyncioTestCase):
                 response_text="y" * 10000,
             )
 
-        self.assertEqual(len(attempts), MAX_ATTEMPTS_PER_RUN)
+        self.assertEqual(
+            sum(not attempt.get("truncated") for attempt in attempts),
+            MAX_ATTEMPTS_PER_RUN,
+        )
+        self.assertEqual(len(attempts), MAX_ATTEMPTS_PER_RUN + 1)
         self.assertTrue(attempts[-1].get("truncated"))
         self.assertLessEqual(
             len(adapter._format_attempts(attempts)),
             MAX_ATTEMPT_SUMMARY_CHARS,
         )
+
+    def test_checkin_success_message_heuristic_is_specific(self) -> None:
+        """Do not treat generic or negative success wording as a check-in."""
+        self.assertTrue(NewApiAdapter._message_indicates_checkin("签到成功，获得奖励"))
+        self.assertTrue(NewApiAdapter._message_indicates_checkin("今日已签到"))
+        self.assertFalse(NewApiAdapter._message_indicates_checkin("接口调用成功，但未触发签到"))
+        self.assertFalse(NewApiAdapter._message_indicates_checkin("签到失败：未成功"))
 
 
 if __name__ == "__main__":

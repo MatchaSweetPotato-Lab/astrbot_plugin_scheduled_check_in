@@ -516,6 +516,7 @@ class DatabaseManager:
         before_id: int | None = None,
         start_date: str | None = None,
         end_date: str | None = None,
+        site_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Read recent history log records ordered from newest to oldest.
 
@@ -524,6 +525,7 @@ class DatabaseManager:
             before_id: Optional log ID cursor for pagination. When provided, returns logs with id < before_id.
             start_date: Optional inclusive start date in YYYY-MM-DD format.
             end_date: Optional inclusive end date in YYYY-MM-DD format.
+            site_id: Optional site ID used to prefilter serialized result details.
 
         Returns:
             List of history log dictionaries.
@@ -531,6 +533,13 @@ class DatabaseManager:
         with self._lock, self._connection() as conn:
             start_bound = f"{str(start_date).strip()} 00:00:00" if start_date else None
             end_bound = f"{str(end_date).strip()} 23:59:59" if end_date else None
+            site_filter = str(site_id).strip() if site_id is not None else ""
+            site_pattern = None
+            if site_filter:
+                # ``details`` is a JSON array. The LIKE is only a SQL-side
+                # prefilter; callers still verify the exact site_id in Python.
+                encoded_site_id = json.dumps(site_filter, ensure_ascii=False)
+                site_pattern = f'%"site_id"%{encoded_site_id}%'
             query_parameters = (
                 start_bound,
                 start_bound,
@@ -538,6 +547,8 @@ class DatabaseManager:
                 end_bound,
                 before_id,
                 before_id,
+                site_pattern,
+                site_pattern,
             )
             if limit is None:
                 cursor = conn.execute(
@@ -546,6 +557,7 @@ class DatabaseManager:
                     WHERE (? IS NULL OR timestamp >= ?)
                       AND (? IS NULL OR timestamp <= ?)
                       AND (? IS NULL OR id < ?)
+                      AND (? IS NULL OR details LIKE ?)
                     ORDER BY id DESC
                     """,
                     query_parameters,
@@ -557,6 +569,7 @@ class DatabaseManager:
                     WHERE (? IS NULL OR timestamp >= ?)
                       AND (? IS NULL OR timestamp <= ?)
                       AND (? IS NULL OR id < ?)
+                      AND (? IS NULL OR details LIKE ?)
                     ORDER BY id DESC
                     LIMIT ?
                     """,

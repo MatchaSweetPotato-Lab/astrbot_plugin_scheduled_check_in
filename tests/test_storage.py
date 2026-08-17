@@ -172,6 +172,13 @@ class DatabaseManagerTests(unittest.TestCase):
             end_date="2026-08-16",
         )
         self.assertEqual(len(filtered_logs), 15)
+        site_logs = self.db.read_history_logs(
+            limit=100,
+            start_date="2026-08-16",
+            end_date="2026-08-16",
+            site_id="site_1",
+        )
+        self.assertEqual([log["report"] for log in site_logs], ["Report 1"])
         self.assertEqual(
             self.db.count_history_logs(start_date="2026-08-16", end_date="2026-08-16"),
             15,

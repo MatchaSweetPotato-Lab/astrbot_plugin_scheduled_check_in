@@ -178,6 +178,7 @@ class ScheduledCheckInPlugin(Star):
         before_id: int | None = None,
         start_date: str | None = None,
         end_date: str | None = None,
+        site_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Read history log entries from SQLite database.
 
@@ -186,6 +187,7 @@ class ScheduledCheckInPlugin(Star):
             before_id: Optional log ID cursor.
             start_date: Optional inclusive start date in YYYY-MM-DD format.
             end_date: Optional inclusive end date in YYYY-MM-DD format.
+            site_id: Optional site ID used to prefilter serialized result details.
 
         Returns:
             List of history log entries.
@@ -196,6 +198,7 @@ class ScheduledCheckInPlugin(Star):
                 before_id=before_id,
                 start_date=start_date,
                 end_date=end_date,
+                site_id=site_id,
             )
         except Exception as e:
             logger.error(f"Error reading history logs from database: {e}", exc_info=True)
@@ -264,6 +267,7 @@ class ScheduledCheckInPlugin(Star):
 
     def _read_site_activity_logs(
         self,
+        site_id: str,
         start_date: str,
         end_date: str,
     ) -> tuple[list[dict[str, Any]], bool]:
@@ -291,6 +295,7 @@ class ScheduledCheckInPlugin(Star):
                 before_id=before_id,
                 start_date=start_date,
                 end_date=end_date,
+                site_id=site_id,
             )
             if not batch:
                 return logs, False
@@ -308,6 +313,7 @@ class ScheduledCheckInPlugin(Star):
             before_id=before_id,
             start_date=start_date,
             end_date=end_date,
+            site_id=site_id,
         )
         return logs, bool(remaining)
 
@@ -350,6 +356,7 @@ class ScheduledCheckInPlugin(Star):
         site_type = str(site.get("type") or "").strip().lower()
         supports_balance = site_type in {"new-api", "one-api"}
         logs, history_truncated = self._read_site_activity_logs(
+            site_id=site_id,
             start_date=month_start_str,
             end_date=month_end_str,
         )
