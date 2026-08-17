@@ -187,7 +187,7 @@ class ScheduledCheckInPlugin(Star):
             before_id: Optional log ID cursor.
             start_date: Optional inclusive start date in YYYY-MM-DD format.
             end_date: Optional inclusive end date in YYYY-MM-DD format.
-            site_id: Optional site ID used to prefilter serialized result details.
+            site_id: Optional site ID filtered through the indexed association table.
 
         Returns:
             List of history log entries.

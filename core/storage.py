@@ -50,6 +50,7 @@ class DatabaseManager:
         self._init_db()
         if legacy_data_dir:
             self._migrate_legacy_json(Path(legacy_data_dir))
+        self._ensure_history_site_index()
 
     def _get_connection(self) -> sqlite3.Connection:
         """Create and configure a SQLite connection."""
@@ -146,9 +147,75 @@ class DatabaseManager:
                     details TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS history_log_sites (
+                    history_id INTEGER NOT NULL,
+                    site_id TEXT NOT NULL,
+                    PRIMARY KEY (history_id, site_id),
+                    FOREIGN KEY (history_id) REFERENCES history_logs(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS storage_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_history_logs_id_desc ON history_logs(id DESC);
                 CREATE INDEX IF NOT EXISTS idx_history_logs_timestamp ON history_logs(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_history_log_sites_site_id
+                    ON history_log_sites(site_id, history_id);
             """)
+
+    @staticmethod
+    def _extract_site_ids(details: Any) -> set[str]:
+        """Extract configured site IDs from one history entry's result list."""
+        if not isinstance(details, list):
+            return set()
+        site_ids: set[str] = set()
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            site_id = str(detail.get("site_id") or "").strip()
+            if site_id:
+                site_ids.add(site_id)
+        return site_ids
+
+    def _index_history_entry_sites(
+        self,
+        conn: sqlite3.Connection,
+        history_id: int,
+        details: Any,
+    ) -> None:
+        """Store site IDs in the indexed history association table."""
+        site_ids = self._extract_site_ids(details)
+        if not site_ids:
+            return
+        conn.executemany(
+            "INSERT OR IGNORE INTO history_log_sites (history_id, site_id) VALUES (?, ?)",
+            [(history_id, site_id) for site_id in site_ids],
+        )
+
+    def _ensure_history_site_index(self) -> None:
+        """Backfill the site association index once for existing history rows."""
+        with self._lock, self._connection() as conn:
+            marker = conn.execute(
+                "SELECT value FROM storage_metadata WHERE key = ?",
+                ("history_site_index_version",),
+            ).fetchone()
+            if marker:
+                return
+
+            rows = conn.execute("SELECT id, details FROM history_logs").fetchall()
+            for row in rows:
+                try:
+                    details = json.loads(row["details"])
+                except Exception:
+                    details = []
+                self._index_history_entry_sites(conn, int(row["id"]), details)
+
+            conn.execute(
+                "INSERT INTO storage_metadata (key, value) VALUES (?, ?)",
+                ("history_site_index_version", "1"),
+            )
 
     def _migrate_legacy_json(self, legacy_dir: Path) -> None:
         """Migrate legacy JSON files into SQLite and rename them to .bak.
@@ -474,8 +541,10 @@ class DatabaseManager:
         max_records = self._normalize_nonnegative_int(max_records)
         retention_days = self._normalize_nonnegative_int(retention_days)
 
+        details = entry.get("details", [])
+        details_json = json.dumps(details, ensure_ascii=False)
         with self._lock, self._connection() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT INTO history_logs (timestamp, type, manual, success, report, details)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -486,9 +555,11 @@ class DatabaseManager:
                     1 if entry.get("manual") else 0,
                     1 if entry.get("success") else 0,
                     entry.get("report", ""),
-                    json.dumps(entry.get("details", []), ensure_ascii=False),
+                    details_json,
                 ),
             )
+            if cursor.lastrowid is not None:
+                self._index_history_entry_sites(conn, int(cursor.lastrowid), details)
 
             if retention_days > 0:
                 cutoff = datetime.now() - timedelta(days=retention_days)
@@ -525,7 +596,7 @@ class DatabaseManager:
             before_id: Optional log ID cursor for pagination. When provided, returns logs with id < before_id.
             start_date: Optional inclusive start date in YYYY-MM-DD format.
             end_date: Optional inclusive end date in YYYY-MM-DD format.
-            site_id: Optional site ID used to prefilter serialized result details.
+            site_id: Optional site ID used to filter through the indexed association table.
 
         Returns:
             List of history log dictionaries.
@@ -533,48 +604,35 @@ class DatabaseManager:
         with self._lock, self._connection() as conn:
             start_bound = f"{str(start_date).strip()} 00:00:00" if start_date else None
             end_bound = f"{str(end_date).strip()} 23:59:59" if end_date else None
-            site_filter = str(site_id).strip() if site_id is not None else ""
-            site_pattern = None
+            site_filter = str(site_id).strip() if site_id is not None else None
+            if not site_filter:
+                site_filter = None
+            conditions: list[str] = []
+            query_parameters: list[Any] = []
+            if start_bound:
+                conditions.append("history_logs.timestamp >= ?")
+                query_parameters.append(start_bound)
+            if end_bound:
+                conditions.append("history_logs.timestamp <= ?")
+                query_parameters.append(end_bound)
+            if before_id is not None:
+                conditions.append("history_logs.id < ?")
+                query_parameters.append(before_id)
+
+            from_clause = "history_logs"
             if site_filter:
-                # ``details`` is a JSON array. The LIKE is only a SQL-side
-                # prefilter; callers still verify the exact site_id in Python.
-                encoded_site_id = json.dumps(site_filter, ensure_ascii=False)
-                site_pattern = f'%"site_id"%{encoded_site_id}%'
-            query_parameters = (
-                start_bound,
-                start_bound,
-                end_bound,
-                end_bound,
-                before_id,
-                before_id,
-                site_pattern,
-                site_pattern,
-            )
-            if limit is None:
-                cursor = conn.execute(
-                    """
-                    SELECT * FROM history_logs
-                    WHERE (? IS NULL OR timestamp >= ?)
-                      AND (? IS NULL OR timestamp <= ?)
-                      AND (? IS NULL OR id < ?)
-                      AND (? IS NULL OR details LIKE ?)
-                    ORDER BY id DESC
-                    """,
-                    query_parameters,
-                )
-            else:
-                cursor = conn.execute(
-                    """
-                    SELECT * FROM history_logs
-                    WHERE (? IS NULL OR timestamp >= ?)
-                      AND (? IS NULL OR timestamp <= ?)
-                      AND (? IS NULL OR id < ?)
-                      AND (? IS NULL OR details LIKE ?)
-                    ORDER BY id DESC
-                    LIMIT ?
-                    """,
-                    (*query_parameters, limit),
-                )
+                from_clause += " INNER JOIN history_log_sites AS indexed_sites ON indexed_sites.history_id = history_logs.id"
+                conditions.append("indexed_sites.site_id = ?")
+                query_parameters.append(site_filter)
+
+            query = f"SELECT history_logs.* FROM {from_clause}"
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+            query += " ORDER BY history_logs.id DESC"
+            if limit is not None:
+                query += " LIMIT ?"
+                query_parameters.append(limit)
+            cursor = conn.execute(query, query_parameters)
             logs = []
             for row in cursor.fetchall():
                 try:

@@ -39,6 +39,12 @@ class DatabaseManagerTests(unittest.TestCase):
             self.assertIn("sites", tables)
             self.assertIn("settings", tables)
             self.assertIn("history_logs", tables)
+            self.assertIn("history_log_sites", tables)
+            indexes = {
+                row[1]
+                for row in conn.execute("PRAGMA index_list(history_log_sites)").fetchall()
+            }
+            self.assertIn("idx_history_log_sites_site_id", indexes)
 
     def test_sites_crud_and_ordering(self) -> None:
         """Test saving, retrieving in order, and updating site check-in status."""
@@ -421,6 +427,8 @@ class DatabaseManagerTests(unittest.TestCase):
         self.assertEqual(len(logs), 2)
         self.assertEqual(logs[0]["report"], "Legacy report 1")
         self.assertEqual(logs[1]["report"], "Legacy report 2")
+        indexed_logs = mgr.read_history_logs(site_id="migrated_site_1")
+        self.assertEqual(len(indexed_logs), 2)
 
         # Verify JSON files were renamed to .bak
         self.assertFalse(sites_file.exists())
