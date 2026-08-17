@@ -1,9 +1,9 @@
 """Main plugin entry point for AstrBot scheduled check-in plugin."""
 
-import json
 import logging
 from collections.abc import AsyncGenerator
-from datetime import datetime
+from datetime import datetime, timedelta
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +14,6 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .core.adapters import create_adapter
 from .core.http_client import (
-    DEFAULT_IMPERSONATE,
     create_client_session,
     get_impersonate_options,
     normalize_impersonate,
@@ -174,26 +173,39 @@ class ScheduledCheckInPlugin(Star):
         self,
         limit: int = 100,
         before_id: int | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
     ) -> list[dict[str, Any]]:
         """Read history log entries from SQLite database.
 
         Args:
             limit: Maximum number of logs to return.
             before_id: Optional log ID cursor.
+            start_date: Optional inclusive start date in YYYY-MM-DD format.
+            end_date: Optional inclusive end date in YYYY-MM-DD format.
 
         Returns:
             List of history log entries.
         """
         try:
-            return self.db.read_history_logs(limit=limit, before_id=before_id)
+            return self.db.read_history_logs(
+                limit=limit,
+                before_id=before_id,
+                start_date=start_date,
+                end_date=end_date,
+            )
         except Exception as e:
             logger.error(f"Error reading history logs from database: {e}", exc_info=True)
             return []
 
-    def count_history_logs(self) -> int:
-        """Count total history log entries in SQLite database."""
+    def count_history_logs(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> int:
+        """Count total history log entries, optionally within a date range."""
         try:
-            return self.db.count_history_logs()
+            return self.db.count_history_logs(start_date=start_date, end_date=end_date)
         except Exception as e:
             logger.error(f"Error counting history logs from database: {e}", exc_info=True)
             return 0
@@ -216,6 +228,7 @@ class ScheduledCheckInPlugin(Star):
             ("/api/sites", self.api_save_sites, ["POST"], "保存站点配置"),
             ("/api/sites/test", self.api_test_site, ["POST"], "测试站点连接"),
             ("/api/sites/recheckin", self.api_recheckin_site, ["POST"], "重新签到单个站点"),
+            ("/api/sites/activity", self.api_get_site_activity, ["GET"], "获取站点签到日历与余额变化"),
             ("/api/checkin/run", self.api_run_checkin, ["POST"], "触发一键打卡"),
             ("/api/settings", self.api_get_settings, ["GET"], "获取设置"),
             ("/api/settings", self.api_save_settings, ["POST"], "保存设置"),
@@ -245,6 +258,175 @@ class ScheduledCheckInPlugin(Star):
             JSON response.
         """
         return json_response(self.get_sites())
+
+    async def api_get_site_activity(self) -> Any:
+        """Web API: Get one site's monthly check-in calendar and balance history."""
+        site_id = ""
+        month = datetime.now().strftime("%Y-%m")
+        try:
+            if hasattr(request, "query") and request.query:
+                site_id = str(request.query.get("site_id") or "").strip()
+                query_month = str(request.query.get("month") or "").strip()
+                if query_month:
+                    month = query_month
+        except Exception as e:
+            logger.warning(f"Failed to parse site activity query params: {e}")
+
+        if not site_id:
+            return error_response("缺少站点 ID")
+
+        try:
+            month_start = datetime.strptime(f"{month}-01", "%Y-%m-%d")
+        except ValueError:
+            return error_response("月份格式必须为 YYYY-MM")
+
+        month_end = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        month_start_str = month_start.strftime("%Y-%m-%d")
+        month_end_str = month_end.strftime("%Y-%m-%d")
+
+        site = next(
+            (
+                item
+                for item in self.get_sites()
+                if str(item.get("id") or "").strip() == site_id
+            ),
+            None,
+        )
+        if site is None:
+            return error_response("站点不存在")
+
+        site_type = str(site.get("type") or "").strip().lower()
+        supports_balance = site_type in {"new-api", "one-api"}
+        logs = self.read_history_logs(
+            limit=5000,
+            start_date=month_start_str,
+            end_date=month_end_str,
+        )
+
+        def as_bool(value: Any) -> bool:
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "on"}
+            return bool(value)
+
+        def as_balance(value: Any) -> float | None:
+            if not supports_balance or value is None:
+                return None
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return None
+            return round(number, 3) if isfinite(number) else None
+
+        events: list[dict[str, Any]] = []
+        for log in logs:
+            timestamp = str(log.get("timestamp") or "")
+            if len(timestamp) < 10:
+                continue
+            details = log.get("details")
+            if not isinstance(details, list):
+                continue
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                detail_site_id = str(detail.get("site_id") or "").strip()
+                if detail_site_id != site_id:
+                    continue
+                success = as_bool(detail.get("success"))
+                events.append(
+                    {
+                        "timestamp": timestamp,
+                        "date": timestamp[:10],
+                        "time": timestamp[11:16] if len(timestamp) >= 16 else "",
+                        "type": str(log.get("type") or "scheduled"),
+                        "success": success,
+                        "message": str(detail.get("message") or ""),
+                        "gained_quota": as_balance(detail.get("gained_quota")) if success else None,
+                        "balance": as_balance(detail.get("total_quota")) if success else None,
+                    }
+                )
+
+        events.sort(key=lambda item: item["timestamp"])
+
+        # Connection tests can provide a balance, but they do not count as a
+        # check-in day. A day keeps the latest real check-in result.
+        daily_checkins: dict[str, dict[str, Any]] = {}
+        for event in events:
+            if event["type"] == "test":
+                continue
+            daily_checkins[event["date"]] = {
+                "date": event["date"],
+                "time": event["time"],
+                "status": "success" if event["success"] else "failure",
+                "message": event["message"],
+                "gained_quota": event["gained_quota"],
+            }
+
+        daily_balances: dict[str, float] = {}
+        for event in events:
+            if event["balance"] is not None:
+                daily_balances[event["date"]] = event["balance"]
+        for date_str, day in daily_checkins.items():
+            day["balance"] = daily_balances.get(date_str)
+
+        balance_history: list[dict[str, Any]] = []
+        previous_balance: float | None = None
+        for event in events:
+            balance = event["balance"]
+            if balance is None:
+                continue
+            change = None if previous_balance is None else round(balance - previous_balance, 3)
+            balance_history.append(
+                {
+                    "timestamp": event["timestamp"],
+                    "date": event["date"],
+                    "time": event["time"],
+                    "type": event["type"],
+                    "message": event["message"],
+                    "balance": balance,
+                    "change": change,
+                }
+            )
+            previous_balance = balance
+
+        current_balance = as_balance(site.get("last_quota"))
+        current_balance_timestamp = " ".join(
+            part
+            for part in (
+                str(site.get("last_checkin_date") or ""),
+                str(site.get("last_checkin_time") or ""),
+            )
+            if part
+        )
+
+        latest_balance: float | None = None
+        latest_balance_timestamp = ""
+        if balance_history:
+            latest_balance = balance_history[-1]["balance"]
+            latest_balance_timestamp = balance_history[-1]["timestamp"]
+        elif month == datetime.now().strftime("%Y-%m"):
+            latest_balance = current_balance
+            latest_balance_timestamp = current_balance_timestamp
+
+        calendar_days = sorted(daily_checkins.values(), key=lambda item: item["date"])
+        return json_response(
+            {
+                "site": {
+                    "id": site_id,
+                    "name": str(site.get("name") or site_id),
+                    "type": str(site.get("type") or ""),
+                },
+                "supports_balance": supports_balance,
+                "month": month,
+                "days": calendar_days,
+                "balance_history": balance_history,
+                "current_balance": current_balance,
+                "current_balance_timestamp": current_balance_timestamp,
+                "latest_balance": latest_balance,
+                "latest_balance_timestamp": latest_balance_timestamp,
+                "success_days": sum(day["status"] == "success" for day in calendar_days),
+                "failure_days": sum(day["status"] == "failure" for day in calendar_days),
+            }
+        )
 
     async def api_save_sites(self) -> Any:
         """Web API: Save sites.
@@ -342,6 +524,22 @@ class ScheduledCheckInPlugin(Star):
                 settings["max_history_records"] = max(0, int(data["max_history_records"]))
             except (ValueError, TypeError):
                 settings["max_history_records"] = 0
+        if "history_retention_days" in data:
+            try:
+                settings["history_retention_days"] = max(0, int(data["history_retention_days"]))
+            except (ValueError, TypeError):
+                settings["history_retention_days"] = 0
+        if "auto_cleanup_logs" in data:
+            cleanup_value = data["auto_cleanup_logs"]
+            if isinstance(cleanup_value, str):
+                settings["auto_cleanup_logs"] = cleanup_value.strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+            else:
+                settings["auto_cleanup_logs"] = bool(cleanup_value)
         settings["http_impersonate"] = normalize_impersonate(
             settings.get("http_impersonate")
         )
@@ -375,6 +573,8 @@ class ScheduledCheckInPlugin(Star):
         """
         limit = 20
         before_id = None
+        start_date = None
+        end_date = None
         try:
             if hasattr(request, "query") and request.query:
                 q_limit = request.query.get("limit")
@@ -383,11 +583,38 @@ class ScheduledCheckInPlugin(Star):
                 q_before_id = request.query.get("before_id")
                 if q_before_id is not None and str(q_before_id).strip():
                     before_id = int(q_before_id)
+                for query_name in ("start_date", "end_date"):
+                    query_value = request.query.get(query_name)
+                    if query_value is None or not str(query_value).strip():
+                        continue
+                    normalized_date = str(query_value).strip()
+                    try:
+                        datetime.strptime(normalized_date, "%Y-%m-%d")
+                    except ValueError:
+                        logger.warning(
+                            "Ignoring invalid log date filter %s=%s",
+                            query_name,
+                            normalized_date,
+                        )
+                        continue
+                    if query_name == "start_date":
+                        start_date = normalized_date
+                    else:
+                        end_date = normalized_date
         except Exception as e:
             logger.warning(f"Failed to parse query params for /api/logs: {e}")
 
-        logs = self.read_history_logs(limit=limit, before_id=before_id)
-        total = self.count_history_logs() if before_id is None else None
+        logs = self.read_history_logs(
+            limit=limit,
+            before_id=before_id,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        total = (
+            self.count_history_logs(start_date=start_date, end_date=end_date)
+            if before_id is None
+            else None
+        )
         has_more = len(logs) == limit
         next_before_id = logs[-1]["id"] if (has_more and logs) else None
 

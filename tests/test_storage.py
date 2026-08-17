@@ -6,10 +6,13 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
+from datetime import datetime, timedelta
 from pathlib import Path
 
-import tests  # noqa: F401
 from core.storage import DEFAULT_SETTINGS, DatabaseManager
+
+import tests  # noqa: F401
 
 
 class DatabaseManagerTests(unittest.TestCase):
@@ -25,7 +28,7 @@ class DatabaseManagerTests(unittest.TestCase):
     def test_database_initialization(self) -> None:
         """Test database tables and WAL mode are initialized properly."""
         self.assertTrue(self.db_path.exists())
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
             cursor = conn.cursor()
             cursor.execute("PRAGMA journal_mode;")
             journal_mode = cursor.fetchone()[0]
@@ -122,6 +125,8 @@ class DatabaseManagerTests(unittest.TestCase):
         settings = self.db.get_settings()
         self.assertEqual(settings["enabled"], DEFAULT_SETTINGS["enabled"])
         self.assertEqual(settings["start_time"], "08:00")
+        self.assertEqual(settings["auto_cleanup_logs"], True)
+        self.assertEqual(settings["history_retention_days"], 0)
         self.assertEqual(settings["max_history_records"], 0)
 
         # Save customized settings
@@ -129,6 +134,8 @@ class DatabaseManagerTests(unittest.TestCase):
         new_settings["start_time"] = "09:00"
         new_settings["end_time"] = "11:00"
         new_settings["http_timeout_seconds"] = 30
+        new_settings["auto_cleanup_logs"] = False
+        new_settings["history_retention_days"] = 30
         new_settings["max_history_records"] = 500
         self.db.save_settings(new_settings)
 
@@ -136,6 +143,8 @@ class DatabaseManagerTests(unittest.TestCase):
         self.assertEqual(reloaded["start_time"], "09:00")
         self.assertEqual(reloaded["end_time"], "11:00")
         self.assertEqual(reloaded["http_timeout_seconds"], 30)
+        self.assertEqual(reloaded["auto_cleanup_logs"], False)
+        self.assertEqual(reloaded["history_retention_days"], 30)
         self.assertEqual(reloaded["max_history_records"], 500)
 
     def test_history_logs_and_pruning(self) -> None:
@@ -156,6 +165,17 @@ class DatabaseManagerTests(unittest.TestCase):
         self.assertEqual(len(all_logs), 15)
         self.assertEqual(all_logs[0]["report"], "Report 14")
         self.assertEqual(all_logs[-1]["report"], "Report 0")
+
+        filtered_logs = self.db.read_history_logs(
+            limit=100,
+            start_date="2026-08-16",
+            end_date="2026-08-16",
+        )
+        self.assertEqual(len(filtered_logs), 15)
+        self.assertEqual(
+            self.db.count_history_logs(start_date="2026-08-16", end_date="2026-08-16"),
+            15,
+        )
 
         # 2. Test pagination with before_id
         page1 = self.db.read_history_logs(limit=5)
@@ -195,6 +215,7 @@ class DatabaseManagerTests(unittest.TestCase):
 
         # 4. Test settings-driven max_history_records pruning
         settings = self.db.get_settings()
+        settings["auto_cleanup_logs"] = True
         settings["max_history_records"] = 5
         self.db.save_settings(settings)
 
@@ -212,7 +233,96 @@ class DatabaseManagerTests(unittest.TestCase):
         self.assertEqual(pruned_logs_5[0]["report"], "Report 16")
         self.assertEqual(pruned_logs_5[-1]["report"], "Report 12")
 
-        # 5. Clear logs
+        # 5. Disable automatic cleanup; max_history_records should no longer prune.
+        settings["auto_cleanup_logs"] = False
+        settings["max_history_records"] = 1
+        self.db.save_settings(settings)
+        self.db.record_history({
+            "timestamp": "2026-08-16 11:06:00",
+            "type": "scheduled",
+            "manual": False,
+            "success": True,
+            "report": "Report 17",
+            "details": [],
+        })
+        self.assertEqual(self.db.count_history_logs(), 6)
+
+        # 6. Age-based cleanup works independently and ignores the row limit.
+        self.db.clear_history_logs()
+        settings["auto_cleanup_logs"] = True
+        settings["history_retention_days"] = 2
+        settings["max_history_records"] = 0
+        self.db.save_settings(settings)
+        now = datetime.now()
+        for label, timestamp in (
+            ("Too Old", now - timedelta(days=3)),
+            ("Recent 1", now - timedelta(hours=2)),
+            ("Recent 2", now - timedelta(hours=1)),
+            ("Recent 3", now),
+        ):
+            self.db.record_history({
+                "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                "type": "scheduled",
+                "manual": False,
+                "success": True,
+                "report": label,
+                "details": [],
+            })
+        self.assertEqual(self.db.count_history_logs(), 3)
+        age_only_logs = self.db.read_history_logs(limit=100)
+        self.assertNotIn("Too Old", [log["report"] for log in age_only_logs])
+
+        # 7. Row-count cleanup works independently and ignores the age limit.
+        self.db.clear_history_logs()
+        settings["history_retention_days"] = 0
+        settings["max_history_records"] = 2
+        self.db.save_settings(settings)
+        for label, timestamp in (
+            ("Recent 1", now - timedelta(hours=2)),
+            ("Recent 2", now - timedelta(hours=1)),
+            ("Old But Within Row Limit", datetime(2020, 1, 1)),
+        ):
+            self.db.record_history({
+                "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                "type": "scheduled",
+                "manual": False,
+                "success": True,
+                "report": label,
+                "details": [],
+            })
+        self.assertEqual(self.db.count_history_logs(), 2)
+        count_only_logs = self.db.read_history_logs(limit=100)
+        self.assertEqual(
+            {log["report"] for log in count_only_logs},
+            {"Recent 2", "Old But Within Row Limit"},
+        )
+
+        # 8. Apply both age-based and row-count cleanup together.
+        self.db.clear_history_logs()
+        settings["history_retention_days"] = 2
+        settings["max_history_records"] = 2
+        self.db.save_settings(settings)
+        now = datetime.now()
+        for label, timestamp in (
+            ("Too Old", now - timedelta(days=3)),
+            ("Recent 1", now - timedelta(hours=2)),
+            ("Recent 2", now - timedelta(hours=1)),
+            ("Recent 3", now),
+        ):
+            self.db.record_history({
+                "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                "type": "scheduled",
+                "manual": False,
+                "success": True,
+                "report": label,
+                "details": [],
+            })
+        self.assertEqual(self.db.count_history_logs(), 2)
+        combined_pruned_logs = self.db.read_history_logs(limit=100)
+        self.assertEqual(combined_pruned_logs[0]["report"], "Recent 3")
+        self.assertEqual(combined_pruned_logs[-1]["report"], "Recent 2")
+
+        # 9. Clear logs
         self.db.clear_history_logs()
         self.assertEqual(self.db.count_history_logs(), 0)
         self.assertEqual(len(self.db.read_history_logs()), 0)
