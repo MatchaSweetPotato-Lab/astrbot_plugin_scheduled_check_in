@@ -23,6 +23,9 @@ from .core.storage import DEFAULT_SETTINGS, DatabaseManager
 
 logger = logging.getLogger("astrbot")
 
+SITE_ACTIVITY_LOG_BATCH_SIZE = 1000
+SITE_ACTIVITY_MAX_RECORDS = 20000
+
 
 async def _read_json_body() -> tuple[bool, Any]:
     """Parse the current request body without leaking JSON decode failures."""
@@ -259,6 +262,55 @@ class ScheduledCheckInPlugin(Star):
         """
         return json_response(self.get_sites())
 
+    def _read_site_activity_logs(
+        self,
+        start_date: str,
+        end_date: str,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Read monthly activity logs in bounded batches.
+
+        The activity view needs chronological aggregation, but a malformed or
+        unusually busy site must not make one request load an unbounded number
+        of database rows. Logs are returned newest-first and the caller sorts
+        the derived events before rendering them.
+
+        Returns:
+            A tuple containing the collected logs and whether the hard cap was
+            reached while more matching records remained.
+        """
+        logs: list[dict[str, Any]] = []
+        before_id: int | None = None
+
+        while len(logs) < SITE_ACTIVITY_MAX_RECORDS:
+            batch_limit = min(
+                SITE_ACTIVITY_LOG_BATCH_SIZE,
+                SITE_ACTIVITY_MAX_RECORDS - len(logs),
+            )
+            batch = self.read_history_logs(
+                limit=batch_limit,
+                before_id=before_id,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            if not batch:
+                return logs, False
+
+            logs.extend(batch)
+            next_before_id = batch[-1].get("id")
+            if next_before_id is None:
+                return logs, False
+            before_id = int(next_before_id)
+            if len(batch) < batch_limit:
+                return logs, False
+
+        remaining = self.read_history_logs(
+            limit=1,
+            before_id=before_id,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        return logs, bool(remaining)
+
     async def api_get_site_activity(self) -> Any:
         """Web API: Get one site's monthly check-in calendar and balance history."""
         site_id = ""
@@ -297,11 +349,7 @@ class ScheduledCheckInPlugin(Star):
 
         site_type = str(site.get("type") or "").strip().lower()
         supports_balance = site_type in {"new-api", "one-api"}
-        logs = self.read_history_logs(
-            # A month can legitimately contain more than 5000 test/check-in logs.
-            # This endpoint aggregates the complete selected month and therefore
-            # deliberately does not use the paginated log-list limit.
-            limit=None,
+        logs, history_truncated = self._read_site_activity_logs(
             start_date=month_start_str,
             end_date=month_end_str,
         )
@@ -419,6 +467,8 @@ class ScheduledCheckInPlugin(Star):
                     "type": str(site.get("type") or ""),
                 },
                 "supports_balance": supports_balance,
+                "history_truncated": history_truncated,
+                "history_record_limit": SITE_ACTIVITY_MAX_RECORDS if history_truncated else None,
                 "month": month,
                 "days": calendar_days,
                 "balance_history": balance_history,

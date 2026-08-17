@@ -387,8 +387,13 @@ async function loadSiteAnalytics() {
   analyticsMonth = requestedMonth;
   const calendar = document.getElementById('site-checkin-calendar');
   const chart = document.getElementById('site-balance-chart');
+  const notice = document.getElementById('site-analytics-notice');
   if (calendar) calendar.innerHTML = '<div class="analytics-loading">正在读取签到记录...</div>';
   if (chart) chart.innerHTML = '<div class="analytics-loading">正在读取余额变化...</div>';
+  if (notice) {
+    notice.hidden = true;
+    notice.textContent = '';
+  }
 
   try {
     const data = await apiGet('/api/sites/activity', {
@@ -422,6 +427,16 @@ function renderSiteAnalytics(data) {
     || ['new-api', 'one-api'].includes(String(data.site?.type || '').trim().toLowerCase());
   const balanceSection = document.getElementById('site-balance-section');
   if (balanceSection) balanceSection.hidden = !supportsBalance;
+
+  const notice = document.getElementById('site-analytics-notice');
+  if (notice) {
+    const truncated = data.history_truncated === true;
+    const limit = Number(data.history_record_limit || 0);
+    notice.hidden = !truncated;
+    notice.textContent = truncated
+      ? `本月日志超过 ${limit.toLocaleString()} 条，仅展示最近记录，统计可能不完整`
+      : '';
+  }
 
   const summary = document.getElementById('site-analytics-summary');
   if (summary) {

@@ -952,6 +952,16 @@ input:checked + .slider:before {
   margin-bottom: 18px;
 }
 
+.analytics-notice {
+  margin: -6px 0 16px;
+  padding: 10px 12px;
+  border: 1px solid #fde68a;
+  border-radius: 9px;
+  background: #fffbeb;
+  color: #92400e;
+  font-size: 13px;
+}
+
 .analytics-stat {
   display: flex;
   flex-direction: column;

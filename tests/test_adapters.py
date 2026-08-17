@@ -6,7 +6,12 @@ import json
 import unittest
 
 import tests  # noqa: F401
-from core.adapters import NewApiAdapter, _TextResponse
+from core.adapters import (
+    MAX_ATTEMPT_SUMMARY_CHARS,
+    MAX_ATTEMPTS_PER_RUN,
+    NewApiAdapter,
+    _TextResponse,
+)
 
 
 class _FakeSession:
@@ -14,9 +19,9 @@ class _FakeSession:
 
 
 class AdapterBalanceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_final_balance_failure_keeps_known_initial_balance(self) -> None:
-        """Do not overwrite a confirmed balance with zero after a failed recheck."""
-        adapter = NewApiAdapter(
+    @staticmethod
+    def _make_adapter() -> NewApiAdapter:
+        return NewApiAdapter(
             {
                 "id": "site-1",
                 "name": "Test site",
@@ -30,6 +35,10 @@ class AdapterBalanceTests(unittest.IsolatedAsyncioTestCase):
             },
             _FakeSession(),
         )
+
+    async def test_final_balance_failure_keeps_known_initial_balance(self) -> None:
+        """Do not overwrite a confirmed balance with zero after a failed recheck."""
+        adapter = self._make_adapter()
         responses = iter(
             [
                 _TextResponse(
@@ -57,6 +66,28 @@ class AdapterBalanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.total_quota, 10.0)
         self.assertEqual(result.gained_quota, 0.0)
         self.assertIn("查询最终余额", result.error_detail)
+
+    async def test_attempt_trace_is_bounded(self) -> None:
+        """Keep repeated endpoint failures from growing one history record forever."""
+        adapter = self._make_adapter()
+        attempts: list[dict[str, object]] = []
+
+        for index in range(MAX_ATTEMPTS_PER_RUN * 2):
+            adapter._record_attempt(
+                attempts,
+                step=f"attempt-{index}",
+                method="GET",
+                endpoint="https://site.test/api/user/checkin",
+                message="x" * 1000,
+                response_text="y" * 10000,
+            )
+
+        self.assertEqual(len(attempts), MAX_ATTEMPTS_PER_RUN)
+        self.assertTrue(attempts[-1].get("truncated"))
+        self.assertLessEqual(
+            len(adapter._format_attempts(attempts)),
+            MAX_ATTEMPT_SUMMARY_CHARS,
+        )
 
 
 if __name__ == "__main__":

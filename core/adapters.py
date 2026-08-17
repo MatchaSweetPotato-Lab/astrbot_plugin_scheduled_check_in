@@ -18,6 +18,8 @@ logger = logging.getLogger("astrbot")
 # Standard conversion: 1 USD = 500,000 raw quota points in One-API / New-API
 QUOTA_CONVERSION_FACTOR = 500000.0
 MAX_RESPONSE_LOG_CHARS = 4000
+MAX_ATTEMPTS_PER_RUN = 32
+MAX_ATTEMPT_SUMMARY_CHARS = 12000
 
 
 @dataclass
@@ -70,6 +72,16 @@ class _QuotaFetchResult:
     total_quota: float = 0.0
     expired: bool = False
     available: bool = False
+    message: str = ""
+
+
+@dataclass
+class _CheckInRequestResult:
+    """Result of one check-in endpoint attempt."""
+
+    success: bool = False
+    signed: bool = False
+    expired: bool = False
     message: str = ""
 
 
@@ -272,6 +284,11 @@ class BaseCheckInAdapter(ABC):
                 return str(error)
         return ""
 
+    @staticmethod
+    def _message_indicates_checkin(message: str) -> bool:
+        """Recognize success messages used by different relay implementations."""
+        return any(marker in message for marker in ("重复", "已签到", "成功"))
+
     def _record_attempt(
         self,
         attempts: list[dict[str, Any]],
@@ -286,6 +303,25 @@ class BaseCheckInAdapter(ABC):
         error: str = "",
     ) -> None:
         """Append one request trace while deliberately excluding request headers."""
+        if len(attempts) >= MAX_ATTEMPTS_PER_RUN:
+            return
+        if len(attempts) == MAX_ATTEMPTS_PER_RUN - 1:
+            attempts.append(
+                {
+                    "step": "请求追踪",
+                    "method": "",
+                    "url": "",
+                    "status": None,
+                    "success": False,
+                    "message": (
+                        f"已达到单次请求追踪上限（{MAX_ATTEMPTS_PER_RUN - 1}），"
+                        "后续尝试已省略"
+                    ),
+                    "truncated": True,
+                }
+            )
+            return
+
         item: dict[str, Any] = {
             "step": step,
             "method": method.upper(),
@@ -308,6 +344,9 @@ class BaseCheckInAdapter(ABC):
         """Build a compact readable summary for notifications and old clients."""
         lines: list[str] = []
         for attempt in attempts:
+            if attempt.get("truncated"):
+                lines.append(f"[请求追踪] {attempt.get('message', '后续尝试已省略')}")
+                continue
             status = (
                 f"HTTP {attempt['status']}"
                 if attempt.get("status") is not None
@@ -324,7 +363,11 @@ class BaseCheckInAdapter(ABC):
             if attempt.get("error"):
                 line += f"；异常：{attempt['error']}"
             lines.append(line)
-        return "\n".join(lines)
+        summary = "\n".join(lines)
+        if len(summary) <= MAX_ATTEMPT_SUMMARY_CHARS:
+            return summary
+        suffix = f"\n...（追踪摘要过长，已截断；原长度 {len(summary)} 字符）"
+        return summary[: MAX_ATTEMPT_SUMMARY_CHARS - len(suffix)] + suffix
 
     @abstractmethod
     async def check_in(self) -> CheckInResult:
@@ -476,6 +519,241 @@ class NewApiAdapter(BaseCheckInAdapter):
             )
             return _QuotaFetchResult(message=message)
 
+    def _checkin_endpoints(self) -> list[str]:
+        """Return configured check-in endpoints in fallback order."""
+        custom_endpoint = self.config["checkin_endpoint"].strip()
+        if custom_endpoint:
+            return [f"{self.base_url}/{custom_endpoint.lstrip('/')}"]
+        return [
+            f"{self.base_url}/api/user/pay/checkin",
+            f"{self.base_url}/api/user/checkin",
+            f"{self.base_url}/api/user/sign_in",
+            f"{self.base_url}/api/user/self",
+        ]
+
+    async def _checkin_get_fallback(
+        self,
+        endpoint: str,
+        headers: dict[str, str],
+        attempts: list[dict[str, Any]],
+    ) -> _CheckInRequestResult:
+        """Try GET when a check-in endpoint rejects POST."""
+        try:
+            response = await self._request_text("GET", endpoint, headers)
+            text = response.text
+            message = ""
+            data: Any = None
+
+            if is_acw_sc_v2_challenge(text):
+                message = self._waf_message(response)
+            elif response.status == 200 and "<html" not in text.lower():
+                try:
+                    data = json.loads(text)
+                except (TypeError, ValueError) as exc:
+                    message = "响应内容格式非法 (非 JSON 格式)"
+                    self._record_attempt(
+                        attempts,
+                        step="执行签到请求（GET 重试）",
+                        method="GET",
+                        endpoint=endpoint,
+                        status=response.status,
+                        message=message,
+                        response_text=text,
+                        error=str(exc),
+                    )
+                    return _CheckInRequestResult(message=message)
+            elif "<html" in text.lower():
+                message = "返回 HTML 页面，可能被 WAF 或登录页拦截"
+            else:
+                try:
+                    data = json.loads(text) if text.strip() else None
+                except (TypeError, ValueError):
+                    data = None
+
+            success = False
+            if isinstance(data, dict):
+                success = bool(data.get("success", False))
+                message = self._response_message(data, text) or message
+            message = message or self._response_message(data, text) or f"HTTP {response.status}"
+            signed = success or self._message_indicates_checkin(message)
+            self._record_attempt(
+                attempts,
+                step="执行签到请求（GET 重试）",
+                method="GET",
+                endpoint=endpoint,
+                status=response.status,
+                success=signed,
+                message=message,
+                response_text=text,
+            )
+            return _CheckInRequestResult(success=success, signed=signed, message=message)
+        except Exception as exc:
+            message = f"请求异常: {str(exc)}"
+            self._record_attempt(
+                attempts,
+                step="执行签到请求（GET 重试）",
+                method="GET",
+                endpoint=endpoint,
+                message=message,
+                error=str(exc),
+            )
+            return _CheckInRequestResult(message=message)
+
+    async def _execute_checkin_endpoint(
+        self,
+        endpoint: str,
+        headers: dict[str, str],
+        attempts: list[dict[str, Any]],
+    ) -> _CheckInRequestResult:
+        """Execute one POST check-in request and its optional GET fallback."""
+        try:
+            response = await self._request_text("POST", endpoint, headers)
+            response_text = response.text
+            if response.status in (401, 403):
+                message = "Token 或 Cookie 已失效 (401/403)"
+                self._record_attempt(
+                    attempts,
+                    step="执行签到请求",
+                    method="POST",
+                    endpoint=endpoint,
+                    status=response.status,
+                    message=message,
+                    response_text=response_text,
+                )
+                return _CheckInRequestResult(expired=True, message=message)
+
+            if response.status == 405:
+                message = "POST 方法不允许，改用 GET 重试"
+                self._record_attempt(
+                    attempts,
+                    step="执行签到请求",
+                    method="POST",
+                    endpoint=endpoint,
+                    status=response.status,
+                    message=message,
+                    response_text=response_text,
+                )
+                return await self._checkin_get_fallback(endpoint, headers, attempts)
+
+            if is_acw_sc_v2_challenge(response_text):
+                message = self._waf_message(response)
+                self._record_attempt(
+                    attempts,
+                    step="执行签到请求",
+                    method="POST",
+                    endpoint=endpoint,
+                    status=response.status,
+                    message=message,
+                    response_text=response_text,
+                )
+                return _CheckInRequestResult(message=message)
+
+            data: Any = None
+            message = ""
+            if response.status == 200 and "<html" not in response_text.lower():
+                try:
+                    data = json.loads(response_text)
+                except (TypeError, ValueError) as exc:
+                    message = "响应内容格式非法 (非 JSON 格式)"
+                    self._record_attempt(
+                        attempts,
+                        step="执行签到请求",
+                        method="POST",
+                        endpoint=endpoint,
+                        status=response.status,
+                        message=message,
+                        response_text=response_text,
+                        error=str(exc),
+                    )
+                    return _CheckInRequestResult(message=message)
+            elif response.status == 200:
+                message = "返回 HTML 页面，可能被 WAF 或登录页拦截"
+                self._record_attempt(
+                    attempts,
+                    step="执行签到请求",
+                    method="POST",
+                    endpoint=endpoint,
+                    status=response.status,
+                    message=message,
+                    response_text=response_text,
+                )
+                return _CheckInRequestResult(message=message)
+            else:
+                try:
+                    data = json.loads(response_text) if response_text.strip() else None
+                except (TypeError, ValueError):
+                    data = None
+                message = self._response_message(data, response_text) or f"HTTP {response.status}"
+
+            if isinstance(data, dict):
+                success = bool(data.get("success", False))
+                message = self._response_message(data, response_text) or message
+                message = message or f"HTTP {response.status}"
+                signed = success or self._message_indicates_checkin(message)
+                self._record_attempt(
+                    attempts,
+                    step="执行签到请求",
+                    method="POST",
+                    endpoint=endpoint,
+                    status=response.status,
+                    success=signed,
+                    message=message,
+                    response_text=response_text,
+                )
+                return _CheckInRequestResult(success=success, signed=signed, message=message)
+
+            if response.status != 405:
+                self._record_attempt(
+                    attempts,
+                    step="执行签到请求",
+                    method="POST",
+                    endpoint=endpoint,
+                    status=response.status,
+                    message=message,
+                    response_text=response_text,
+                )
+            return _CheckInRequestResult(message=message)
+        except Exception as exc:
+            message = f"请求异常: {str(exc)}"
+            self._record_attempt(
+                attempts,
+                step="执行签到请求",
+                method="POST",
+                endpoint=endpoint,
+                message=message,
+                error=str(exc),
+            )
+            return _CheckInRequestResult(message=message)
+
+    @staticmethod
+    def _reconcile_final_quota(
+        initial_result: _QuotaFetchResult,
+        final_result: _QuotaFetchResult,
+        success: bool,
+        expired: bool,
+        last_message: str,
+    ) -> tuple[float, float, bool, bool, str]:
+        """Combine the final balance query with the check-in response."""
+        initial_quota = initial_result.total_quota
+        total_quota = final_result.total_quota if final_result.available else initial_quota
+        gained = 0.0
+
+        if not final_result.available:
+            # Keep a known initial balance when the final query is transiently
+            # unavailable instead of replacing it with a misleading zero.
+            expired = expired or final_result.expired
+            if not success:
+                last_message = final_result.message
+            elif final_result.message:
+                last_message = f"{last_message}（签到后余额查询失败：{final_result.message}）"
+
+        if initial_result.available and final_result.available and total_quota > initial_quota:
+            success = True
+            gained = round(total_quota - initial_quota, 3)
+            last_message = f"登录成功，自动获赠额度 (+$ {gained})"
+
+        return total_quota, gained, success, expired, last_message
+
     async def check_in(self) -> CheckInResult:
         """Perform check-in on New-API / One-API station.
 
@@ -488,12 +766,7 @@ class NewApiAdapter(BaseCheckInAdapter):
         headers = self._get_headers()
         attempts: list[dict[str, Any]] = []
 
-        # Step 1: Query initial quota
-        initial_result = await self._fetch_user_quota(
-            headers,
-            attempts,
-            "查询初始余额",
-        )
+        initial_result = await self._fetch_user_quota(headers, attempts, "查询初始余额")
         if initial_result.expired:
             return CheckInResult(
                 site_id=self.site_id,
@@ -504,243 +777,28 @@ class NewApiAdapter(BaseCheckInAdapter):
                 error_detail=self._format_attempts(attempts),
                 attempts=attempts,
             )
-        initial_quota = initial_result.total_quota
-
-        # Step 2: Determine endpoints to attempt
-        custom_endpoint = self.config["checkin_endpoint"].strip()
-        if custom_endpoint:
-            endpoints = [f"{self.base_url}/{custom_endpoint.lstrip('/')}"]
-        else:
-            endpoints = [
-                f"{self.base_url}/api/user/pay/checkin",
-                f"{self.base_url}/api/user/checkin",
-                f"{self.base_url}/api/user/sign_in",
-                f"{self.base_url}/api/user/self",
-            ]
 
         last_message = ""
         success = False
         expired = False
-        gained = 0.0
+        for endpoint in self._checkin_endpoints():
+            result = await self._execute_checkin_endpoint(endpoint, headers, attempts)
+            if result.message:
+                last_message = result.message
+            success = success or result.success
+            expired = expired or result.expired
+            if result.expired or result.signed:
+                break
 
-        for endpoint in endpoints:
-            try:
-                response = await self._request_text("POST", endpoint, headers)
-                response_text = response.text
-                if response.status in (401, 403):
-                    expired = True
-                    last_message = "Token 或 Cookie 已失效 (401/403)"
-                    self._record_attempt(
-                        attempts,
-                        step="执行签到请求",
-                        method="POST",
-                        endpoint=endpoint,
-                        status=response.status,
-                        message=last_message,
-                        response_text=response_text,
-                    )
-                    break
-
-                data: Any = None
-                if response.status == 405:
-                    # Fall back to GET if POST is not allowed (e.g., /api/user/self)
-                    self._record_attempt(
-                        attempts,
-                        step="执行签到请求",
-                        method="POST",
-                        endpoint=endpoint,
-                        status=response.status,
-                        message="POST 方法不允许，改用 GET 重试",
-                        response_text=response_text,
-                    )
-                    try:
-                        get_response = await self._request_text("GET", endpoint, headers)
-                        get_text = get_response.text
-                        get_message = ""
-                        get_data: Any = None
-
-                        if is_acw_sc_v2_challenge(get_text):
-                            get_message = self._waf_message(get_response)
-                        elif get_response.status == 200 and "<html" not in get_text.lower():
-                            try:
-                                get_data = json.loads(get_text)
-                            except (TypeError, ValueError) as exc:
-                                get_message = "响应内容格式非法 (非 JSON 格式)"
-                                self._record_attempt(
-                                    attempts,
-                                    step="执行签到请求（GET 重试）",
-                                    method="GET",
-                                    endpoint=endpoint,
-                                    status=get_response.status,
-                                    message=get_message,
-                                    response_text=get_text,
-                                    error=str(exc),
-                                )
-                                last_message = get_message
-                                continue
-                        elif "<html" in get_text.lower():
-                            get_message = "返回 HTML 页面，可能被 WAF 或登录页拦截"
-                        else:
-                            try:
-                                get_data = json.loads(get_text) if get_text.strip() else None
-                            except (TypeError, ValueError):
-                                get_data = None
-
-                        get_success = False
-                        if isinstance(get_data, dict):
-                            get_success = bool(get_data.get("success", False))
-                            get_message = self._response_message(get_data, get_text) or get_message
-                            data = get_data
-
-                        get_message = get_message or self._response_message(get_data, get_text) or f"HTTP {get_response.status}"
-                        last_message = get_message
-                        endpoint_signed = (
-                            get_success
-                            or "重复" in get_message
-                            or "已签到" in get_message
-                            or "成功" in get_message
-                        )
-                        success = success or get_success
-                        self._record_attempt(
-                            attempts,
-                            step="执行签到请求（GET 重试）",
-                            method="GET",
-                            endpoint=endpoint,
-                            status=get_response.status,
-                            success=endpoint_signed,
-                            message=get_message,
-                            response_text=get_text,
-                        )
-                        if endpoint_signed:
-                            break
-                    except Exception as exc:
-                        last_message = f"请求异常: {str(exc)}"
-                        self._record_attempt(
-                            attempts,
-                            step="执行签到请求（GET 重试）",
-                            method="GET",
-                            endpoint=endpoint,
-                            message=last_message,
-                            error=str(exc),
-                        )
-                    continue
-                elif is_acw_sc_v2_challenge(response.text):
-                    last_message = self._waf_message(response)
-                    self._record_attempt(
-                        attempts,
-                        step="执行签到请求",
-                        method="POST",
-                        endpoint=endpoint,
-                        status=response.status,
-                        message=last_message,
-                        response_text=response_text,
-                    )
-                    continue
-                elif response.status == 200 and "<html" not in response.text.lower():
-                    try:
-                        data = json.loads(response.text)
-                    except (TypeError, ValueError) as exc:
-                        last_message = "响应内容格式非法 (非 JSON 格式)"
-                        self._record_attempt(
-                            attempts,
-                            step="执行签到请求",
-                            method="POST",
-                            endpoint=endpoint,
-                            status=response.status,
-                            message=last_message,
-                            response_text=response_text,
-                            error=str(exc),
-                        )
-                        continue
-                elif response.status == 200:
-                    last_message = "返回 HTML 页面，可能被 WAF 或登录页拦截"
-                    self._record_attempt(
-                        attempts,
-                        step="执行签到请求",
-                        method="POST",
-                        endpoint=endpoint,
-                        status=response.status,
-                        message=last_message,
-                        response_text=response_text,
-                    )
-                    continue
-                else:
-                    try:
-                        data = json.loads(response_text) if response_text.strip() else None
-                    except (TypeError, ValueError):
-                        data = None
-                    last_message = self._response_message(data, response_text) or f"HTTP {response.status}"
-
-                if isinstance(data, dict):
-                    endpoint_success = bool(data.get("success", False))
-                    success = success or endpoint_success
-                    msg = self._response_message(data, response_text)
-                    if msg:
-                        last_message = str(msg)
-                    endpoint_signed = (
-                        endpoint_success
-                        or "重复" in last_message
-                        or "已签到" in last_message
-                        or "成功" in last_message
-                    )
-                    self._record_attempt(
-                        attempts,
-                        step="执行签到请求",
-                        method="POST",
-                        endpoint=endpoint,
-                        status=response.status,
-                        success=endpoint_signed,
-                        message=last_message,
-                        response_text=response_text,
-                    )
-                    if endpoint_signed:
-                        break
-                elif response.status != 405:
-                    self._record_attempt(
-                        attempts,
-                        step="执行签到请求",
-                        method="POST",
-                        endpoint=endpoint,
-                        status=response.status,
-                        message=last_message,
-                        response_text=response_text,
-                    )
-            except Exception as e:
-                last_message = f"请求异常: {str(e)}"
-                self._record_attempt(
-                    attempts,
-                    step="执行签到请求",
-                    method="POST",
-                    endpoint=endpoint,
-                    message=last_message,
-                    error=str(e),
-                )
-                continue
-
-        # Step 3: Query final quota
-        final_result = await self._fetch_user_quota(
-            headers,
-            attempts,
-            "查询最终余额",
+        final_result = await self._fetch_user_quota(headers, attempts, "查询最终余额")
+        total_quota, gained, success, expired, last_message = self._reconcile_final_quota(
+            initial_result,
+            final_result,
+            success,
+            expired,
+            last_message,
         )
-        total_quota = final_result.total_quota if final_result.available else initial_quota
-        if not final_result.available:
-            # The initial balance is still authoritative enough to avoid replacing
-            # a known value with a misleading zero after a transient final-query
-            # failure. The request trace retains the final-query error details.
-            expired = expired or final_result.expired
-            if not success:
-                last_message = final_result.message
-            elif final_result.message:
-                last_message = f"{last_message}（签到后余额查询失败：{final_result.message}）"
-
-        # Step 4: Check for login-triggered quota increases
-        if initial_result.available and final_result.available and total_quota > initial_quota:
-            success = True
-            gained = round(total_quota - initial_quota, 3)
-            last_message = f"登录成功，自动获赠额度 (+$ {gained})"
-
-        is_signed = success or ("已签到" in last_message or "重复" in last_message or "成功" in last_message)
+        is_signed = success or self._message_indicates_checkin(last_message)
 
         return CheckInResult(
             site_id=self.site_id,
