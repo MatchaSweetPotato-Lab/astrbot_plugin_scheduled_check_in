@@ -189,6 +189,8 @@ class DatabaseManagerTests(unittest.TestCase):
             self.db.count_history_logs(start_date="2026-08-16", end_date="2026-08-16"),
             15,
         )
+        self.assertEqual(len(self.db.read_history_logs(start_date="invalid-date")), 15)
+        self.assertEqual(self.db.count_history_logs(end_date="2026-99-99"), 15)
         self.assertEqual(
             len(self.db.read_history_logs(
                 limit=None,

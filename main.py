@@ -645,24 +645,8 @@ class ScheduledCheckInPlugin(Star):
                 q_before_id = request.query.get("before_id")
                 if q_before_id is not None and str(q_before_id).strip():
                     before_id = int(q_before_id)
-                for query_name in ("start_date", "end_date"):
-                    query_value = request.query.get(query_name)
-                    if query_value is None or not str(query_value).strip():
-                        continue
-                    normalized_date = str(query_value).strip()
-                    try:
-                        datetime.strptime(normalized_date, "%Y-%m-%d")
-                    except ValueError:
-                        logger.warning(
-                            "Ignoring invalid log date filter %s=%s",
-                            query_name,
-                            normalized_date,
-                        )
-                        continue
-                    if query_name == "start_date":
-                        start_date = normalized_date
-                    else:
-                        end_date = normalized_date
+                start_date = request.query.get("start_date") or None
+                end_date = request.query.get("end_date") or None
         except Exception as e:
             logger.warning(f"Failed to parse query params for /api/logs: {e}")
 

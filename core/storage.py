@@ -90,6 +90,33 @@ class DatabaseManager:
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
 
+    @staticmethod
+    def _normalize_history_date(value: Any) -> str | None:
+        """Normalize a history date filter to YYYY-MM-DD or ignore it."""
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        if not normalized:
+            return None
+        try:
+            return datetime.strptime(normalized, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+
+    @classmethod
+    def _history_date_bounds(
+        cls,
+        start_date: Any,
+        end_date: Any,
+    ) -> tuple[str | None, str | None]:
+        """Build normalized inclusive timestamp bounds for history queries."""
+        normalized_start = cls._normalize_history_date(start_date)
+        normalized_end = cls._normalize_history_date(end_date)
+        return (
+            f"{normalized_start} 00:00:00" if normalized_start else None,
+            f"{normalized_end} 23:59:59" if normalized_end else None,
+        )
+
     def _get_cleanup_settings(self) -> tuple[bool, int, int]:
         """Read and cache the settings used by the history cleanup hot path."""
         with self._lock:
@@ -618,8 +645,7 @@ class DatabaseManager:
             List of history log dictionaries.
         """
         with self._lock, self._connection() as conn:
-            start_bound = f"{str(start_date).strip()} 00:00:00" if start_date else None
-            end_bound = f"{str(end_date).strip()} 23:59:59" if end_date else None
+            start_bound, end_bound = self._history_date_bounds(start_date, end_date)
             site_filter = str(site_id).strip() if site_id is not None else None
             if not site_filter:
                 site_filter = None
@@ -697,6 +723,7 @@ class DatabaseManager:
             Total record count integer.
         """
         with self._lock, self._connection() as conn:
+            start_bound, end_bound = self._history_date_bounds(start_date, end_date)
             cursor = conn.execute(
                 """
                 SELECT COUNT(*) FROM history_logs
@@ -704,10 +731,10 @@ class DatabaseManager:
                   AND (? IS NULL OR timestamp <= ?)
                 """,
                 (
-                    f"{str(start_date).strip()} 00:00:00" if start_date else None,
-                    f"{str(start_date).strip()} 00:00:00" if start_date else None,
-                    f"{str(end_date).strip()} 23:59:59" if end_date else None,
-                    f"{str(end_date).strip()} 23:59:59" if end_date else None,
+                    start_bound,
+                    start_bound,
+                    end_bound,
+                    end_bound,
                 ),
             )
             row = cursor.fetchone()
