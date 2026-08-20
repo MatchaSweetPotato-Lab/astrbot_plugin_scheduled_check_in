@@ -423,6 +423,24 @@
             <button class="modal-close" onclick="closeModal('logs-drawer')">&times;</button>
           </div>
         </div>
+        <div class="logs-filter-bar">
+          <div class="logs-filter-title">时间筛选</div>
+          <div class="logs-filter-fields">
+            <label class="logs-filter-field">
+              <span>开始日期</span>
+              <input type="date" id="logs-start-date" class="form-control" />
+            </label>
+            <span class="logs-filter-separator">至</span>
+            <label class="logs-filter-field">
+              <span>结束日期</span>
+              <input type="date" id="logs-end-date" class="form-control" />
+            </label>
+            <div class="logs-filter-actions">
+              <button class="btn btn-sm btn-primary-plain" onclick="applyLogTimeFilter()">筛选</button>
+              <button class="btn btn-sm" onclick="resetLogTimeFilter()">重置</button>
+            </div>
+          </div>
+        </div>
         <div class="modal-body" id="logs-body">
           <div class="empty-text">加载中...</div>
         </div>

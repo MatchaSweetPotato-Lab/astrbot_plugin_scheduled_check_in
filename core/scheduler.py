@@ -474,6 +474,65 @@ class CheckInScheduler:
         persist_writeback(db, site_id, getattr(adapter, "writeback", None))
 
     @staticmethod
+    def build_history_entries(
+        results: list[CheckInResult],
+        log_type: str,
+        timestamp: str,
+    ) -> list[dict[str, Any]]:
+        """Build one history entry per site result.
+
+        A batch run is stored as a separate row per site so that every history
+        entry, and the detail view built from it, covers exactly one task.
+
+        Args:
+            results: Results of one run.
+            log_type: ``scheduled``, ``manual`` or ``test``.
+            timestamp: Shared timestamp for every row of this run.
+
+        Returns:
+            Entry dictionaries ready for ``record_history_entries``.
+        """
+        return [
+            {
+                "timestamp": timestamp,
+                "type": log_type,
+                "manual": log_type == "manual",
+                "success": bool(result.success),
+                "report": CheckInScheduler.format_result_line(result),
+                "details": [result.to_dict()],
+            }
+            # Reversed because every row of one run shares a timestamp and the
+            # drawer lists newest first: this makes the sites read top-down in
+            # the order they were checked.
+            for result in reversed(results)
+        ]
+
+    @staticmethod
+    def format_result_line(result: CheckInResult) -> str:
+        """Format one result as a single report line.
+
+        Also used as the stored report of a per-site history entry, so the
+        history and the broadcast briefing read identically.
+
+        Args:
+            result: The result to describe.
+
+        Returns:
+            One formatted line, e.g. ``[成功] 站点 | 消息 (余额: $1.00)``.
+        """
+        if result.success:
+            status_str = "[成功]"
+        elif result.expired:
+            status_str = "[Token失效]"
+        else:
+            status_str = "[失败]"
+
+        line = f"{status_str} {result.site_name} | {result.message}"
+        if result.total_quota > 0:
+            line += f" (余额: ${result.total_quota:.2f})"
+        return line
+
+    @staticmethod
     def format_report(results: list[CheckInResult]) -> str:
         """Format check-in results into a clean markdown report card.
 
@@ -492,18 +551,10 @@ class CheckInScheduler:
 
         for r in results:
             if r.success:
-                status_str = "[成功]"
                 success_count += 1
-            elif r.expired:
-                status_str = "[Token失效]"
-            else:
-                status_str = "[失败]"
-
-            line = f"{status_str} {r.site_name} | {r.message}"
             if r.total_quota > 0:
-                line += f" (余额: ${r.total_quota:.2f})"
                 total_quota_sum += r.total_quota
-            lines.append(line)
+            lines.append(CheckInScheduler.format_result_line(r))
 
         lines.append("━━━━━━━━━━━━━━━━━━━━")
         summary_line = f"完成统计: {success_count}/{len(results)}"

@@ -1355,6 +1355,27 @@ class DatabaseManager:
                 "auto_cleanup_logs" setting is the master switch: when disabled, it
                 suppresses both global and per-call cleanup values.
         """
+        self.record_history_entries([entry], max_records, retention_days)
+
+    def record_history_entries(
+        self,
+        entries: list[dict[str, Any]],
+        max_records: int | None = None,
+        retention_days: int | None = None,
+    ) -> None:
+        """Record several history logs in one transaction, then prune once.
+
+        A batch check-in writes one entry per site, so inserting them together
+        avoids reopening the database and re-running cleanup for every site.
+
+        Args:
+            entries: Log dictionaries, oldest first.
+            max_records: See :meth:`record_history`.
+            retention_days: See :meth:`record_history`.
+        """
+        if not entries:
+            return
+
         cleanup_enabled, configured_max_records, configured_retention_days = self._get_cleanup_settings()
         if max_records is None:
             max_records = configured_max_records
@@ -1368,25 +1389,25 @@ class DatabaseManager:
         max_records = self._normalize_nonnegative_int(max_records)
         retention_days = self._normalize_nonnegative_int(retention_days)
 
-        details = entry.get("details", [])
-        details_json = json.dumps(details, ensure_ascii=False)
         with self._lock, self._connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO history_logs (timestamp, type, manual, success, report, details)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    entry.get("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                    entry.get("type", "scheduled"),
-                    1 if entry.get("manual") else 0,
-                    1 if entry.get("success") else 0,
-                    entry.get("report", ""),
-                    details_json,
-                ),
-            )
-            if cursor.lastrowid is not None:
-                self._index_history_entry_sites(conn, int(cursor.lastrowid), details)
+            for entry in entries:
+                details = entry.get("details", [])
+                cursor = conn.execute(
+                    """
+                    INSERT INTO history_logs (timestamp, type, manual, success, report, details)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        entry.get("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                        entry.get("type", "scheduled"),
+                        1 if entry.get("manual") else 0,
+                        1 if entry.get("success") else 0,
+                        entry.get("report", ""),
+                        json.dumps(details, ensure_ascii=False),
+                    ),
+                )
+                if cursor.lastrowid is not None:
+                    self._index_history_entry_sites(conn, int(cursor.lastrowid), details)
 
             if retention_days > 0:
                 cutoff = datetime.now() - timedelta(days=retention_days)

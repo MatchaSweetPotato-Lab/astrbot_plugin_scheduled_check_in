@@ -262,5 +262,86 @@ class WritebackPersistenceTests(unittest.TestCase):
         scheduler._persist_site_writeback("s1", self._Adapter(SiteWriteback(checkin_headers=[])))
 
 
+class HistoryEntryTests(unittest.TestCase):
+    """A batch run is stored as one entry per site, not one aggregate entry."""
+
+    TS = "2026-08-20 08:31:20"
+
+    @staticmethod
+    def _results() -> list[CheckInResult]:
+        return [
+            CheckInResult("s1", "站点 A", True, "额度增加 +$ 1.0", total_quota=12.5, gained_quota=1.0),
+            CheckInResult("s2", "站点 B", False, "凭据已失效", expired=True),
+            CheckInResult("s3", "站点 C", False, "请求超时"),
+        ]
+
+    def test_one_entry_per_site(self) -> None:
+        entries = CheckInScheduler.build_history_entries(self._results(), "scheduled", self.TS)
+        self.assertEqual(len(entries), 3)
+        for entry in entries:
+            self.assertEqual(len(entry["details"]), 1)
+
+    def test_each_entry_holds_only_its_own_site(self) -> None:
+        entries = CheckInScheduler.build_history_entries(self._results(), "scheduled", self.TS)
+        ids = [entry["details"][0]["site_id"] for entry in entries]
+        self.assertEqual(sorted(ids), ["s1", "s2", "s3"])
+        for entry in entries:
+            detail = entry["details"][0]
+            self.assertIn(detail["site_name"], entry["report"])
+            # No other site may leak into this entry's stored report.
+            others = {"站点 A", "站点 B", "站点 C"} - {detail["site_name"]}
+            for name in others:
+                self.assertNotIn(name, entry["report"])
+
+    def test_success_is_per_site_not_aggregated(self) -> None:
+        entries = CheckInScheduler.build_history_entries(self._results(), "scheduled", self.TS)
+        by_site = {e["details"][0]["site_id"]: e["success"] for e in entries}
+        self.assertEqual(by_site, {"s1": True, "s2": False, "s3": False})
+
+    def test_every_entry_shares_the_run_timestamp(self) -> None:
+        entries = CheckInScheduler.build_history_entries(self._results(), "manual", self.TS)
+        self.assertEqual({e["timestamp"] for e in entries}, {self.TS})
+
+    def test_manual_flag_follows_the_log_type(self) -> None:
+        for log_type, expected in (("manual", True), ("scheduled", False), ("test", False)):
+            entries = CheckInScheduler.build_history_entries(self._results(), log_type, self.TS)
+            self.assertTrue(all(e["manual"] is expected for e in entries), log_type)
+            self.assertTrue(all(e["type"] == log_type for e in entries))
+
+    def test_sites_read_in_check_order(self) -> None:
+        """Rows share a timestamp and the drawer is newest-first, so they are
+        stored reversed to read top-down in check order."""
+        entries = CheckInScheduler.build_history_entries(self._results(), "scheduled", self.TS)
+        self.assertEqual([e["details"][0]["site_id"] for e in entries], ["s3", "s2", "s1"])
+
+    def test_no_results_yields_no_entries(self) -> None:
+        self.assertEqual(CheckInScheduler.build_history_entries([], "scheduled", self.TS), [])
+
+    def test_report_line_marks_each_outcome(self) -> None:
+        ok, expired, failed = self._results()
+        self.assertIn("[成功]", CheckInScheduler.format_result_line(ok))
+        self.assertIn("(余额: $12.50)", CheckInScheduler.format_result_line(ok))
+        self.assertIn("[Token失效]", CheckInScheduler.format_result_line(expired))
+        self.assertIn("[失败]", CheckInScheduler.format_result_line(failed))
+
+    def test_report_line_omits_a_zero_balance(self) -> None:
+        line = CheckInScheduler.format_result_line(self._results()[2])
+        self.assertNotIn("余额", line)
+
+    def test_the_broadcast_report_still_combines_every_site(self) -> None:
+        """Splitting storage must not change the chat briefing."""
+        report = CheckInScheduler.format_report(self._results())
+        for name in ("站点 A", "站点 B", "站点 C"):
+            self.assertIn(name, report)
+        self.assertIn("完成统计: 1/3", report)
+        self.assertIn("总余额估算: $12.50", report)
+
+    def test_the_report_reuses_the_single_line_format(self) -> None:
+        results = self._results()
+        report = CheckInScheduler.format_report(results)
+        for result in results:
+            self.assertIn(CheckInScheduler.format_result_line(result), report)
+
+
 if __name__ == "__main__":
     unittest.main()

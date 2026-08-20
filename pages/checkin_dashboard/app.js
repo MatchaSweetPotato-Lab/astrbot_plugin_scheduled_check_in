@@ -20,6 +20,8 @@ let logsNextBeforeId = null;
 let logsHasMore = true;
 let logsLoading = false;
 let logsTotal = 0;
+let logsStartDate = '';
+let logsEndDate = '';
 let isEdit = false;
 let editIndex = -1;
 let activeConfirmResolver = null;
@@ -1880,11 +1882,17 @@ function createLogTimelineItem(log) {
   const item = document.createElement('div');
   item.className = 'timeline-item';
 
+  const details = Array.isArray(log?.details) ? log.details : [];
+  const single = details.length === 1 ? details[0] : null;
+
   const header = document.createElement('div');
   header.className = 'timeline-header';
   const title = document.createElement('span');
   title.className = 'timeline-title';
-  title.textContent = getLogTitle(log);
+  // One entry is one site, so lead with its name; the run type is secondary.
+  title.textContent = single
+    ? `${single.site_name || single.site_id || '未命名站点'} · ${getLogTitle(log)}`
+    : getLogTitle(log);
   const time = document.createElement('span');
   time.className = 'timeline-time';
   time.textContent = log.timestamp || '';
@@ -1893,7 +1901,27 @@ function createLogTimelineItem(log) {
   const stats = summarizeLog(log);
   const summary = document.createElement('div');
   summary.className = 'timeline-summary';
-  if (stats.total > 0) {
+  if (single) {
+    const status = document.createElement('span');
+    if (single.success) {
+      status.className = 'badge badge-success';
+      status.textContent = '成功';
+    } else if (single.expired) {
+      status.className = 'badge badge-failure';
+      status.textContent = 'Token 失效';
+    } else {
+      status.className = 'badge badge-failure';
+      status.textContent = '失败';
+    }
+    summary.appendChild(status);
+    const gained = Number(single.gained_quota);
+    if (Number.isFinite(gained) && gained > 0) {
+      const gain = document.createElement('span');
+      gain.className = 'badge badge-success';
+      gain.textContent = `+${formatBalance(gained)}`;
+      summary.appendChild(gain);
+    }
+  } else if (stats.total > 0) {
     const counts = document.createElement('span');
     const allOk = stats.okCount === stats.total;
     counts.className = `badge ${allOk ? 'badge-success' : 'badge-warning'}`;
@@ -1908,13 +1936,19 @@ function createLogTimelineItem(log) {
   if (stats.totalQuota !== null) {
     const balance = document.createElement('span');
     balance.className = 'badge badge-info';
-    balance.textContent = `总余额 ${formatBalance(stats.totalQuota)}`;
+    balance.textContent = single
+      ? `余额 ${formatBalance(stats.totalQuota)}`
+      : `总余额 ${formatBalance(stats.totalQuota)}`;
     summary.appendChild(balance);
   }
 
   const preview = document.createElement('div');
   preview.className = 'timeline-preview';
-  preview.textContent = stats.preview || '无更多信息';
+  // Abridged on purpose: a station message can be a whole HTML page or JSON
+  // document, which belongs in the detail view, not the overview.
+  preview.textContent = single
+    ? (abridge(single.message, 160) || '无更多信息')
+    : (stats.preview || '无更多信息');
   preview.title = '点击「查看详情」查看完整报文';
 
   const actions = document.createElement('div');
@@ -2054,15 +2088,25 @@ function openLogDetail(log) {
   const body = document.getElementById('log-detail-body');
   if (!body) return;
 
-  if (title) title.textContent = `签到日志详情 · ${log.timestamp || ''}`;
+  const details = Array.isArray(log.details) ? log.details : [];
+  // One entry is normally one site, so name it in the title rather than making
+  // the user hunt for it. Pre-split entries fall back to a neutral heading.
+  const single = details.length === 1 ? details[0] : null;
+  const siteName = single ? (single.site_name || single.site_id || '未命名站点') : '';
+  if (title) {
+    title.textContent = siteName
+      ? `${siteName} · ${log.timestamp || ''}`
+      : `签到日志详情 · ${log.timestamp || ''}`;
+  }
   body.replaceChildren();
 
   const overview = document.createElement('div');
   overview.className = 'log-detail-overview';
-  [
-    ['类型', getLogTitle(log)],
-    ['时间', log.timestamp || '未记录']
-  ].forEach(([labelText, value]) => {
+  const fields = [['类型', getLogTitle(log)], ['时间', log.timestamp || '未记录']];
+  if (!single && details.length > 1) {
+    fields.push(['站点数', String(details.length)]);
+  }
+  fields.forEach(([labelText, value]) => {
     const field = document.createElement('div');
     const label = document.createElement('span');
     label.textContent = labelText;
@@ -2073,9 +2117,9 @@ function openLogDetail(log) {
   });
   body.appendChild(overview);
 
-  body.appendChild(createLogDetailBlock('汇总', log.report || '未记录汇总', 'log-detail-report'));
-
-  const details = Array.isArray(log.details) ? log.details : [];
+  // No aggregate report block: an entry covers one site's task, and its status,
+  // message and balance already appear in the section below. Older databases
+  // may still hold pre-split entries with several sites, so the loop stays.
   if (details.length > 0) {
     details.forEach((result, resultIndex) => {
       body.appendChild(createLogResultElement(result, resultIndex));
@@ -2121,9 +2165,42 @@ function updateLogsFooter(isLoadingMore) {
   } else if (!logsHasMore) {
     const endDiv = document.createElement('div');
     endDiv.className = 'logs-end-line';
-    endDiv.textContent = `已加载全部日志 (共 ${logItems.length} 条)`;
+    const total = logsTotal || logItems.length;
+    endDiv.textContent = logsStartDate || logsEndDate
+      ? `筛选结果：共 ${total} 条日志`
+      : `已加载全部日志 (共 ${total} 条)`;
     container.appendChild(endDiv);
   }
+}
+
+function syncLogTimeFilterFields() {
+  const startInput = document.getElementById('logs-start-date');
+  const endInput = document.getElementById('logs-end-date');
+  if (startInput) startInput.value = logsStartDate;
+  if (endInput) endInput.value = logsEndDate;
+}
+
+function applyLogTimeFilter() {
+  const startInput = document.getElementById('logs-start-date');
+  const endInput = document.getElementById('logs-end-date');
+  const startDate = startInput?.value || '';
+  const endDate = endInput?.value || '';
+
+  if (startDate && endDate && startDate > endDate) {
+    showToast('开始日期不能晚于结束日期', 'warning');
+    return;
+  }
+
+  logsStartDate = startDate;
+  logsEndDate = endDate;
+  fetchLogsPage(true);
+}
+
+function resetLogTimeFilter() {
+  logsStartDate = '';
+  logsEndDate = '';
+  syncLogTimeFilterFields();
+  fetchLogsPage(true);
 }
 
 async function fetchLogsPage(isInitial = false) {
@@ -2148,6 +2225,8 @@ async function fetchLogsPage(isInitial = false) {
     if (logsNextBeforeId !== null && logsNextBeforeId !== undefined) {
       params.before_id = logsNextBeforeId;
     }
+    if (logsStartDate) params.start_date = logsStartDate;
+    if (logsEndDate) params.end_date = logsEndDate;
 
     const data = await apiGet('/api/logs', params);
     let newItems = [];
@@ -2167,7 +2246,12 @@ async function fetchLogsPage(isInitial = false) {
     if (isInitial) {
       container.replaceChildren();
       if (newItems.length === 0) {
-        renderLogMessage(container, '暂无签到历史记录');
+        renderLogMessage(
+          container,
+          logsStartDate || logsEndDate
+            ? '该时间范围内没有签到记录'
+            : '暂无签到历史记录'
+        );
         logsLoading = false;
         return;
       }
@@ -2206,6 +2290,7 @@ function handleLogsScroll() {
 
 function openLogsDrawer() {
   openModal('logs-drawer');
+  syncLogTimeFilterFields();
   fetchLogsPage(true);
 }
 
@@ -2224,6 +2309,10 @@ function clearLogs() {
       logsNextBeforeId = null;
       logsHasMore = false;
       logsTotal = 0;
+      // Nothing is left to filter, so drop the range too.
+      logsStartDate = '';
+      logsEndDate = '';
+      syncLogTimeFilterFields();
       const container = document.getElementById('logs-body');
       renderLogMessage(container, '暂无签到历史记录');
       showToast('历史日志已成功清空', 'success');

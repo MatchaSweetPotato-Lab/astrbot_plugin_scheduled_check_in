@@ -184,23 +184,26 @@ class ScheduledCheckInPlugin(Star):
             logger.error(f"Error saving settings to database: {e}", exc_info=True)
 
     def record_history(self, results: list[Any], log_type: str = "scheduled") -> None:
-        """Record check-in results into history SQLite table.
+        """Record check-in results into the history table, one entry per site.
+
+        A batch run writes a separate row for every site instead of one
+        aggregated row, so each history entry — and its detail view — describes
+        exactly one site's task and request chain. The broadcast briefing still
+        combines them; only storage is split.
 
         Args:
             results: List of CheckInResult objects.
             log_type: Type of log entry ("scheduled", "manual", "test").
         """
         try:
-            report_text = CheckInScheduler.format_report(results)
-            entry = {
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "type": log_type,
-                "manual": log_type == "manual",
-                "success": all(r.success for r in results) if results else False,
-                "report": report_text,
-                "details": [r.to_dict() for r in results],
-            }
-            self.db.record_history(entry)
+            entries = CheckInScheduler.build_history_entries(
+                results,
+                log_type,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            if not entries:
+                return
+            self.db.record_history_entries(entries)
         except Exception as e:
             logger.error(f"Error recording history to database: {e}", exc_info=True)
 
@@ -1038,13 +1041,15 @@ class ScheduledCheckInPlugin(Star):
         )
 
     async def api_get_logs(self) -> Any:
-        """Web API: Get history logs with pagination support.
+        """Web API: Get history logs with pagination and date filtering.
 
         Returns:
             JSON response with items, total, has_more, and next_before_id.
         """
         limit = 20
         before_id = None
+        start_date = None
+        end_date = None
         try:
             if hasattr(request, "query") and request.query:
                 q_limit = request.query.get("limit")
@@ -1053,11 +1058,23 @@ class ScheduledCheckInPlugin(Star):
                 q_before_id = request.query.get("before_id")
                 if q_before_id is not None and str(q_before_id).strip():
                     before_id = int(q_before_id)
+                # Storage normalizes these and ignores anything unparseable.
+                start_date = request.query.get("start_date") or None
+                end_date = request.query.get("end_date") or None
         except Exception as e:
             logger.warning(f"Failed to parse query params for /api/logs: {e}")
 
-        logs = self.read_history_logs(limit=limit, before_id=before_id)
-        total = self.count_history_logs() if before_id is None else None
+        logs = self.read_history_logs(
+            limit=limit,
+            before_id=before_id,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        total = (
+            self.count_history_logs(start_date=start_date, end_date=end_date)
+            if before_id is None
+            else None
+        )
         has_more = len(logs) == limit
         next_before_id = logs[-1]["id"] if (has_more and logs) else None
 
