@@ -1,28 +1,39 @@
 """Main plugin entry point for AstrBot scheduled check-in plugin."""
 
-import json
 import logging
+import os
 from collections.abc import AsyncGenerator
-from datetime import datetime
+from datetime import datetime, timedelta
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.star import Context, Star, register
-from astrbot.api.web import error_response, json_response, request
+from astrbot.api.web import error_response, file_response, json_response, request
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
-from .core.adapters import create_adapter
+from .core.adapters import create_adapter, persist_writeback
+from .core.crypto import VaultError, encode_bytes
 from .core.http_client import (
-    DEFAULT_IMPERSONATE,
     create_client_session,
     get_impersonate_options,
     normalize_impersonate,
 )
-from .core.scheduler import CheckInScheduler
-from .core.storage import DEFAULT_SETTINGS, DatabaseManager
+from .core.scheduler import LOCKED_MESSAGE, CheckInScheduler
+from .core.site_schema import SITE_TYPE_NEW_API, normalize_site_type
+from .core.storage import SLOT_WEBAUTHN, DEFAULT_SETTINGS, DatabaseManager
 
 logger = logging.getLogger("astrbot")
+
+# Fixed WebAuthn user handle. The vault is a single local secret, not a
+# multi-user account system, so one stable handle is all that is needed.
+_PASSKEY_USER_HANDLE = b"astrbot-checkin-vault"
+
+# Bounds on one activity query. Monthly aggregation happens in memory, so a
+# busy site must not be able to make a single request load unbounded rows.
+SITE_ACTIVITY_MAX_RECORDS = 20000
+SITE_ACTIVITY_LOG_BATCH_SIZE = 500
 
 
 async def _read_json_body() -> tuple[bool, Any]:
@@ -40,7 +51,7 @@ async def _read_json_body() -> tuple[bool, Any]:
     "astrbot_plugin_scheduled_check_in",
     "Soulter",
     "LLM API 中转站自动签到插件，支持 Pages 可视化配置与定时广播简报",
-    "1.0.0",
+    "1.2.0",
 )
 class ScheduledCheckInPlugin(Star):
     """Star plugin managing auto sign-ins for API relay stations."""
@@ -58,6 +69,9 @@ class ScheduledCheckInPlugin(Star):
 
         self.db = DatabaseManager(self.data_dir / "data.db", legacy_data_dir=self.data_dir)
         self.acw_cache_file: Path = self.data_dir / "acw_sc_v2_cache.json"
+        # Served at the real AstrBot origin rather than from pages/, which
+        # AstrBot would auto-discover and render inside the sandboxed iframe.
+        self.passkey_page_file: Path = Path(__file__).parent / "webauthn" / "passkey.html"
 
         self.scheduler = CheckInScheduler(self)
         self._register_routes()
@@ -86,6 +100,26 @@ class ScheduledCheckInPlugin(Star):
         except Exception as e:
             logger.error(f"Error reading sites from database: {e}", exc_info=True)
             return []
+
+    def get_sites_for_display(self) -> list[dict[str, Any]]:
+        """Read sites for the dashboard, withholding OAuth session cookies.
+
+        Returns:
+            List of site configuration dictionaries safe to send to the browser.
+        """
+        try:
+            return self.db.get_sites_for_display()
+        except Exception as e:
+            logger.error(f"Error reading sites for display: {e}", exc_info=True)
+            return []
+
+    def is_config_locked(self) -> bool:
+        """Return whether encryption is on but no key has been supplied."""
+        try:
+            return bool(self.db.vault.locked)
+        except Exception as e:
+            logger.error(f"Error reading vault state: {e}", exc_info=True)
+            return False
 
     def save_sites(self, sites_data: list[dict[str, Any]]) -> None:
         """Write site configurations to SQLite database.
@@ -172,28 +206,44 @@ class ScheduledCheckInPlugin(Star):
 
     def read_history_logs(
         self,
-        limit: int = 100,
+        limit: int | None = 100,
         before_id: int | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        site_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Read history log entries from SQLite database.
 
         Args:
-            limit: Maximum number of logs to return.
+            limit: Maximum number of logs to return. ``None`` returns all matches.
             before_id: Optional log ID cursor.
+            start_date: Optional inclusive start date (YYYY-MM-DD).
+            end_date: Optional inclusive end date (YYYY-MM-DD).
+            site_id: Optional site filter, resolved through the index table.
 
         Returns:
             List of history log entries.
         """
         try:
-            return self.db.read_history_logs(limit=limit, before_id=before_id)
+            return self.db.read_history_logs(
+                limit=limit,
+                before_id=before_id,
+                start_date=start_date,
+                end_date=end_date,
+                site_id=site_id,
+            )
         except Exception as e:
             logger.error(f"Error reading history logs from database: {e}", exc_info=True)
             return []
 
-    def count_history_logs(self) -> int:
+    def count_history_logs(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> int:
         """Count total history log entries in SQLite database."""
         try:
-            return self.db.count_history_logs()
+            return self.db.count_history_logs(start_date=start_date, end_date=end_date)
         except Exception as e:
             logger.error(f"Error counting history logs from database: {e}", exc_info=True)
             return 0
@@ -216,10 +266,44 @@ class ScheduledCheckInPlugin(Star):
             ("/api/sites", self.api_save_sites, ["POST"], "保存站点配置"),
             ("/api/sites/test", self.api_test_site, ["POST"], "测试站点连接"),
             ("/api/sites/recheckin", self.api_recheckin_site, ["POST"], "重新签到单个站点"),
+            ("/api/sites/activity", self.api_get_site_activity, ["GET"], "获取站点签到日历与余额变化"),
             ("/api/checkin/run", self.api_run_checkin, ["POST"], "触发一键打卡"),
             ("/api/settings", self.api_get_settings, ["GET"], "获取设置"),
             ("/api/settings", self.api_save_settings, ["POST"], "保存设置"),
             ("/api/settings/target_time", self.api_save_custom_target_time, ["POST"], "设置自定义下次签到时间"),
+            ("/api/vault", self.api_get_vault, ["GET"], "获取加密状态"),
+            ("/api/vault/enable", self.api_enable_vault, ["POST"], "启用配置加密"),
+            ("/api/vault/unlock", self.api_unlock_vault, ["POST"], "输入密钥解锁配置"),
+            ("/api/vault/lock", self.api_lock_vault, ["POST"], "立即锁定配置"),
+            ("/api/vault/disable", self.api_disable_vault, ["POST"], "关闭配置加密"),
+            ("/api/vault/reset", self.api_reset_vault, ["POST"], "忘记密钥并清空密文"),
+            ("/api/vault/slots", self.api_get_slots, ["GET"], "获取密钥槽位列表"),
+            (
+                "/api/vault/slots/webauthn/begin-register",
+                self.api_begin_register_passkey,
+                ["POST"],
+                "开始注册通行密钥",
+            ),
+            (
+                "/api/vault/slots/webauthn/finish-register",
+                self.api_finish_register_passkey,
+                ["POST"],
+                "完成注册通行密钥",
+            ),
+            (
+                "/api/vault/slots/webauthn/begin-unlock",
+                self.api_begin_unlock_passkey,
+                ["POST"],
+                "开始通行密钥解锁",
+            ),
+            (
+                "/api/vault/unlock/webauthn",
+                self.api_unlock_with_passkey,
+                ["POST"],
+                "使用通行密钥解锁",
+            ),
+            ("/api/vault/slots/remove", self.api_remove_slot, ["POST"], "删除密钥槽位"),
+            ("/passkey", self.page_passkey, ["GET"], "通行密钥管理页面"),
             ("/api/logs", self.api_get_logs, ["GET"], "获取打卡日志"),
             ("/api/logs/clear", self.api_clear_logs, ["POST"], "清空打卡日志"),
         ]
@@ -241,10 +325,14 @@ class ScheduledCheckInPlugin(Star):
     async def api_get_sites(self) -> Any:
         """Web API: Get sites.
 
+        The list is always returned so the dashboard can show what is
+        configured; while the vault is locked the protected fields come back
+        withheld and each site carries ``locked: true``.
+
         Returns:
             JSON response.
         """
-        return json_response(self.get_sites())
+        return json_response(self.get_sites_for_display())
 
     async def api_save_sites(self) -> Any:
         """Web API: Save sites.
@@ -273,9 +361,14 @@ class ScheduledCheckInPlugin(Star):
             return error_response("请求体必须是合法 JSON")
         if not isinstance(site_config, dict):
             return error_response("站点配置必须是对象")
+        if self.is_config_locked() or site_config.get("locked"):
+            return error_response(LOCKED_MESSAGE)
         async with create_client_session(self.get_settings()) as session:
             adapter = create_adapter(site_config, session, self.acw_cache_file)
             result = await adapter.test_connection()
+            site_id = str(site_config.get("id") or "").strip()
+            if site_id:
+                persist_writeback(self.db, site_id, adapter.writeback)
             self.record_history([result], log_type="test")
             return json_response(result.to_dict())
 
@@ -289,12 +382,242 @@ class ScheduledCheckInPlugin(Star):
         site_id = str(body.get("site_id", "")).strip()
         if not site_id:
             return error_response("缺少站点 ID")
+        if self.is_config_locked():
+            return error_response(LOCKED_MESSAGE)
 
         result = await self.scheduler.run_check_in_site(site_id, manual=True)
         if result is None:
             return error_response("站点不存在")
 
         return json_response({"status": "ok", "result": result.to_dict()})
+
+    # ------------------------------------------------------------------
+    # Site Activity (calendar + balance history)
+    # ------------------------------------------------------------------
+    def _read_site_activity_logs(
+        self,
+        site_id: str,
+        start_date: str,
+        end_date: str,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Read monthly activity logs in bounded batches.
+
+        The activity view needs chronological aggregation, but a malformed or
+        unusually busy site must not make one request load an unbounded number
+        of database rows. Logs are returned newest-first and the caller sorts
+        the derived events before rendering them.
+
+        Returns:
+            A tuple containing the collected logs and whether the hard cap was
+            reached while more matching records remained.
+        """
+        logs: list[dict[str, Any]] = []
+        before_id: int | None = None
+
+        while len(logs) < SITE_ACTIVITY_MAX_RECORDS:
+            batch_limit = min(
+                SITE_ACTIVITY_LOG_BATCH_SIZE,
+                SITE_ACTIVITY_MAX_RECORDS - len(logs),
+            )
+            batch = self.read_history_logs(
+                limit=batch_limit,
+                before_id=before_id,
+                start_date=start_date,
+                end_date=end_date,
+                site_id=site_id,
+            )
+            if not batch:
+                return logs, False
+
+            logs.extend(batch)
+            next_before_id = batch[-1].get("id")
+            if next_before_id is None:
+                return logs, False
+            before_id = int(next_before_id)
+            if len(batch) < batch_limit:
+                return logs, False
+
+        remaining = self.read_history_logs(
+            limit=1,
+            before_id=before_id,
+            start_date=start_date,
+            end_date=end_date,
+            site_id=site_id,
+        )
+        return logs, bool(remaining)
+
+    async def api_get_site_activity(self) -> Any:
+        """Web API: Get one site's monthly check-in calendar and balance history."""
+        site_id = ""
+        month = datetime.now().strftime("%Y-%m")
+        try:
+            if hasattr(request, "query") and request.query:
+                site_id = str(request.query.get("site_id") or "").strip()
+                query_month = str(request.query.get("month") or "").strip()
+                if query_month:
+                    month = query_month
+        except Exception as e:
+            logger.warning(f"Failed to parse site activity query params: {e}")
+
+        if not site_id:
+            return error_response("缺少站点 ID")
+
+        try:
+            month_start = datetime.strptime(f"{month}-01", "%Y-%m-%d")
+        except ValueError:
+            return error_response("月份格式必须为 YYYY-MM")
+
+        month_end = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        month_start_str = month_start.strftime("%Y-%m-%d")
+        month_end_str = month_end.strftime("%Y-%m-%d")
+
+        # Read from the display view so a locked vault cannot leak secrets here.
+        site = next(
+            (
+                item
+                for item in self.get_sites_for_display()
+                if str(item.get("id") or "").strip() == site_id
+            ),
+            None,
+        )
+        if site is None:
+            return error_response("站点不存在")
+
+        supports_balance = normalize_site_type(site.get("type")) == SITE_TYPE_NEW_API
+        logs, history_truncated = self._read_site_activity_logs(
+            site_id=site_id,
+            start_date=month_start_str,
+            end_date=month_end_str,
+        )
+
+        def as_bool(value: Any) -> bool:
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "on"}
+            return bool(value)
+
+        def as_balance(value: Any) -> float | None:
+            if not supports_balance or value is None:
+                return None
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return None
+            return round(number, 3) if isfinite(number) else None
+
+        events: list[dict[str, Any]] = []
+        for log in logs:
+            timestamp = str(log.get("timestamp") or "")
+            if len(timestamp) < 10:
+                continue
+            details = log.get("details")
+            if not isinstance(details, list):
+                continue
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                detail_site_id = str(detail.get("site_id") or "").strip()
+                if detail_site_id != site_id:
+                    continue
+                success = as_bool(detail.get("success"))
+                events.append(
+                    {
+                        "timestamp": timestamp,
+                        "date": timestamp[:10],
+                        "time": timestamp[11:16] if len(timestamp) >= 16 else "",
+                        "type": str(log.get("type") or "scheduled"),
+                        "success": success,
+                        "message": str(detail.get("message") or ""),
+                        "gained_quota": as_balance(detail.get("gained_quota")) if success else None,
+                        "balance": as_balance(detail.get("total_quota")) if success else None,
+                    }
+                )
+
+        events.sort(key=lambda item: item["timestamp"])
+
+        # Connection tests can provide a balance, but they do not count as a
+        # check-in day. A day keeps the latest real check-in result.
+        daily_checkins: dict[str, dict[str, Any]] = {}
+        for event in events:
+            if event["type"] == "test":
+                continue
+            daily_checkins[event["date"]] = {
+                "date": event["date"],
+                "time": event["time"],
+                "status": "success" if event["success"] else "failure",
+                "message": event["message"],
+                "gained_quota": event["gained_quota"],
+                "balance": None,
+            }
+
+        balance_history: list[dict[str, Any]] = []
+        if supports_balance:
+            daily_balances: dict[str, float] = {}
+            for event in events:
+                if event["balance"] is not None:
+                    daily_balances[event["date"]] = event["balance"]
+            for date_str, day in daily_checkins.items():
+                day["balance"] = daily_balances.get(date_str)
+
+            previous_balance: float | None = None
+            for event in events:
+                balance = event["balance"]
+                if balance is None:
+                    continue
+                change = None if previous_balance is None else round(balance - previous_balance, 3)
+                balance_history.append(
+                    {
+                        "timestamp": event["timestamp"],
+                        "date": event["date"],
+                        "time": event["time"],
+                        "type": event["type"],
+                        "message": event["message"],
+                        "balance": balance,
+                        "change": change,
+                    }
+                )
+                previous_balance = balance
+
+        current_balance = as_balance(site.get("last_quota"))
+        current_balance_timestamp = " ".join(
+            part
+            for part in (
+                str(site.get("last_checkin_date") or ""),
+                str(site.get("last_checkin_time") or ""),
+            )
+            if part
+        )
+
+        latest_balance: float | None = None
+        latest_balance_timestamp = ""
+        if balance_history:
+            latest_balance = balance_history[-1]["balance"]
+            latest_balance_timestamp = balance_history[-1]["timestamp"]
+        elif month == datetime.now().strftime("%Y-%m"):
+            latest_balance = current_balance
+            latest_balance_timestamp = current_balance_timestamp
+
+        calendar_days = sorted(daily_checkins.values(), key=lambda item: item["date"])
+        return json_response(
+            {
+                "site": {
+                    "id": site_id,
+                    "name": str(site.get("name") or site_id),
+                    "type": str(site.get("type") or ""),
+                },
+                "supports_balance": supports_balance,
+                "history_truncated": history_truncated,
+                "history_record_limit": SITE_ACTIVITY_MAX_RECORDS if history_truncated else None,
+                "month": month,
+                "days": calendar_days,
+                "balance_history": balance_history,
+                "current_balance": current_balance,
+                "current_balance_timestamp": current_balance_timestamp,
+                "latest_balance": latest_balance,
+                "latest_balance_timestamp": latest_balance_timestamp,
+                "success_days": sum(day["status"] == "success" for day in calendar_days),
+                "failure_days": sum(day["status"] == "failure" for day in calendar_days),
+            }
+        )
 
     async def api_run_checkin(self) -> Any:
         """Web API: Trigger instant check-in.
@@ -307,6 +630,8 @@ class ScheduledCheckInPlugin(Star):
             return error_response("请求体必须是合法 JSON")
         if not isinstance(body, dict):
             return error_response("签到请求必须是对象")
+        if self.is_config_locked():
+            return error_response(LOCKED_MESSAGE)
         force = bool(body.get("force", False))
         results = await self.scheduler.run_check_in_all(manual=True, force=force)
         return json_response({"status": "ok", "results": [r.to_dict() for r in results]})
@@ -322,6 +647,7 @@ class ScheduledCheckInPlugin(Star):
         settings["target_info"] = target_info
         settings["today_target_time"] = target_info.get("display_text", "")
         settings["http_impersonate_options"] = get_impersonate_options()
+        settings["vault"] = self.db.vault_status()
         return json_response(settings)
 
     async def api_save_settings(self) -> Any:
@@ -366,6 +692,350 @@ class ScheduledCheckInPlugin(Star):
         self.save_settings(settings)
         self.scheduler.reset_today_target_time()
         return json_response({"status": "ok", "message": "下次签到时间已设置"})
+
+    # ------------------------------------------------------------------
+    # Vault Routes
+    # ------------------------------------------------------------------
+    async def api_get_vault(self) -> Any:
+        """Web API: Report whether config encryption is on, and unlocked.
+
+        Returns:
+            JSON response with enabled, unlocked, and locked flags.
+        """
+        return json_response(self.db.vault_status())
+
+    async def api_enable_vault(self) -> Any:
+        """Web API: Turn on encryption and hand the new key to the user once.
+
+        Returns:
+            JSON response containing the generated key.
+        """
+        try:
+            key = self.db.enable_encryption()
+        except RuntimeError as exc:
+            return error_response(str(exc))
+        except Exception as exc:
+            logger.error(f"Error enabling encryption: {exc}", exc_info=True)
+            return error_response(f"启用加密失败: {exc}")
+        return json_response(
+            {
+                "status": "ok",
+                "key": key,
+                "message": "加密已启用，请立即保存密钥。密钥不会再次显示，丢失后只能重置。",
+                "vault": self.db.vault_status(),
+            }
+        )
+
+    async def api_unlock_vault(self) -> Any:
+        """Web API: Validate a supplied key and unlock protected fields.
+
+        Returns:
+            JSON response with the resulting vault state.
+        """
+        parsed, body = await _read_json_body()
+        if not parsed or not isinstance(body, dict):
+            return error_response("请求体必须是合法 JSON 对象")
+        key = str(body.get("key", "") or "")
+        try:
+            self.db.unlock_encryption(key)
+        except (VaultError, RuntimeError) as exc:
+            return error_response(str(exc))
+        except Exception as exc:
+            logger.error(f"Error unlocking vault: {exc}", exc_info=True)
+            return error_response(f"解锁失败: {exc}")
+        return json_response(
+            {"status": "ok", "message": "解锁成功", "vault": self.db.vault_status()}
+        )
+
+    async def api_lock_vault(self) -> Any:
+        """Web API: Drop the in-memory key without disabling encryption.
+
+        Returns:
+            JSON response with the resulting vault state.
+        """
+        self.db.lock_encryption()
+        return json_response(
+            {"status": "ok", "message": "已锁定，下次操作需重新输入密钥", "vault": self.db.vault_status()}
+        )
+
+    async def api_disable_vault(self) -> Any:
+        """Web API: Turn encryption off, rewriting protected fields as plaintext.
+
+        Returns:
+            JSON response with the resulting vault state.
+        """
+        try:
+            self.db.disable_encryption()
+        except VaultError as exc:
+            return error_response(f"{exc}（关闭加密前必须先解锁）")
+        except Exception as exc:
+            logger.error(f"Error disabling encryption: {exc}", exc_info=True)
+            return error_response(f"关闭加密失败: {exc}")
+        return json_response(
+            {"status": "ok", "message": "加密已关闭，敏感字段已还原为明文", "vault": self.db.vault_status()}
+        )
+
+    async def api_reset_vault(self) -> Any:
+        """Web API: Discard unreadable ciphertext after a lost key.
+
+        Site names, URLs, and history survive; credentials, custom headers, and
+        proxies are cleared because they can no longer be decrypted.
+
+        Returns:
+            JSON response with the number of sites cleared.
+        """
+        parsed, body = await _read_json_body()
+        if not parsed or not isinstance(body, dict):
+            return error_response("请求体必须是合法 JSON 对象")
+        if str(body.get("confirm", "")).strip().lower() != "reset":
+            return error_response("重置需要二次确认")
+        try:
+            affected = self.db.reset_encryption()
+        except Exception as exc:
+            logger.error(f"Error resetting encryption: {exc}", exc_info=True)
+            return error_response(f"重置失败: {exc}")
+        return json_response(
+            {
+                "status": "ok",
+                "cleared_sites": affected,
+                "message": f"已清空 {affected} 个站点的凭据、请求头与代理，并关闭加密",
+                "vault": self.db.vault_status(),
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # Key Slot Routes (WebAuthn PRF)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _current_rp_id() -> str:
+        """Derive the WebAuthn RP ID from the request Host.
+
+        The RP ID must be a bare domain, so the port is stripped. A credential
+        is bound to the RP ID it was created under, which is why each address
+        the dashboard is reached at needs its own slot.
+        """
+        host = ""
+        try:
+            host = str(request.headers.get("host") or "").strip()
+        except Exception:
+            host = ""
+        if not host:
+            return ""
+        # Strip the port, taking care not to break an IPv6 literal.
+        if host.startswith("["):
+            return host.partition("]")[0].lstrip("[").lower()
+        return host.split(":", 1)[0].lower()
+
+    async def api_get_slots(self) -> Any:
+        """Web API: List key slots.
+
+        Readable while locked: the unlock page needs the credential ids and PRF
+        salts before any key is available. None of it is secret.
+
+        Returns:
+            JSON response with the slots and the current RP ID.
+        """
+        rp_id = self._current_rp_id()
+        slots = self.db.list_slots()
+        return json_response(
+            {
+                "slots": slots,
+                "rp_id": rp_id,
+                "vault": self.db.vault_status(),
+                "matching_slots": [
+                    slot["id"] for slot in slots if slot["rp_id"].lower() == rp_id
+                ],
+            }
+        )
+
+    async def api_begin_register_passkey(self) -> Any:
+        """Web API: Start passkey registration.
+
+        Requires an unlocked vault, since registering wraps the vault key.
+
+        Returns:
+            JSON response with the ceremony parameters.
+        """
+        if not self.db.vault.unlocked:
+            return error_response("请先解锁配置，再注册通行密钥")
+        rp_id = self._current_rp_id()
+        if not rp_id:
+            return error_response("无法确定当前域名，无法注册通行密钥")
+
+        slots = self.db.list_slots()
+        return json_response(
+            {
+                "status": "ok",
+                "rp_id": rp_id,
+                "rp_name": "AstrBot 定时签到",
+                "user_id": encode_bytes(_PASSKEY_USER_HANDLE),
+                "user_name": str(getattr(request, "username", "") or "astrbot"),
+                "challenge": encode_bytes(os.urandom(32)),
+                "prf_salt": encode_bytes(os.urandom(32)),
+                # Stops the browser from silently creating a second credential
+                # on an authenticator that already has one for this vault.
+                "exclude_credentials": [
+                    slot["credential_id"]
+                    for slot in slots
+                    if slot["credential_id"] and slot["rp_id"].lower() == rp_id
+                ],
+            }
+        )
+
+    async def api_finish_register_passkey(self) -> Any:
+        """Web API: Store a registered passkey as a new key slot.
+
+        The PRF output is the slot secret: it wraps the vault key and is then
+        discarded. Nothing key-derived is written to disk.
+
+        Returns:
+            JSON response with the created slot.
+        """
+        parsed, body = await _read_json_body()
+        if not parsed or not isinstance(body, dict):
+            return error_response("请求体必须是合法 JSON 对象")
+        try:
+            slot = self.db.add_webauthn_slot(
+                credential_id=str(body.get("credential_id", "")),
+                prf_output=str(body.get("prf_output", "")),
+                prf_salt=str(body.get("prf_salt", "")),
+                rp_id=self._current_rp_id(),
+                label=str(body.get("label", "")).strip(),
+                transports=body.get("transports"),
+            )
+        except (VaultError, RuntimeError) as exc:
+            return error_response(str(exc))
+        except Exception as exc:
+            logger.error(f"Error registering passkey: {exc}", exc_info=True)
+            return error_response(f"注册通行密钥失败: {exc}")
+        return json_response(
+            {
+                "status": "ok",
+                "message": "通行密钥已注册",
+                "slot": slot,
+                "vault": self.db.vault_status(),
+            }
+        )
+
+    async def api_begin_unlock_passkey(self) -> Any:
+        """Web API: Start a passkey unlock ceremony.
+
+        Only slots registered for the current host are offered — a credential
+        from another address cannot be asserted here and would just produce an
+        opaque browser error.
+
+        Returns:
+            JSON response with the ceremony parameters.
+        """
+        rp_id = self._current_rp_id()
+        if not rp_id:
+            return error_response("无法确定当前域名，无法使用通行密钥")
+
+        matching = self.db.list_slots_for_rp(rp_id)
+        if not matching:
+            others = sorted(
+                {
+                    slot["rp_id"]
+                    for slot in self.db.list_slots()
+                    if slot["type"] == SLOT_WEBAUTHN and slot["rp_id"]
+                }
+            )
+            return error_response(
+                "当前地址没有已注册的通行密钥"
+                + (f"，已注册的地址：{', '.join(others)}" if others else ""),
+                data={"registered_rp_ids": others},
+            )
+
+        return json_response(
+            {
+                "status": "ok",
+                "rp_id": rp_id,
+                "challenge": encode_bytes(os.urandom(32)),
+                "allow_credentials": [
+                    {
+                        "id": slot["credential_id"],
+                        "prf_salt": slot["prf_salt"],
+                        "transports": slot["transports"],
+                        "label": slot["label"],
+                    }
+                    for slot in matching
+                ],
+            }
+        )
+
+    async def api_unlock_with_passkey(self) -> Any:
+        """Web API: Unlock the vault with a passkey PRF output.
+
+        Returns:
+            JSON response with the resulting vault state.
+        """
+        parsed, body = await _read_json_body()
+        if not parsed or not isinstance(body, dict):
+            return error_response("请求体必须是合法 JSON 对象")
+        try:
+            slot = self.db.unlock_with_webauthn(
+                credential_id=str(body.get("credential_id", "")),
+                prf_output=str(body.get("prf_output", "")),
+            )
+        except (VaultError, RuntimeError) as exc:
+            return error_response(str(exc))
+        except Exception as exc:
+            logger.error(f"Error unlocking with passkey: {exc}", exc_info=True)
+            return error_response(f"解锁失败: {exc}")
+        return json_response(
+            {
+                "status": "ok",
+                "message": f"已通过「{slot['label'] or '通行密钥'}」解锁",
+                "slot": slot,
+                "vault": self.db.vault_status(),
+            }
+        )
+
+    async def api_remove_slot(self) -> Any:
+        """Web API: Delete a key slot.
+
+        Returns:
+            JSON response with the resulting slot list.
+        """
+        parsed, body = await _read_json_body()
+        if not parsed or not isinstance(body, dict):
+            return error_response("请求体必须是合法 JSON 对象")
+        slot_id = str(body.get("slot_id", "")).strip()
+        if not slot_id:
+            return error_response("缺少槽位 ID")
+        try:
+            removed = self.db.remove_slot(slot_id)
+        except RuntimeError as exc:
+            return error_response(str(exc))
+        except Exception as exc:
+            logger.error(f"Error removing key slot: {exc}", exc_info=True)
+            return error_response(f"删除槽位失败: {exc}")
+        if not removed:
+            return error_response("槽位不存在")
+        return json_response(
+            {
+                "status": "ok",
+                "message": "槽位已删除",
+                "slots": self.db.list_slots(),
+                "vault": self.db.vault_status(),
+            }
+        )
+
+    async def page_passkey(self) -> Any:
+        """Serve the standalone passkey page.
+
+        This page must run at the real AstrBot origin: the dashboard hosts
+        plugin pages in a sandboxed iframe without ``allow-same-origin``, which
+        gives them an opaque origin where WebAuthn cannot resolve an RP ID.
+
+        Returns:
+            The HTML page.
+        """
+        return file_response(
+            self.passkey_page_file,
+            content_type="text/html; charset=utf-8",
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def api_get_logs(self) -> Any:
         """Web API: Get history logs with pagination support.
@@ -446,6 +1116,10 @@ class ScheduledCheckInPlugin(Star):
         event: AstrMessageEvent,
     ) -> AsyncGenerator[MessageEventResult, None]:
         """查看当前配置的所有中转站连接状态与余额明细"""
+        if self.is_config_locked():
+            yield event.plain_result(LOCKED_MESSAGE)
+            return
+
         sites = self.get_sites()
         if not sites:
             yield event.plain_result("当前未配置任何中转站，请前往 Pages 页面添加！")
@@ -470,6 +1144,7 @@ class ScheduledCheckInPlugin(Star):
                     continue
                 adapter = create_adapter(site, session, self.acw_cache_file)
                 res = await adapter.test_connection()
+                persist_writeback(self.db, site_id, adapter.writeback)
                 results.append(res)
 
         report = CheckInScheduler.format_report(results)

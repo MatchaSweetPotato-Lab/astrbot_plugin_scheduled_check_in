@@ -6,10 +6,13 @@ import random
 from datetime import datetime
 from typing import Any
 
-from .adapters import CheckInResult, create_adapter
+from .adapters import CheckInResult, create_adapter, persist_writeback
 from .http_client import create_client_session
 
 logger = logging.getLogger("astrbot")
+
+# Shown when a run is skipped because the configuration is still encrypted.
+LOCKED_MESSAGE = "配置已加密未解锁，请在 Web 端输入密钥后重试"
 
 
 class CheckInScheduler:
@@ -305,6 +308,36 @@ class CheckInScheduler:
                 logger.error(f"Error in CheckInScheduler loop: {e}", exc_info=True)
                 await asyncio.sleep(60)
 
+    def _is_locked(self) -> bool:
+        """Return whether the plugin's configuration is encrypted but unlocked."""
+        checker = getattr(self.plugin, "is_config_locked", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker())
+        except Exception as exc:
+            logger.warning(f"Could not determine vault state, assuming unlocked: {exc}")
+            return False
+
+    async def _skip_locked_run(self, manual: bool) -> list[CheckInResult]:
+        """Record a skipped run so a locked vault is visible in the history.
+
+        The scheduled task keeps firing on purpose: silently doing nothing would
+        look identical to a healthy day with nothing to sign in for.
+        """
+        logger.warning("Skipping check-in run: %s", LOCKED_MESSAGE)
+        results = [
+            CheckInResult(
+                site_id="",
+                site_name="全部站点",
+                success=False,
+                message=LOCKED_MESSAGE,
+            )
+        ]
+        async with self._history_lock:
+            self._record_checkin_history(results, manual)
+        return results
+
     async def run_check_in_all(self, manual: bool = False, force: bool = False) -> list[CheckInResult]:
         """Execute check-in for all enabled sites.
 
@@ -315,6 +348,9 @@ class CheckInScheduler:
         Returns:
             List of CheckInResult objects.
         """
+        if self._is_locked():
+            return await self._skip_locked_run(manual)
+
         all_sites = self.plugin.get_sites()
         enabled_sites: list[dict[str, Any]] = []
         for site_config in all_sites:
@@ -374,6 +410,7 @@ class CheckInScheduler:
                     getattr(self.plugin, "acw_cache_file", None),
                 )
                 result = await adapter.check_in()
+                self._persist_site_writeback(site_id, adapter)
                 results.append(result)
                 site_results_to_persist.append(result)
 
@@ -405,6 +442,14 @@ class CheckInScheduler:
         if site_config is None:
             return None
 
+        if self._is_locked() or site_config.get("locked"):
+            return CheckInResult(
+                site_id=normalized_site_id,
+                site_name=str(site_config.get("name") or ""),
+                success=False,
+                message=LOCKED_MESSAGE,
+            )
+
         async with create_client_session(self.plugin.get_settings()) as session:
             adapter = create_adapter(
                 site_config,
@@ -412,11 +457,21 @@ class CheckInScheduler:
                 getattr(self.plugin, "acw_cache_file", None),
             )
             result = await adapter.check_in()
+            self._persist_site_writeback(normalized_site_id, adapter)
 
         await self._persist_checkin_results(
             [result], manual, [result], checked_at
         )
         return result
+
+    def _persist_site_writeback(self, site_id: str, adapter: Any) -> None:
+        """Store config values the adapter discovered while running."""
+        if not site_id:
+            return
+        db = getattr(self.plugin, "db", None)
+        if db is None:
+            return
+        persist_writeback(db, site_id, getattr(adapter, "writeback", None))
 
     @staticmethod
     def format_report(results: list[CheckInResult]) -> str:

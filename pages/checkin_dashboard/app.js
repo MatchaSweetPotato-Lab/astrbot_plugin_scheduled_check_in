@@ -23,6 +23,47 @@ let logsTotal = 0;
 let isEdit = false;
 let editIndex = -1;
 let activeConfirmResolver = null;
+let vaultState = { enabled: false, unlocked: false, locked: false };
+let keySlots = [];
+let activeAnalyticsSite = null;
+let analyticsMonth = '';
+const PLUGIN_ID = 'astrbot_plugin_scheduled_check_in';
+
+const SLOT_TYPE_LABELS = {
+  user_key: '用户密钥',
+  webauthn_prf: '通行密钥'
+};
+// Credentials being edited in the site modal, kept out of `sites` until saved.
+let credentialDraft = [];
+let credentialSeq = 0;
+
+const CREDENTIAL_LABELS = {
+  token: 'Authorization Token',
+  cookie: 'Cookie',
+  github_oauth: 'Github OAuth',
+  linuxdo_oauth: 'LinuxDO OAuth'
+};
+
+const OAUTH_TYPES = ['github_oauth', 'linuxdo_oauth'];
+
+const OAUTH_COOKIE_HINTS = {
+  github_oauth: '填入 github.com 的 user_session Cookie',
+  linuxdo_oauth: '填入 linux.do 的 _t Cookie'
+};
+
+// Endpoints each framework already knows, shown as placeholder hints.
+const FRAMEWORK_DEFAULTS = {
+  'new-api': {
+    checkin: '留空自动使用 /api/user/checkin 或 /api/user/pay/checkin',
+    balance: '留空自动使用 /api/user/self',
+    newApiUser: '跟随框架时会自动探测 new-api-user 并回写到此处'
+  },
+  generic_rest: {
+    checkin: '留空将直接 GET 访问 Base URL（该框架未适配签到接口）',
+    balance: '留空则不查询余额（该框架未适配余额接口）',
+    newApiUser: ''
+  }
+};
 
 // Helper: Toast Notifications
 function showToast(message, type = 'success', duration = 3500) {
@@ -74,12 +115,8 @@ function cancelConfirm() {
   closeModal('confirm-modal');
 }
 
-// Helper: Mask credentials
-function maskToken(val) {
-  if (!val) return '未配置';
-  const token = String(val);
-  if (token.length <= 10) return '******';
-  return token.substring(0, 4) + '***' + token.substring(token.length - 4);
+function isVaultLocked() {
+  return vaultState.locked === true;
 }
 
 function getSiteId(site) {
@@ -174,24 +211,32 @@ function getTodayStr() {
   return `${year}-${month}-${day}`;
 }
 
+function getCurrentMonthStr() {
+  return getTodayStr().substring(0, 7);
+}
+
 function renderCheckInStatus(site) {
   const todayStr = getTodayStr();
-  const badge = document.createElement('span');
+  const statusButton = document.createElement('button');
+  statusButton.type = 'button';
+  statusButton.className = 'status-chip';
+  statusButton.title = '点击查看签到日历和余额变化';
+  statusButton.addEventListener('click', () => openSiteAnalytics(site));
   const timeStr = site.last_checkin_time ? String(site.last_checkin_time).substring(0, 5) : '';
 
   if (site.last_checkin_date === todayStr && site.last_checkin_success) {
-    badge.className = 'badge badge-success';
-    badge.textContent = `已签到${timeStr ? ' (' + timeStr + ')' : ''}`;
-    return badge;
+    statusButton.classList.add('status-chip-success');
+    statusButton.textContent = `已签到${timeStr ? ' (' + timeStr + ')' : ''}`;
+    return statusButton;
   }
   if (site.last_checkin_date === todayStr && site.last_checkin_success === false) {
-    badge.className = 'badge badge-failure';
-    badge.textContent = `失败${timeStr ? ' (' + timeStr + ')' : ''}`;
-    return badge;
+    statusButton.classList.add('status-chip-failure');
+    statusButton.textContent = `失败${timeStr ? ' (' + timeStr + ')' : ''}`;
+    return statusButton;
   }
-  badge.className = 'badge badge-warning';
-  badge.textContent = '未签到';
-  return badge;
+  statusButton.classList.add('status-chip-warning');
+  statusButton.textContent = '未签到';
+  return statusButton;
 }
 
 function renderTableMessage(tbody, message) {
@@ -199,7 +244,7 @@ function renderTableMessage(tbody, message) {
   tbody.replaceChildren();
   const row = document.createElement('tr');
   const cell = document.createElement('td');
-  cell.colSpan = 7;
+  cell.colSpan = 6;
   cell.className = 'empty-text';
   cell.textContent = message;
   row.appendChild(cell);
@@ -228,11 +273,21 @@ function renderSitesTable() {
   tbody.replaceChildren();
   sites.forEach((site, index) => {
     const row = document.createElement('tr');
+    const locked = site.locked === true;
+    if (locked) row.classList.add('row-locked');
 
     const nameCell = document.createElement('td');
     const name = document.createElement('strong');
     name.textContent = site.name;
     nameCell.appendChild(name);
+    if (locked) {
+      const lockTag = document.createElement('span');
+      lockTag.className = 'badge badge-warning';
+      lockTag.style.marginLeft = '8px';
+      lockTag.textContent = '锁定';
+      lockTag.title = '配置已加密，请先输入密钥解锁';
+      nameCell.appendChild(lockTag);
+    }
     row.appendChild(nameCell);
 
     const typeCell = document.createElement('td');
@@ -254,13 +309,6 @@ function renderSitesTable() {
     const statusCell = document.createElement('td');
     statusCell.appendChild(renderCheckInStatus(site));
     row.appendChild(statusCell);
-
-    const tokenCell = document.createElement('td');
-    const token = document.createElement('span');
-    token.className = 'token-mask';
-    token.textContent = maskToken(site.auth_value);
-    tokenCell.appendChild(token);
-    row.appendChild(tokenCell);
 
     const enabledCell = document.createElement('td');
     const switchLabel = document.createElement('label');
@@ -299,16 +347,324 @@ function renderSitesTable() {
         }
       }
     );
+    const testButton = createActionButton('测试', 'btn-primary-plain', () => testSingleSite(index));
+    const editButton = createActionButton('编辑', '', () => openEditSiteModal(index));
+    if (locked) {
+      // Editing or running a locked site would overwrite unreadable secrets.
+      [recheckButton, testButton, editButton].forEach(button => {
+        button.disabled = true;
+        button.title = '配置已加密，请先输入密钥解锁';
+      });
+    }
     actionButtons.push(
       recheckButton,
-      createActionButton('测试', 'btn-primary-plain', () => testSingleSite(index)),
-      createActionButton('编辑', '', () => openEditSiteModal(index)),
+      testButton,
+      editButton,
       createActionButton('删除', 'btn-danger-plain', () => deleteSite(index), false)
     );
     actionsCell.append(...actionButtons);
     row.appendChild(actionsCell);
     tbody.appendChild(row);
   });
+}
+
+function formatBalanceNumber(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  return Number(number.toFixed(3)).toString();
+}
+
+function formatBalance(value) {
+  if (value === null || value === undefined || value === '') return '暂无数据';
+  const formatted = formatBalanceNumber(value);
+  return formatted === null ? '暂无数据' : `$${formatted}`;
+}
+
+function formatBalanceChange(value) {
+  if (value === null || value === undefined || value === '') return '首次记录';
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '首次记录';
+  return `${number > 0 ? '+' : ''}$${formatBalanceNumber(number)}`;
+}
+
+function formatSignedBalance(value) {
+  if (value === null || value === undefined || value === '') return '—';
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '—';
+  return `${number >= 0 ? '+' : '-'}$${formatBalanceNumber(Math.abs(number))}`;
+}
+
+function getAnalyticsTypeLabel(type) {
+  if (type === 'test') return '测试连接';
+  if (type === 'manual') return '手动签到';
+  return '自动签到';
+}
+
+function formatAnalyticsMonth(month) {
+  const match = /^(\d{4})-(\d{2})$/.exec(month || '');
+  return match ? `${match[1]} 年 ${Number(match[2])} 月` : month || '签到日历';
+}
+
+function changeAnalyticsMonth(delta) {
+  if (!analyticsMonth) analyticsMonth = getCurrentMonthStr();
+  const [year, month] = analyticsMonth.split('-').map(Number);
+  const next = new Date(year, month - 1 + delta, 1);
+  analyticsMonth = `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, '0')}`;
+  loadSiteAnalytics();
+}
+
+function openSiteAnalytics(site) {
+  if (!site) return;
+  activeAnalyticsSite = site;
+  analyticsMonth = getCurrentMonthStr();
+  const title = document.getElementById('site-analytics-title');
+  if (title) title.textContent = `${site.name || '站点'} · 签到日历`;
+  openModal('site-analytics-modal');
+  loadSiteAnalytics();
+}
+
+async function loadSiteAnalytics() {
+  if (!activeAnalyticsSite) return;
+  const siteId = getSiteId(activeAnalyticsSite);
+  const requestedMonth = analyticsMonth || getCurrentMonthStr();
+  analyticsMonth = requestedMonth;
+  const calendar = document.getElementById('site-checkin-calendar');
+  const chart = document.getElementById('site-balance-chart');
+  const notice = document.getElementById('site-analytics-notice');
+  if (calendar) calendar.innerHTML = '<div class="analytics-loading">正在读取签到记录...</div>';
+  if (chart) chart.innerHTML = '<div class="analytics-loading">正在读取余额变化...</div>';
+  if (notice) {
+    notice.hidden = true;
+    notice.textContent = '';
+  }
+
+  try {
+    const data = await apiGet('/api/sites/activity', {
+      site_id: siteId,
+      month: requestedMonth
+    });
+    if (!data || data.error || data.status === 'error') {
+      throw new Error(data?.message || data?.error || '读取站点活动记录失败');
+    }
+    if (
+      !activeAnalyticsSite
+      || getSiteId(activeAnalyticsSite) !== siteId
+      || analyticsMonth !== requestedMonth
+    ) {
+      return;
+    }
+    renderSiteAnalytics(data);
+  } catch (e) {
+    console.error('loadSiteAnalytics error:', e);
+    if (calendar) calendar.innerHTML = '<div class="analytics-empty">暂时无法读取签到记录</div>';
+    if (chart) chart.innerHTML = '<div class="analytics-empty">暂时无法读取余额变化</div>';
+    showToast(e.message || '读取站点活动记录失败', 'error');
+  }
+}
+
+function renderSiteAnalytics(data) {
+  const monthLabel = document.getElementById('site-analytics-month');
+  if (monthLabel) monthLabel.textContent = formatAnalyticsMonth(data.month || analyticsMonth);
+
+  const supportsBalance = data.supports_balance === true
+    || ['new-api', 'one-api'].includes(String(data.site?.type || '').trim().toLowerCase());
+  const balanceSection = document.getElementById('site-balance-section');
+  if (balanceSection) balanceSection.hidden = !supportsBalance;
+
+  const notice = document.getElementById('site-analytics-notice');
+  if (notice) {
+    const truncated = data.history_truncated === true;
+    const limit = Number(data.history_record_limit || 0);
+    notice.hidden = !truncated;
+    notice.textContent = truncated
+      ? `本月日志超过 ${limit.toLocaleString()} 条，仅展示最近记录，统计可能不完整`
+      : '';
+  }
+
+  const summary = document.getElementById('site-analytics-summary');
+  if (summary) {
+    summary.replaceChildren();
+    const summaryItems = [
+      ['本月签到', `${Number(data.success_days || 0)} 天`, 'success'],
+      ['失败记录', `${Number(data.failure_days || 0)} 天`, 'failure'],
+    ];
+    if (supportsBalance) {
+      summaryItems.push([
+        '签到余额(总余额)',
+        formatBalance(data.current_balance !== undefined ? data.current_balance : data.latest_balance),
+        'balance'
+      ]);
+    }
+    summaryItems.forEach(([label, value, className]) => {
+      const item = document.createElement('div');
+      item.className = `analytics-stat ${className}`;
+      const labelElement = document.createElement('span');
+      labelElement.textContent = label;
+      const valueElement = document.createElement('strong');
+      valueElement.textContent = value;
+      item.append(labelElement, valueElement);
+      summary.appendChild(item);
+    });
+  }
+
+  renderSiteCalendar(
+    Array.isArray(data.days) ? data.days : [],
+    data.month || analyticsMonth,
+    supportsBalance ? data.current_balance : null,
+    supportsBalance
+  );
+  renderBalanceHistory(supportsBalance && Array.isArray(data.balance_history) ? data.balance_history : []);
+}
+
+function renderSiteCalendar(days, month, currentBalance = null, showBalance = true) {
+  const container = document.getElementById('site-checkin-calendar');
+  if (!container) return;
+  container.replaceChildren();
+
+  const match = /^(\d{4})-(\d{2})$/.exec(month || '');
+  if (!match) {
+    container.textContent = '月份格式无效';
+    return;
+  }
+  const year = Number(match[1]);
+  const monthNumber = Number(match[2]);
+  const firstDay = (new Date(year, monthNumber - 1, 1).getDay() + 6) % 7;
+  const daysInMonth = new Date(year, monthNumber, 0).getDate();
+  const dayMap = new Map(days.map(day => [day.date, day]));
+
+  const grid = document.createElement('div');
+  grid.className = 'analytics-calendar-grid';
+  ['一', '二', '三', '四', '五', '六', '日'].forEach(label => {
+    const weekday = document.createElement('div');
+    weekday.className = 'analytics-calendar-weekday';
+    weekday.textContent = label;
+    grid.appendChild(weekday);
+  });
+
+  for (let index = 0; index < firstDay; index += 1) {
+    const emptyCell = document.createElement('div');
+    emptyCell.className = 'analytics-calendar-cell is-empty';
+    grid.appendChild(emptyCell);
+  }
+
+  for (let dayNumber = 1; dayNumber <= daysInMonth; dayNumber += 1) {
+    const date = `${year}-${String(monthNumber).padStart(2, '0')}-${String(dayNumber).padStart(2, '0')}`;
+    const record = dayMap.get(date);
+    const cell = document.createElement('div');
+    cell.className = 'analytics-calendar-cell';
+    if (date === getTodayStr()) cell.classList.add('is-today');
+    if (record) cell.classList.add(record.status === 'success' ? 'is-success' : 'is-failure');
+    cell.title = record?.message || (
+      record ? (record.status === 'success' ? '签到成功' : '签到失败') : '当天没有签到记录'
+    );
+
+    const number = document.createElement('span');
+    number.className = 'analytics-calendar-date';
+    number.textContent = String(dayNumber);
+    const marker = document.createElement('span');
+    marker.className = 'analytics-calendar-marker';
+    marker.textContent = record ? (record.status === 'success' ? '✓' : '×') : '·';
+    cell.append(number, marker);
+
+    if (showBalance && record?.balance !== null && record?.balance !== undefined) {
+      const balanceRow = document.createElement('div');
+      balanceRow.className = 'analytics-calendar-balance-row';
+      balanceRow.title = '左侧为本次签到增量，括号内为记录总余额';
+      const gained = document.createElement('small');
+      gained.className = 'analytics-calendar-gain';
+      gained.textContent = formatSignedBalance(record.gained_quota);
+      const displayBalance = date === getTodayStr() && currentBalance !== null && currentBalance !== undefined
+        ? currentBalance
+        : record.balance;
+      const total = document.createElement('small');
+      total.className = 'analytics-calendar-total';
+      total.textContent = `(${formatBalance(displayBalance)})`;
+      balanceRow.append(gained, total);
+      cell.appendChild(balanceRow);
+    }
+    grid.appendChild(cell);
+  }
+  container.appendChild(grid);
+}
+
+function renderBalanceHistory(history) {
+  const chartContainer = document.getElementById('site-balance-chart');
+  const listContainer = document.getElementById('site-balance-list');
+  if (!chartContainer || !listContainer) return;
+  chartContainer.replaceChildren();
+  listContainer.replaceChildren();
+
+  if (history.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'analytics-empty';
+    empty.textContent = '本月没有可用的余额记录';
+    chartContainer.appendChild(empty);
+    return;
+  }
+
+  const chartPoints = history
+    .slice(-60)
+    .filter(item => Number.isFinite(Number(item.balance)));
+  if (chartPoints.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'analytics-empty';
+    empty.textContent = '本月没有可用的数值余额记录';
+    chartContainer.appendChild(empty);
+  } else {
+    const values = chartPoints.map(item => Number(item.balance));
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const span = max - min;
+    const chart = document.createElement('div');
+    chart.className = 'analytics-balance-chart';
+    chartPoints.forEach(item => {
+      const value = Number(item.balance);
+      const column = document.createElement('div');
+      column.className = 'analytics-balance-column';
+      column.title = `${item.timestamp || ''} · ${formatBalance(value)}`;
+      const barTrack = document.createElement('div');
+      barTrack.className = 'analytics-balance-bar-track';
+      const bar = document.createElement('div');
+      bar.className = 'analytics-balance-bar';
+      bar.style.height = `${span === 0 ? 52 : 18 + ((value - min) / span) * 82}%`;
+      barTrack.appendChild(bar);
+      const date = document.createElement('small');
+      date.textContent = String(item.date || '').substring(5);
+      const valueLabel = document.createElement('span');
+      valueLabel.textContent = formatBalance(value);
+      column.append(barTrack, valueLabel, date);
+      chart.appendChild(column);
+    });
+    chartContainer.appendChild(chart);
+  }
+
+  const list = document.createElement('div');
+  list.className = 'analytics-balance-list';
+  history.slice().reverse().forEach(item => {
+    const row = document.createElement('div');
+    row.className = 'analytics-balance-row';
+    const info = document.createElement('div');
+    info.className = 'analytics-balance-info';
+    const timestamp = document.createElement('strong');
+    timestamp.textContent = item.timestamp || '未记录时间';
+    const type = document.createElement('span');
+    type.textContent = getAnalyticsTypeLabel(item.type);
+    info.append(timestamp, type);
+    const value = document.createElement('div');
+    value.className = 'analytics-balance-value';
+    const balance = document.createElement('strong');
+    balance.textContent = formatBalance(item.balance);
+    const change = document.createElement('span');
+    const changeNumber = Number(item.change);
+    change.className = Number.isFinite(changeNumber)
+      ? (changeNumber > 0 ? 'is-increase' : changeNumber < 0 ? 'is-decrease' : 'is-flat')
+      : 'is-first';
+    change.textContent = formatBalanceChange(item.change);
+    value.append(balance, change);
+    row.append(info, value);
+    list.appendChild(row);
+  });
+  listContainer.appendChild(list);
 }
 
 async function toggleSiteEnabled(index, enabled) {
@@ -327,9 +683,13 @@ async function saveSites() {
   }
 }
 
-// Header Dynamic Key-Value Editor Helpers
-function addHeaderRow(key = '', value = '') {
-  const container = document.getElementById('headers-list-container');
+// Header Dynamic Key-Value Editor Helpers (one editor per action)
+function getHeadersContainer(action) {
+  return document.getElementById(`${action}-headers-container`);
+}
+
+function addHeaderRow(action, key = '', value = '') {
+  const container = getHeadersContainer(action);
   if (!container) return;
 
   const row = document.createElement('div');
@@ -337,10 +697,12 @@ function addHeaderRow(key = '', value = '') {
   const keyInput = document.createElement('input');
   keyInput.type = 'text';
   keyInput.className = 'form-control kv-key';
+  keyInput.placeholder = 'Header 名称';
   keyInput.value = key;
   const valueInput = document.createElement('input');
   valueInput.type = 'text';
   valueInput.className = 'form-control kv-value';
+  valueInput.placeholder = 'Header 值';
   valueInput.value = value;
   const removeButton = document.createElement('button');
   removeButton.type = 'button';
@@ -352,40 +714,276 @@ function addHeaderRow(key = '', value = '') {
   container.appendChild(row);
 }
 
-function clearHeaderRows() {
-  const container = document.getElementById('headers-list-container');
-  if (container) container.replaceChildren();
-}
-
-function setHeadersFromText(text) {
-  clearHeaderRows();
-  if (!text) return;
-  const lines = String(text).split('\n');
-  lines.forEach(line => {
-    line = line.trim();
-    if (!line) return;
-    const idx = line.indexOf(':');
-    if (idx > -1) {
-      const k = line.substring(0, idx).trim();
-      const v = line.substring(idx + 1).trim();
-      addHeaderRow(k, v);
-    }
+function setHeaderRows(action, pairs) {
+  const container = getHeadersContainer(action);
+  if (!container) return;
+  container.replaceChildren();
+  (Array.isArray(pairs) ? pairs : []).forEach(pair => {
+    if (pair && pair.key) addHeaderRow(action, pair.key, pair.value ?? '');
   });
 }
 
-function getHeaderPairsText() {
-  const container = document.getElementById('headers-list-container');
-  if (!container) return '';
-  const rows = container.querySelectorAll('.kv-row');
+function getHeaderPairs(action) {
+  const container = getHeadersContainer(action);
+  if (!container) return [];
   const pairs = [];
-  rows.forEach(row => {
+  container.querySelectorAll('.kv-row').forEach(row => {
     const key = row.querySelector('.kv-key')?.value.trim();
-    const val = row.querySelector('.kv-value')?.value.trim();
-    if (key) {
-      pairs.push(`${key}: ${val}`);
-    }
+    const value = row.querySelector('.kv-value')?.value.trim();
+    if (key) pairs.push({ key, value: value || '' });
   });
-  return pairs.join('\n');
+  return pairs;
+}
+
+// Site Modal Tabs
+function switchSiteTab(tab) {
+  document.querySelectorAll('#site-tab-bar .tab-btn').forEach(button => {
+    button.classList.toggle('active', button.dataset.tab === tab);
+  });
+  document.querySelectorAll('#site-modal .tab-panel').forEach(panel => {
+    panel.classList.toggle('active', panel.dataset.panel === tab);
+  });
+}
+
+// Credential Editor
+function nextCredentialId() {
+  credentialSeq += 1;
+  return `cred_${Date.now()}_${credentialSeq}`;
+}
+
+function addCredential(type) {
+  credentialDraft.push({
+    id: nextCredentialId(),
+    type,
+    label: '',
+    value: '',
+    auto_bearer: type === 'token' ? true : undefined,
+    has_session: false
+  });
+  renderCredentials();
+  renderActionCredentialOptions('checkin');
+  renderActionCredentialOptions('balance');
+}
+
+function removeCredential(credentialId) {
+  credentialDraft = credentialDraft.filter(item => item.id !== credentialId);
+  renderCredentials();
+  renderActionCredentialOptions('checkin');
+  renderActionCredentialOptions('balance');
+}
+
+function readCredentialDraftFromDom() {
+  const list = document.getElementById('credentials-list');
+  if (!list) return;
+  list.querySelectorAll('.cred-card').forEach(card => {
+    const credential = credentialDraft.find(item => item.id === card.dataset.credId);
+    if (!credential) return;
+    credential.label = card.querySelector('.cred-label')?.value.trim() || '';
+    credential.value = card.querySelector('.cred-value')?.value.trim() || '';
+    const autoBearer = card.querySelector('.cred-auto-bearer');
+    if (autoBearer) credential.auto_bearer = autoBearer.checked;
+  });
+}
+
+function buildCredentialCard(credential) {
+  const isOauth = OAUTH_TYPES.includes(credential.type);
+  const card = document.createElement('div');
+  card.className = 'cred-card';
+  card.dataset.credId = credential.id;
+
+  const header = document.createElement('div');
+  header.className = 'cred-card-header';
+  const title = document.createElement('div');
+  title.className = 'cred-title';
+  const tag = document.createElement('span');
+  tag.className = `cred-type-tag${isOauth ? ' oauth' : ''}`;
+  tag.textContent = CREDENTIAL_LABELS[credential.type] || credential.type;
+  title.appendChild(tag);
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'btn-icon-danger';
+  remove.title = '删除此凭据';
+  remove.textContent = '×';
+  remove.addEventListener('click', () => {
+    readCredentialDraftFromDom();
+    removeCredential(credential.id);
+  });
+  header.append(title, remove);
+  card.appendChild(header);
+
+  const labelGroup = document.createElement('div');
+  labelGroup.className = 'form-group';
+  const labelText = document.createElement('label');
+  labelText.textContent = '备注名称 (可选)';
+  const labelInput = document.createElement('input');
+  labelInput.type = 'text';
+  labelInput.className = 'form-control cred-label';
+  labelInput.placeholder = '用于在签到/余额页中区分同类凭据';
+  labelInput.value = credential.label || '';
+  labelInput.addEventListener('input', () => {
+    credential.label = labelInput.value.trim();
+    renderActionCredentialOptions('checkin');
+    renderActionCredentialOptions('balance');
+  });
+  labelGroup.append(labelText, labelInput);
+  card.appendChild(labelGroup);
+
+  const valueGroup = document.createElement('div');
+  valueGroup.className = 'form-group';
+  const valueLabel = document.createElement('label');
+  valueLabel.textContent = isOauth ? '第三方会话 Cookie *' : `${CREDENTIAL_LABELS[credential.type]} *`;
+  const valueInput = document.createElement('textarea');
+  valueInput.className = 'form-control cred-value';
+  valueInput.rows = isOauth ? 2 : 3;
+  valueInput.placeholder = isOauth
+    ? OAUTH_COOKIE_HINTS[credential.type] || ''
+    : (credential.type === 'token' ? '粘贴 Access Token' : '例如 session=xxxx; other=yyyy');
+  valueInput.value = credential.value || '';
+  valueGroup.append(valueLabel, valueInput);
+  if (isOauth) {
+    const hint = document.createElement('div');
+    hint.className = 'form-hint';
+    hint.textContent = '插件会用它自动登录，并把站点会话 Cookie 存在此凭据内。';
+    valueGroup.appendChild(hint);
+  }
+  card.appendChild(valueGroup);
+
+  if (credential.type === 'token') {
+    const inlineGroup = document.createElement('div');
+    inlineGroup.className = 'form-group cred-inline-row';
+    const autoLabel = document.createElement('label');
+    autoLabel.className = 'checkbox-label';
+    autoLabel.title = '发送请求时自动加上 Bearer 前缀';
+    const autoInput = document.createElement('input');
+    autoInput.type = 'checkbox';
+    autoInput.className = 'cred-auto-bearer';
+    autoInput.checked = credential.auto_bearer !== false;
+    const autoText = document.createElement('span');
+    autoText.textContent = '自动补全 Bearer';
+    autoLabel.append(autoInput, autoText);
+    inlineGroup.appendChild(autoLabel);
+    card.appendChild(inlineGroup);
+  }
+
+  if (isOauth) {
+    const state = document.createElement('div');
+    const hasSession = credential.has_session === true || Boolean(credential.session_cookie);
+    state.className = `cred-session-state${hasSession ? ' has-session' : ''}`;
+    state.textContent = hasSession
+      ? `站点会话已保存${credential.session_updated_at ? ` (${credential.session_updated_at})` : ''}`
+      : '尚未登录，首次签到时会自动完成 OAuth';
+    card.appendChild(state);
+  }
+
+  return card;
+}
+
+function renderCredentials() {
+  const list = document.getElementById('credentials-list');
+  const count = document.getElementById('credentials-count');
+  if (count) count.textContent = String(credentialDraft.length);
+  if (!list) return;
+  list.replaceChildren();
+  if (credentialDraft.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-text';
+    empty.textContent = '暂无凭据，请从上方按钮添加';
+    list.appendChild(empty);
+    return;
+  }
+  credentialDraft.forEach(credential => list.appendChild(buildCredentialCard(credential)));
+}
+
+// Action credential pickers reflect the credentials currently drafted.
+function renderActionCredentialOptions(action) {
+  const select = document.getElementById(`${action}-credential`);
+  const hint = document.getElementById(`${action}-credential-hint`);
+  if (!select) return;
+
+  const protocol = document.getElementById(`${action}-protocol`)?.value || 'auto';
+  const wantsOauth = action === 'checkin' && protocol === 'oauth';
+  const previous = select.value;
+
+  select.replaceChildren();
+  const auto = document.createElement('option');
+  auto.value = '';
+  auto.textContent = wantsOauth ? '自动（优先 Github，其次 LinuxDO）' : '自动（优先 Token，其次 Cookie）';
+  select.appendChild(auto);
+
+  const usable = credentialDraft.filter(credential =>
+    wantsOauth ? OAUTH_TYPES.includes(credential.type) : true
+  );
+  usable.forEach(credential => {
+    const option = document.createElement('option');
+    option.value = credential.id;
+    const name = CREDENTIAL_LABELS[credential.type] || credential.type;
+    option.textContent = credential.label ? `${name} — ${credential.label}` : name;
+    select.appendChild(option);
+  });
+  select.value = usable.some(item => item.id === previous) ? previous : '';
+
+  if (hint) {
+    if (credentialDraft.length === 0) {
+      hint.textContent = '请先在「凭据」页添加至少一个凭据。';
+    } else if (wantsOauth && usable.length === 0) {
+      hint.textContent = 'OAuth 协议需要一个 Github 或 LinuxDO OAuth 凭据。';
+    } else {
+      hint.textContent = '';
+    }
+  }
+
+  const protocolHint = document.getElementById(`${action}-protocol-hint`);
+  if (protocolHint) {
+    protocolHint.textContent = wantsOauth
+      ? '适用于二次开发后关闭了通用签到端点、只能靠重新登录自动签到的站点：每次签到都会重新走一次 OAuth 登录，而不是复用已保存的会话。'
+      : '';
+  }
+  if (action === 'checkin') renderFrameworkHints();
+}
+
+function renderFrameworkHints() {
+  const type = document.getElementById('site-type')?.value || 'new-api';
+  const defaults = FRAMEWORK_DEFAULTS[type] || FRAMEWORK_DEFAULTS['new-api'];
+  const checkinHint = document.getElementById('checkin-path-hint');
+  const balanceHint = document.getElementById('balance-path-hint');
+  const isOauth = document.getElementById('checkin-protocol')?.value === 'oauth';
+  if (checkinHint) {
+    checkinHint.textContent = isOauth
+      ? '通常留空。若站点仍保留签到端点，登录成功后会继续请求它。'
+      : defaults.checkin;
+  }
+  if (balanceHint) balanceHint.textContent = defaults.balance;
+  ['checkin', 'balance'].forEach(name => {
+    const headerHint = document.getElementById(`${name}-headers-hint`);
+    if (headerHint) headerHint.textContent = defaults.newApiUser;
+  });
+}
+
+function fillActionForm(action, config) {
+  const source = config && typeof config === 'object' ? config : {};
+  const path = document.getElementById(`${action}-path`);
+  const protocol = document.getElementById(`${action}-protocol`);
+  const solve = document.getElementById(`${action}-solve-acw`);
+  if (path) path.value = source.path || '';
+  if (protocol) protocol.value = source.protocol || 'auto';
+  if (solve) solve.checked = source.solve_acw_sc_v2 === true;
+  setHeaderRows(action, source.headers);
+  renderActionCredentialOptions(action);
+  const credential = document.getElementById(`${action}-credential`);
+  if (credential) {
+    const wanted = source.credential_id || '';
+    credential.value = credentialDraft.some(item => item.id === wanted) ? wanted : '';
+  }
+}
+
+function readActionForm(action) {
+  return {
+    path: document.getElementById(`${action}-path`)?.value.trim() || '',
+    protocol: document.getElementById(`${action}-protocol`)?.value || 'auto',
+    credential_id: document.getElementById(`${action}-credential`)?.value || '',
+    headers: getHeaderPairs(action),
+    solve_acw_sc_v2: document.getElementById(`${action}-solve-acw`)?.checked === true
+  };
 }
 
 // Site Form Actions
@@ -396,33 +994,42 @@ function openAddSiteModal() {
   document.getElementById('site-name').value = '';
   document.getElementById('site-type').value = 'new-api';
   document.getElementById('site-url').value = '';
-  document.querySelector('input[name="auth_type"][value="bearer_token"]').checked = true;
-  document.getElementById('site-solve-acw-sc-v2').checked = false;
-  document.getElementById('site-auth-value').value = '';
-  document.getElementById('site-endpoint').value = '';
   document.getElementById('site-proxy').value = '';
-  clearHeaderRows();
   document.getElementById('site-enabled').checked = true;
+  credentialDraft = [];
+  renderCredentials();
+  fillActionForm('checkin', {});
+  fillActionForm('balance', {});
+  renderFrameworkHints();
+  switchSiteTab('basic');
   openModal('site-modal');
 }
 
 function openEditSiteModal(index) {
   const site = sites[index];
   if (!site) return;
+  if (site.locked) {
+    showToast('该站点配置已加密，请先输入密钥解锁', 'warning');
+    return;
+  }
   isEdit = true;
   editIndex = index;
   document.getElementById('site-modal-title').textContent = '编辑中转站';
-  document.getElementById('site-name').value = site.name;
-  document.getElementById('site-type').value = site.type;
-  document.getElementById('site-url').value = site.base_url;
-  const authType = site.auth_type === 'cookie' ? 'cookie' : 'bearer_token';
-  document.querySelector(`input[name="auth_type"][value="${authType}"]`).checked = true;
-  document.getElementById('site-solve-acw-sc-v2').checked = site.solve_acw_sc_v2 === true;
-  document.getElementById('site-auth-value').value = site.auth_value;
-  document.getElementById('site-endpoint').value = site.checkin_endpoint;
-  document.getElementById('site-proxy').value = site.proxy;
-  setHeadersFromText(site.custom_headers);
+  document.getElementById('site-name').value = site.name || '';
+  document.getElementById('site-type').value = site.type || 'new-api';
+  document.getElementById('site-url').value = site.base_url || '';
+  document.getElementById('site-proxy').value = site.proxy || '';
   document.getElementById('site-enabled').checked = site.enabled === true;
+
+  credentialDraft = (Array.isArray(site.credentials) ? site.credentials : []).map(credential => ({
+    ...credential,
+    id: credential.id || nextCredentialId()
+  }));
+  renderCredentials();
+  fillActionForm('checkin', site.checkin);
+  fillActionForm('balance', site.balance);
+  renderFrameworkHints();
+  switchSiteTab('basic');
   openModal('site-modal');
 }
 
@@ -430,32 +1037,63 @@ async function submitSiteForm() {
   const name = document.getElementById('site-name').value.trim();
   const type = document.getElementById('site-type').value;
   const base_url = document.getElementById('site-url').value.trim();
-  const auth_type = document.querySelector('input[name="auth_type"]:checked').value;
-  const solve_acw_sc_v2 = document.getElementById('site-solve-acw-sc-v2').checked;
-  const auth_value = document.getElementById('site-auth-value').value.trim();
-  const checkin_endpoint = document.getElementById('site-endpoint').value.trim();
   const proxy = document.getElementById('site-proxy').value.trim();
-  const custom_headers = getHeaderPairsText();
   const enabled = document.getElementById('site-enabled').checked;
 
-  if (!name || !base_url || !auth_value) {
-    showToast('请补全必要信息', 'warning');
+  if (!name || !base_url) {
+    showToast('请填写站点名称与 Base URL', 'warning');
+    switchSiteTab('basic');
     return;
   }
 
+  readCredentialDraftFromDom();
+  if (credentialDraft.length === 0) {
+    showToast('请至少添加一个凭据', 'warning');
+    switchSiteTab('credentials');
+    return;
+  }
+  const blank = credentialDraft.find(credential => !credential.value);
+  if (blank) {
+    const label = CREDENTIAL_LABELS[blank.type] || '凭据';
+    showToast(`凭据「${blank.label || label}」尚未填写内容`, 'warning');
+    switchSiteTab('credentials');
+    return;
+  }
+
+  const checkin = readActionForm('checkin');
+  if (checkin.protocol === 'oauth' && !credentialDraft.some(c => OAUTH_TYPES.includes(c.type))) {
+    showToast('签到协议为 OAuth，请先添加一个 OAuth 凭据', 'warning');
+    switchSiteTab('checkin');
+    return;
+  }
+
+  const previous = isEdit && editIndex >= 0 ? sites[editIndex] : null;
   const siteData = {
-    id: isEdit ? sites[editIndex].id : 'site_' + Date.now(),
+    id: previous ? previous.id : 'site_' + Date.now(),
     name,
     type,
     base_url,
-    auth_type,
-    solve_acw_sc_v2,
-    auth_value,
-    checkin_endpoint,
     proxy,
-    custom_headers,
+    credentials: credentialDraft.map(credential => {
+      const entry = {
+        id: credential.id,
+        type: credential.type,
+        label: credential.label || '',
+        value: credential.value || ''
+      };
+      if (credential.type === 'token') entry.auto_bearer = credential.auto_bearer !== false;
+      return entry;
+    }),
+    checkin,
+    balance: readActionForm('balance'),
     enabled
   };
+  if (previous) {
+    // Preserve state the dashboard never edits.
+    ['last_checkin_date', 'last_checkin_time', 'last_checkin_success', 'last_quota'].forEach(key => {
+      if (previous[key] !== undefined) siteData[key] = previous[key];
+    });
+  }
 
   if (isEdit && editIndex >= 0) {
     sites[editIndex] = siteData;
@@ -466,6 +1104,7 @@ async function submitSiteForm() {
   renderSitesTable();
   await saveSites();
   closeModal('site-modal');
+  await loadSites();
 }
 
 function deleteSite(index) {
@@ -481,6 +1120,10 @@ function deleteSite(index) {
 async function recheckInSite(index) {
   const site = sites[index];
   if (!site) return false;
+  if (site.locked || isVaultLocked()) {
+    showToast('配置已加密未解锁，请先输入密钥', 'warning');
+    return false;
+  }
   const siteId = getSiteId(site);
 
   const confirmed = await showConfirm(`确定要重新签到“${site.name}”吗？这会再次请求签到接口。`);
@@ -505,6 +1148,10 @@ async function recheckInSite(index) {
 async function testSingleSite(index) {
   const site = sites[index];
   if (!site) return;
+  if (site.locked || isVaultLocked()) {
+    showToast('配置已加密未解锁，请先输入密钥', 'warning');
+    return;
+  }
   try {
     const data = await apiPost('/api/sites/test', site);
     if (data && data.success) {
@@ -512,6 +1159,7 @@ async function testSingleSite(index) {
     } else {
       showToast(`${site.name}: ${data.message || '测试失败'}`, 'error');
     }
+    await loadSites();
     loadLogs();
   } catch (e) {
     showToast('测试请求失败', 'error');
@@ -519,6 +1167,10 @@ async function testSingleSite(index) {
 }
 
 async function runCheckInAll() {
+  if (isVaultLocked()) {
+    showToast('配置已加密未解锁，请先输入密钥', 'warning');
+    return;
+  }
   const btn = document.getElementById('btn-run-all');
   if (btn) {
     btn.disabled = true;
@@ -539,6 +1191,486 @@ async function runCheckInAll() {
   }
 }
 
+// Vault (AES-256-GCM Encryption) Actions
+function applyVaultState(state) {
+  if (state && typeof state === 'object') {
+    vaultState = {
+      enabled: state.enabled === true,
+      unlocked: state.unlocked === true,
+      locked: state.locked === true
+    };
+  }
+  renderVaultUi();
+}
+
+function renderVaultUi() {
+  const banner = document.getElementById('lock-banner');
+  if (banner) banner.style.display = vaultState.locked ? 'flex' : 'none';
+
+  const badge = document.getElementById('vault-badge');
+  if (badge) {
+    badge.style.display = vaultState.enabled ? 'inline-block' : 'none';
+    badge.className = `badge ${vaultState.locked ? 'badge-warning' : 'badge-success'}`;
+    badge.textContent = vaultState.locked ? '已加密 · 锁定' : '已加密 · 已解锁';
+  }
+
+  const toggle = document.getElementById('setting-vault-enabled');
+  if (toggle) toggle.checked = vaultState.enabled;
+
+  const controls = document.getElementById('vault-controls');
+  if (controls) controls.style.display = vaultState.enabled ? 'flex' : 'none';
+
+  const hint = document.getElementById('vault-state-hint');
+  if (hint) {
+    if (!vaultState.enabled) {
+      hint.textContent = '加密凭据、请求头与代理。启用后生成一个仅显示一次的密钥。';
+    } else if (vaultState.locked) {
+      hint.textContent = '已锁定：敏感字段不可读，定时签到会跳过所有站点。';
+    } else {
+      hint.textContent = '已解锁：插件重载后需重新解锁。';
+    }
+  }
+
+  renderKeySlots();
+}
+
+async function loadVaultState() {
+  try {
+    const data = await apiGet('/api/vault');
+    applyVaultState(data);
+  } catch (e) {
+    console.error('loadVaultState error:', e);
+  }
+  await loadKeySlots();
+}
+
+// Key Slot Actions
+async function loadKeySlots() {
+  try {
+    const data = await apiGet('/api/vault/slots');
+    keySlots = Array.isArray(data?.slots) ? data.slots : [];
+  } catch (e) {
+    console.error('loadKeySlots error:', e);
+    keySlots = [];
+  }
+  renderKeySlots();
+}
+
+function renderKeySlots() {
+  const block = document.getElementById('slots-block');
+  if (block) block.style.display = vaultState.enabled ? 'block' : 'none';
+
+  const list = document.getElementById('slots-list');
+  if (!list) return;
+  list.replaceChildren();
+  if (keySlots.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-text';
+    empty.textContent = '暂无槽位';
+    list.appendChild(empty);
+    return;
+  }
+
+  keySlots.forEach(slot => {
+    const card = document.createElement('div');
+    card.className = 'cred-card';
+
+    const header = document.createElement('div');
+    header.className = 'cred-card-header';
+    const title = document.createElement('div');
+    title.className = 'cred-title';
+    const tag = document.createElement('span');
+    tag.className = `cred-type-tag${slot.type === 'webauthn_prf' ? ' oauth' : ''}`;
+    tag.textContent = SLOT_TYPE_LABELS[slot.type] || slot.type;
+    const name = document.createElement('span');
+    name.textContent = slot.label || '未命名';
+    title.append(tag, name);
+    header.appendChild(title);
+
+    if (slot.removable) {
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'btn-icon-danger';
+      remove.title = '删除此槽位';
+      remove.textContent = '×';
+      remove.addEventListener('click', () => removeKeySlot(slot));
+      header.appendChild(remove);
+    } else {
+      const badge = document.createElement('span');
+      badge.className = 'badge badge-info';
+      badge.textContent = '恢复槽位';
+      badge.title = '不可删除，确保丢失通行密钥后仍能解锁';
+      header.appendChild(badge);
+    }
+    card.appendChild(header);
+
+    const meta = document.createElement('div');
+    meta.className = 'cred-session-state';
+    const bits = [];
+    if (slot.rp_id) bits.push(`域名 ${slot.rp_id}`);
+    if (slot.created_at) bits.push(`创建于 ${slot.created_at}`);
+    bits.push(slot.last_used_at ? `最近使用 ${slot.last_used_at}` : '尚未使用');
+    meta.textContent = bits.join(' · ');
+    card.appendChild(meta);
+
+    list.appendChild(card);
+  });
+}
+
+function removeKeySlot(slot) {
+  const name = slot.label || '该槽位';
+  showConfirm(`确定要删除「${name}」吗？该设备将无法再解锁配置。`, async () => {
+    try {
+      const data = await apiPost('/api/vault/slots/remove', { slot_id: slot.id });
+      if (!data || data.status !== 'ok') {
+        showToast(data?.message || '删除槽位失败', 'error');
+        return;
+      }
+      applyVaultState(data.vault);
+      showToast(data.message || '槽位已删除', 'success');
+      await loadKeySlots();
+    } catch (e) {
+      showToast('删除槽位请求失败', 'error');
+    }
+  });
+}
+
+function getPasskeyPageUrl() {
+  // This iframe has an opaque origin, so location.origin reads "null" and
+  // parent.location is unreachable. The document can still read its own
+  // protocol and host, which are the dashboard's — that is enough to build an
+  // absolute URL the user can paste into a new tab.
+  const path = `/api/v1/plugins/extensions/${PLUGIN_ID}/passkey`;
+  const { protocol, host } = window.location;
+  if (host && protocol && protocol !== 'null:') {
+    return `${protocol}//${host}${path}`;
+  }
+  return path;
+}
+
+function openPasskeyModal() {
+  const box = document.getElementById('passkey-url');
+  if (box) box.textContent = getPasskeyPageUrl();
+  clearCopyStatus('passkey-url', 'passkey-url-status');
+  openModal('passkey-modal');
+}
+
+async function copyPasskeyUrl() {
+  await runCopy({
+    boxId: 'passkey-url',
+    statusId: 'passkey-url-status',
+    successText: '地址已复制，请在新标签页中打开',
+    failureTitle: '复制失败，请手动复制下面的地址',
+    noun: '地址'
+  });
+}
+
+/**
+ * Copy a one-shot value and report the outcome inline, next to the value.
+ *
+ * A corner toast is the wrong place for either outcome here: the vault key is
+ * shown exactly once, so a user who misses a failed copy — or who treats a
+ * successful copy as "saved" and closes the dialog before pasting anywhere —
+ * has to reset the vault. Both messages therefore land directly above the
+ * value and stay there until the dialog is reopened.
+ */
+async function runCopy({ boxId, statusId, successText, successNotice, failureTitle, noun }) {
+  const box = document.getElementById(boxId);
+  const value = box?.textContent || '';
+  if (!value) return false;
+
+  const copied = await copyText(value);
+  if (copied) {
+    if (box) box.classList.remove('copy-failed');
+    if (successNotice) {
+      renderCopyStatus(statusId, 'notice', '✓', successNotice.title, successNotice.detail);
+    } else {
+      clearCopyStatus(boxId, statusId);
+    }
+    showToast(successText, 'success');
+    return true;
+  }
+
+  // Select the text so the only remaining step is one keystroke.
+  const selected = selectElementText(box);
+  if (box) box.classList.add('copy-failed');
+  renderCopyStatus(
+    statusId,
+    'error',
+    '!',
+    failureTitle,
+    selected
+      ? `${noun}已选中，按 Ctrl/⌘+C 复制。`
+      : `请选中下面的${noun}并按 Ctrl/⌘+C 复制。`
+  );
+  return false;
+}
+
+/** Render an inline copy status block above a value box. */
+function renderCopyStatus(statusId, variant, iconText, title, detail) {
+  const status = document.getElementById(statusId);
+  if (!status) return;
+  status.replaceChildren();
+  status.className = `copy-status copy-status-${variant}`;
+
+  const icon = document.createElement('span');
+  icon.className = 'copy-status-icon';
+  icon.textContent = iconText;
+
+  const text = document.createElement('div');
+  const heading = document.createElement('strong');
+  heading.textContent = title;
+  const body = document.createElement('span');
+  body.textContent = detail;
+  text.append(heading, body);
+
+  status.append(icon, text);
+  status.style.display = 'flex';
+  status.scrollIntoView({ block: 'nearest' });
+}
+
+/** Reset the copy status state for one value box. */
+function clearCopyStatus(boxId, statusId) {
+  const box = document.getElementById(boxId);
+  const status = document.getElementById(statusId);
+  if (box) box.classList.remove('copy-failed');
+  if (status) {
+    status.className = 'copy-status';
+    status.style.display = 'none';
+    status.replaceChildren();
+  }
+}
+
+/**
+ * Select an element's text so the user only needs to press Ctrl+C.
+ *
+ * Returns whether the selection took, so the failure message can tell the
+ * truth instead of promising a selection that never happened. The check uses
+ * rangeCount/isCollapsed rather than the selection's string value: after the
+ * copy fallback moves focus, the stringified selection can lag by a frame and
+ * would make a successful selection look like a failure.
+ */
+function selectElementText(element) {
+  if (!element) return false;
+  try {
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    const selection = document.getSelection();
+    if (!selection) return false;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return selection.rangeCount > 0 && !selection.isCollapsed;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Copy text to the clipboard, falling back to the legacy command.
+ *
+ * navigator.clipboard is unusable in this page: the dashboard sandboxes plugin
+ * iframes without allow-same-origin, giving them an opaque origin that the
+ * clipboard-write permissions policy (default allowlist "self") can never
+ * match, so writeText always rejects with NotAllowedError. execCommand is
+ * governed by user-gesture rules instead and still works, so it is the one
+ * that actually succeeds here.
+ */
+async function copyText(text) {
+  const value = String(text || '');
+  if (!value) return false;
+
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch (e) {
+      // Expected inside the sandbox; fall through to execCommand.
+    }
+  }
+
+  let textarea = null;
+  try {
+    textarea = document.createElement('textarea');
+    textarea.value = value;
+    textarea.setAttribute('readonly', '');
+    // Keep it off-screen without using display:none, which would make it
+    // unselectable and defeat the copy.
+    textarea.style.position = 'fixed';
+    textarea.style.top = '0';
+    textarea.style.left = '0';
+    textarea.style.width = '1px';
+    textarea.style.height = '1px';
+    textarea.style.padding = '0';
+    textarea.style.border = 'none';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+
+    const selection = document.getSelection();
+    const previousRange = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+
+    textarea.focus();
+    textarea.select();
+    textarea.setSelectionRange(0, value.length);
+    const copied = document.execCommand('copy');
+
+    // Leave the selection in a clean state. Without this it still points into
+    // the textarea we are about to remove, and a later selectElementText()
+    // would silently produce an empty selection.
+    if (selection) {
+      selection.removeAllRanges();
+      if (previousRange) selection.addRange(previousRange);
+    }
+    textarea.blur();
+    return copied;
+  } catch (e) {
+    return false;
+  } finally {
+    if (textarea) textarea.remove();
+  }
+}
+
+function toggleVaultEncryption(input) {
+  const wantsEnabled = input.checked;
+  // The switch only reflects server state; revert it until the call succeeds.
+  input.checked = vaultState.enabled;
+  if (wantsEnabled === vaultState.enabled) return;
+  if (wantsEnabled) {
+    showConfirm(
+      '启用后将使用 AES-256-GCM 加密凭据、自定义请求头与代理地址。密钥只显示一次，丢失后只能重置。是否继续？',
+      enableVault
+    );
+  } else {
+    showConfirm('关闭加密会把所有敏感字段还原为明文保存。是否继续？', disableVault);
+  }
+}
+
+async function enableVault() {
+  try {
+    const data = await apiPost('/api/vault/enable', {});
+    if (!data || data.status !== 'ok' || !data.key) {
+      showToast(data?.message || '启用加密失败', 'error');
+      await loadVaultState();
+      return;
+    }
+    applyVaultState(data.vault);
+    await loadKeySlots();
+    const keyBox = document.getElementById('vault-key-text');
+    if (keyBox) keyBox.textContent = data.key;
+    clearCopyStatus('vault-key-text', 'vault-key-status');
+    openModal('vault-key-modal');
+    await loadSites();
+  } catch (e) {
+    showToast('启用加密请求失败', 'error');
+  }
+}
+
+async function disableVault() {
+  try {
+    const data = await apiPost('/api/vault/disable', {});
+    if (!data || data.status !== 'ok') {
+      showToast(data?.message || '关闭加密失败', 'error');
+      await loadVaultState();
+      return;
+    }
+    applyVaultState(data.vault);
+    await loadKeySlots();
+    showToast(data.message || '加密已关闭', 'success');
+    await loadSites();
+  } catch (e) {
+    showToast('关闭加密请求失败', 'error');
+  }
+}
+
+async function copyVaultKey() {
+  await runCopy({
+    boxId: 'vault-key-text',
+    statusId: 'vault-key-status',
+    successText: '密钥已复制到剪贴板',
+    // Copying is not saving: the clipboard can be overwritten at any moment,
+    // and this key is never shown again.
+    successNotice: {
+      title: '先粘贴保存，再关闭',
+      detail: '密钥不会再次显示，剪贴板随时可能被覆盖。'
+    },
+    failureTitle: '复制失败，请手动复制',
+    noun: '密钥'
+  });
+}
+
+function openUnlockModal() {
+  const input = document.getElementById('vault-unlock-key');
+  if (input) input.value = '';
+  openModal('vault-unlock-modal');
+  if (input) input.focus();
+}
+
+async function submitUnlockVault() {
+  const input = document.getElementById('vault-unlock-key');
+  const key = input ? input.value.trim() : '';
+  if (!key) {
+    showToast('请粘贴密钥', 'warning');
+    return;
+  }
+  try {
+    const data = await apiPost('/api/vault/unlock', { key });
+    if (!data || data.status !== 'ok') {
+      showToast(data?.message || '解锁失败', 'error');
+      return;
+    }
+    applyVaultState(data.vault);
+    if (input) input.value = '';
+    closeModal('vault-unlock-modal');
+    showToast('解锁成功', 'success');
+    await loadSites();
+  } catch (e) {
+    showToast('解锁请求失败', 'error');
+  }
+}
+
+function lockVault() {
+  showConfirm('锁定后需要重新输入密钥才能查看和使用敏感配置，定时签到将暂时跳过所有站点。是否继续？', async () => {
+    try {
+      const data = await apiPost('/api/vault/lock', {});
+      applyVaultState(data?.vault);
+      showToast(data?.message || '已锁定', 'success');
+      await loadSites();
+    } catch (e) {
+      showToast('锁定请求失败', 'error');
+    }
+  });
+}
+
+function openResetVaultModal() {
+  const input = document.getElementById('vault-reset-confirm');
+  if (input) input.value = '';
+  openModal('vault-reset-modal');
+  if (input) input.focus();
+}
+
+async function submitResetVault() {
+  const input = document.getElementById('vault-reset-confirm');
+  if ((input ? input.value.trim().toUpperCase() : '') !== 'RESET') {
+    showToast('请输入 RESET 以确认重置', 'warning');
+    return;
+  }
+  const confirmed = await showConfirm('最后确认：所有站点的凭据、自定义请求头与代理地址都会被清空，且无法恢复。');
+  if (!confirmed) return;
+  try {
+    const data = await apiPost('/api/vault/reset', { confirm: 'reset' });
+    if (!data || data.status !== 'ok') {
+      showToast(data?.message || '重置失败', 'error');
+      return;
+    }
+    applyVaultState(data.vault);
+    await loadKeySlots();
+    closeModal('vault-reset-modal');
+    showToast(data.message || '已重置加密', 'success');
+    await loadSites();
+  } catch (e) {
+    showToast('重置请求失败', 'error');
+  }
+}
+
 // Global Settings Actions
 async function loadSettings() {
   try {
@@ -546,6 +1678,7 @@ async function loadSettings() {
     if (data && typeof data === 'object') {
       settings = { ...settings, ...data };
       renderSettingsForm();
+      applyVaultState(data.vault);
       const badge = document.getElementById('target-time-badge');
       if (badge && data.today_target_time) {
         badge.textContent = data.today_target_time;
@@ -571,6 +1704,7 @@ function renderSettingsForm() {
   }
   renderImpersonateOptions();
   toggleRandomMode();
+  renderVaultUi();
 }
 
 function renderImpersonateOptions() {
@@ -869,10 +2003,20 @@ function clearLogs() {
 
 // Initial Loading
 document.addEventListener('DOMContentLoaded', () => {
+  loadVaultState();
   loadSites();
   loadSettings();
   const logsBody = document.getElementById('logs-body');
   if (logsBody) {
     logsBody.addEventListener('scroll', handleLogsScroll);
+  }
+  const unlockInput = document.getElementById('vault-unlock-key');
+  if (unlockInput) {
+    unlockInput.addEventListener('keydown', event => {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        submitUnlockVault();
+      }
+    });
   }
 });

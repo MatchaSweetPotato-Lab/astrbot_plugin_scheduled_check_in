@@ -13,6 +13,19 @@
     <!-- Toast Notifications -->
     <div id="toast-container" class="toast-container"></div>
 
+    <!-- Locked Vault Banner -->
+    <div id="lock-banner" class="lock-banner" style="display: none;">
+      <div class="lock-banner-text">
+        <strong>配置已加密，当前处于锁定状态</strong>
+        <span>敏感字段已隐藏，签到任务会跳过所有站点。</span>
+      </div>
+      <div class="lock-banner-actions">
+        <button class="btn btn-primary" onclick="openUnlockModal()">输入密钥解锁</button>
+        <button class="btn" onclick="openPasskeyModal()">使用通行密钥</button>
+        <button class="btn btn-danger-plain" onclick="openResetVaultModal()">我忘了 Key</button>
+      </div>
+    </div>
+
     <!-- Header Card -->
     <div class="card">
       <div class="header-content">
@@ -21,6 +34,7 @@
           <div style="display: flex; gap: 12px; align-items: center; margin-top: 4px; flex-wrap: wrap;">
             <p style="margin: 0;">可视化维护中转站配置、检测连通性与每日打卡任务</p>
             <span id="target-time-badge" class="badge badge-info" onclick="openTargetTimeModal()" title="点击修改下次预计签到时间" style="font-size: 13px; padding: 4px 10px; cursor: pointer;">下次预计签到: --:--</span>
+            <span id="vault-badge" class="badge badge-success" onclick="openSettingsModal()" title="点击前往全局设置管理加密" style="font-size: 13px; padding: 4px 10px; cursor: pointer; display: none;">已加密</span>
           </div>
         </div>
         <div class="action-buttons">
@@ -50,14 +64,13 @@
               <th>框架/协议</th>
               <th>Base URL</th>
               <th>今日签到状态</th>
-              <th>凭据 (已脱敏)</th>
               <th>启用</th>
               <th style="text-align: right; padding-right: 24px;">操作</th>
             </tr>
           </thead>
           <tbody id="sites-tbody">
             <tr>
-              <td colspan="7" class="empty-text">加载中...</td>
+              <td colspan="6" class="empty-text">加载中...</td>
             </tr>
           </tbody>
         </table>
@@ -66,69 +79,144 @@
 
     <!-- Add/Edit Site Modal -->
     <div id="site-modal" class="modal-overlay" onclick="handleOverlayClick(event, 'site-modal')">
-      <div class="modal-card">
+      <div class="modal-card modal-card-wide">
         <div class="modal-header">
           <h3 id="site-modal-title">新增中转站</h3>
           <button class="modal-close" onclick="closeModal('site-modal')">&times;</button>
         </div>
+        <div class="tab-bar" id="site-tab-bar">
+          <button type="button" class="tab-btn active" data-tab="basic" onclick="switchSiteTab('basic')">基本</button>
+          <button type="button" class="tab-btn" data-tab="credentials" onclick="switchSiteTab('credentials')">
+            凭据 <span id="credentials-count" class="tab-count">0</span>
+          </button>
+          <button type="button" class="tab-btn" data-tab="checkin" onclick="switchSiteTab('checkin')">签到</button>
+          <button type="button" class="tab-btn" data-tab="balance" onclick="switchSiteTab('balance')">余额</button>
+        </div>
         <div class="modal-body">
-          <div class="form-group">
-            <label>站点名称 *</label>
-            <input type="text" id="site-name" class="form-control" placeholder="例如：公益中转站 A" />
-          </div>
-          <div class="form-group">
-            <label>框架类型</label>
-            <select id="site-type" class="form-control">
-              <option value="new-api">New-API / One-API (主流)</option>
-              <option value="generic_rest">通用 REST API</option>
-            </select>
-          </div>
-          <div class="form-group">
-            <label>Base URL *</label>
-            <input type="text" id="site-url" class="form-control" placeholder="例如：https://api.example.com" />
-          </div>
-          <div class="form-group">
-            <label>鉴权方式</label>
-            <div class="auth-options-row">
-              <div class="radio-group">
-                <label class="radio-label">
-                  <input type="radio" name="auth_type" value="bearer_token" checked /> Bearer Token
-                </label>
-                <label class="radio-label">
-                  <input type="radio" name="auth_type" value="cookie" /> Cookie
-                </label>
-              </div>
-              <label class="checkbox-label" title="遇到阿里云 WAF JavaScript 挑战时，使用纯 Python 解算并自动重试">
-                <input type="checkbox" id="site-solve-acw-sc-v2" />
-                <span>解算acw_sc__v2(Beta)</span>
+          <!-- Tab: 基本 -->
+          <div class="tab-panel active" data-panel="basic">
+            <div class="form-group">
+              <label>站点名称 *</label>
+              <input type="text" id="site-name" class="form-control" placeholder="例如：公益中转站 A" />
+            </div>
+            <div class="form-group">
+              <label>框架类型</label>
+              <select id="site-type" class="form-control" onchange="renderFrameworkHints()">
+                <option value="new-api">New-API / One-API (主流)</option>
+                <option value="generic_rest">通用 REST API</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Base URL *</label>
+              <input type="text" id="site-url" class="form-control" placeholder="例如：https://api.example.com" />
+            </div>
+            <div class="form-group">
+              <label>代理地址 (可选)</label>
+              <input type="text" id="site-proxy" class="form-control" placeholder="例如 http://127.0.0.1:7890 (留空使用系统/AstrBot 代理)" />
+              <div class="form-hint">对该站点全局生效，包括 OAuth 登录访问的 Github / LinuxDO 等第三方域名。</div>
+            </div>
+            <div class="form-group" style="display: flex; align-items: center; justify-content: space-between;">
+              <label style="margin: 0;">默认开启</label>
+              <label class="switch">
+                <input type="checkbox" id="site-enabled" checked />
+                <span class="slider"></span>
               </label>
             </div>
           </div>
-          <div class="form-group">
-            <label>Token/Cookie *</label>
-            <textarea id="site-auth-value" class="form-control" rows="3" placeholder="请输入 Access Token 或 Cookie 凭据"></textarea>
-          </div>
-          <div class="form-group">
-            <label>自定义路径</label>
-            <input type="text" id="site-endpoint" class="form-control" placeholder="可选，例如 /api/user/self (留空自动探测)" />
-          </div>
-          <div class="form-group">
-            <label>代理地址 (可选)</label>
-            <input type="text" id="site-proxy" class="form-control" placeholder="可选，例如 http://127.0.0.1:7890 (留空使用系统/AstrBot 代理)" />
-          </div>
-          <div class="form-group">
-            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
-              <label style="margin: 0;">自定义请求头 (可选)</label>
-              <button type="button" class="btn btn-sm btn-primary-plain" onclick="addHeaderRow()">+ 添加 Header</button>
+
+          <!-- Tab: 凭据 -->
+          <div class="tab-panel" data-panel="credentials">
+            <div class="panel-intro">
+              可添加多个凭据。签到与余额查询未显式指定时，请求类优先 Authorization Token，其次 Cookie；
+              OAuth 类优先 Github，其次 LinuxDO。
             </div>
-            <div id="headers-list-container" class="kv-editor"></div>
+            <div class="add-cred-row">
+              <button type="button" class="btn btn-sm btn-primary-plain" onclick="addCredential('token')">+ Authorization Token</button>
+              <button type="button" class="btn btn-sm btn-primary-plain" onclick="addCredential('cookie')">+ Cookie</button>
+              <button type="button" class="btn btn-sm btn-primary-plain" onclick="addCredential('github_oauth')">+ Github OAuth</button>
+              <button type="button" class="btn btn-sm btn-primary-plain" onclick="addCredential('linuxdo_oauth')">+ LinuxDO OAuth</button>
+            </div>
+            <div id="credentials-list" class="cred-list"></div>
           </div>
-          <div class="form-group" style="display: flex; align-items: center; justify-content: space-between;">
-            <label style="margin: 0;">默认开启</label>
-            <label class="switch">
-              <input type="checkbox" id="site-enabled" checked />
-              <span class="slider"></span>
-            </label>
+
+          <!-- Tab: 签到 -->
+          <div class="tab-panel" data-panel="checkin">
+            <div class="panel-intro">不填写将根据框架探测。</div>
+            <div class="form-group">
+              <label>自定义 Path</label>
+              <input type="text" id="checkin-path" class="form-control" placeholder="留空根据框架适配" />
+              <div class="form-hint" id="checkin-path-hint"></div>
+            </div>
+            <div class="form-group">
+              <label>签到协议</label>
+              <select id="checkin-protocol" class="form-control" onchange="renderActionCredentialOptions('checkin')">
+                <option value="auto">跟随框架</option>
+                <option value="get">GET</option>
+                <option value="post">POST</option>
+                <option value="oauth">OAuth（重新登录签到）</option>
+              </select>
+              <div class="form-hint" id="checkin-protocol-hint"></div>
+            </div>
+            <div class="form-group">
+              <label>使用凭据</label>
+              <select id="checkin-credential" class="form-control">
+                <option value="">按优先级自动选择</option>
+              </select>
+              <div class="form-hint" id="checkin-credential-hint"></div>
+            </div>
+            <div class="form-group">
+              <div class="kv-header">
+                <label style="margin: 0;">自定义请求头 (可选)</label>
+                <button type="button" class="btn btn-sm btn-primary-plain" onclick="addHeaderRow('checkin')">+ 添加 Header</button>
+              </div>
+              <div id="checkin-headers-container" class="kv-editor"></div>
+              <div class="form-hint" id="checkin-headers-hint"></div>
+            </div>
+            <div class="form-group">
+              <label class="checkbox-label" title="遇到阿里云 WAF JavaScript 挑战时，使用纯 Python 解算并自动重试">
+                <input type="checkbox" id="checkin-solve-acw" />
+                <span>解算 acw_sc__v2 (Beta)</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- Tab: 余额 -->
+          <div class="tab-panel" data-panel="balance">
+            <div class="panel-intro">不填写将根据框架探测。</div>
+            <div class="form-group">
+              <label>自定义 Path</label>
+              <input type="text" id="balance-path" class="form-control" placeholder="留空根据框架适配" />
+              <div class="form-hint" id="balance-path-hint"></div>
+            </div>
+            <div class="form-group">
+              <label>查询协议</label>
+              <select id="balance-protocol" class="form-control" onchange="renderActionCredentialOptions('balance')">
+                <option value="auto">跟随框架</option>
+                <option value="get">GET</option>
+                <option value="post">POST</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>使用凭据</label>
+              <select id="balance-credential" class="form-control">
+                <option value="">按优先级自动选择</option>
+              </select>
+              <div class="form-hint" id="balance-credential-hint"></div>
+            </div>
+            <div class="form-group">
+              <div class="kv-header">
+                <label style="margin: 0;">自定义请求头 (可选)</label>
+                <button type="button" class="btn btn-sm btn-primary-plain" onclick="addHeaderRow('balance')">+ 添加 Header</button>
+              </div>
+              <div id="balance-headers-container" class="kv-editor"></div>
+              <div class="form-hint" id="balance-headers-hint"></div>
+            </div>
+            <div class="form-group">
+              <label class="checkbox-label" title="遇到阿里云 WAF JavaScript 挑战时，使用纯 Python 解算并自动重试">
+                <input type="checkbox" id="balance-solve-acw" />
+                <span>解算 acw_sc__v2 (Beta)</span>
+              </label>
+            </div>
           </div>
         </div>
         <div class="modal-footer">
@@ -199,10 +287,128 @@
             <input type="number" id="setting-max-history-records" class="form-control" min="0" max="1000000" step="1" value="0" />
             <div class="form-hint">设为 0 表示不设上限（全部保留）。配置大于 0 时，超出条数的旧日志将被自动清理。</div>
           </div>
+
+          <div class="section-divider">配置加密</div>
+          <div class="form-group" style="display: flex; align-items: center; justify-content: space-between;">
+            <label style="margin: 0;" title="使用 AES-256-GCM 加密凭据、自定义请求头与代理地址">启用 AES-256-GCM 加密</label>
+            <label class="switch">
+              <input type="checkbox" id="setting-vault-enabled" onchange="toggleVaultEncryption(this)" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="form-hint" id="vault-state-hint">加密范围：凭据、自定义请求头、代理地址。</div>
+          <div id="vault-controls" class="vault-controls" style="display: none;">
+            <button type="button" class="btn btn-sm" onclick="lockVault()">立即锁定</button>
+            <button type="button" class="btn btn-sm btn-primary-plain" onclick="openUnlockModal()">输入密钥解锁</button>
+            <button type="button" class="btn btn-sm btn-danger-plain" onclick="openResetVaultModal()">我忘了 Key</button>
+          </div>
+
+          <div id="slots-block" style="display: none;">
+            <div class="kv-header" style="margin-top: 20px;">
+              <label style="margin: 0;">密钥槽位</label>
+              <button type="button" class="btn btn-sm btn-primary-plain" onclick="openPasskeyModal()">管理通行密钥</button>
+            </div>
+            <div id="slots-list" class="cred-list"></div>
+            <div class="form-hint">
+              任意一个槽位都可解密。「用户密钥」为恢复入口，不可删除。
+            </div>
+          </div>
         </div>
         <div class="modal-footer">
           <button class="btn" onclick="closeModal('settings-modal')">取消</button>
           <button class="btn btn-primary" onclick="saveSettings()">保存配置</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Vault Key Reveal Modal -->
+    <div id="vault-key-modal" class="modal-overlay" onclick="handleOverlayClick(event, 'vault-key-modal')">
+      <div class="modal-card" style="max-width: 520px;">
+        <div class="modal-header">
+          <h3>请立即保存密钥</h3>
+          <button class="modal-close" onclick="closeModal('vault-key-modal')">&times;</button>
+        </div>
+        <div class="modal-body">
+          <p class="warn-text">
+            密钥仅显示一次，插件不会保存。丢失后只能重置，重置会清空所有凭据、请求头与代理。
+          </p>
+          <div class="copy-status" id="vault-key-status" style="display: none;"></div>
+          <div class="key-box" id="vault-key-text"></div>
+          <button type="button" class="btn btn-sm btn-primary-plain" onclick="copyVaultKey()">复制密钥</button>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-primary" onclick="closeModal('vault-key-modal')">我已保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Vault Unlock Modal -->
+    <div id="vault-unlock-modal" class="modal-overlay" onclick="handleOverlayClick(event, 'vault-unlock-modal')">
+      <div class="modal-card" style="max-width: 480px;">
+        <div class="modal-header">
+          <h3>输入密钥解锁配置</h3>
+          <button class="modal-close" onclick="closeModal('vault-unlock-modal')">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label>AES-256-GCM 密钥</label>
+            <textarea id="vault-unlock-key" class="form-control" rows="3" placeholder="粘贴启用加密时保存的 Base64 密钥"></textarea>
+          </div>
+          <div class="form-hint">解锁状态仅保留在内存中，插件重载后需要重新输入。</div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" onclick="closeModal('vault-unlock-modal')">取消</button>
+          <button class="btn btn-primary" onclick="submitUnlockVault()">解锁</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Vault Reset Modal -->
+    <div id="vault-reset-modal" class="modal-overlay" onclick="handleOverlayClick(event, 'vault-reset-modal')">
+      <div class="modal-card" style="max-width: 480px;">
+        <div class="modal-header">
+          <h3>重置加密（清空密文）</h3>
+          <button class="modal-close" onclick="closeModal('vault-reset-modal')">&times;</button>
+        </div>
+        <div class="modal-body">
+          <p class="warn-text">
+            重置将<strong>清空所有凭据、请求头与代理</strong>并关闭加密。站点名称、URL、路径与历史日志保留。
+          </p>
+          <div class="form-group">
+            <label>请输入 <code>RESET</code> 以确认</label>
+            <input type="text" id="vault-reset-confirm" class="form-control" placeholder="RESET" autocomplete="off" />
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" onclick="closeModal('vault-reset-modal')">取消</button>
+          <button class="btn btn-danger-plain" onclick="submitResetVault()">确认重置</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Passkey Handoff Modal -->
+    <div id="passkey-modal" class="modal-overlay" onclick="handleOverlayClick(event, 'passkey-modal')">
+      <div class="modal-card" style="max-width: 560px;">
+        <div class="modal-header">
+          <h3>管理通行密钥</h3>
+          <button class="modal-close" onclick="closeModal('passkey-modal')">&times;</button>
+        </div>
+        <div class="modal-body">
+          <p class="warn-text">
+            通行密钥需在<strong>独立标签页</strong>中使用——本页处于沙箱 iframe，浏览器不允许在此调用 WebAuthn。
+          </p>
+          <div class="form-group">
+            <label>请复制下面的地址，在新标签页中打开</label>
+            <div class="copy-status" id="passkey-url-status" style="display: none;"></div>
+            <div class="key-box" id="passkey-url"></div>
+            <button type="button" class="btn btn-sm btn-primary-plain" onclick="copyPasskeyUrl()">复制地址</button>
+          </div>
+          <div class="form-hint">
+            无需再次登录。需通过 HTTPS 或 <code>localhost</code> 访问，纯 HTTP 的局域网 IP 不可用。
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-primary" onclick="closeModal('passkey-modal')">好</button>
         </div>
       </div>
     </div>
@@ -222,6 +428,51 @@
         </div>
       </div>
     </div>
+
+    <!-- Site Check-In Calendar and Balance Modal -->
+    <div id="site-analytics-modal" class="modal-overlay" onclick="handleOverlayClick(event, 'site-analytics-modal')">
+      <div class="modal-card site-analytics-modal-card">
+        <div class="modal-header">
+          <h3 id="site-analytics-title">签到日历</h3>
+          <button class="modal-close" onclick="closeModal('site-analytics-modal')">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="site-analytics-month-toolbar">
+            <button class="btn btn-sm" type="button" onclick="changeAnalyticsMonth(-1)" aria-label="上个月">‹</button>
+            <strong id="site-analytics-month">----</strong>
+            <button class="btn btn-sm" type="button" onclick="changeAnalyticsMonth(1)" aria-label="下个月">›</button>
+          </div>
+          <div id="site-analytics-summary" class="analytics-summary"></div>
+          <div id="site-analytics-notice" class="analytics-notice" hidden></div>
+
+          <section class="analytics-section">
+            <div class="analytics-section-header">
+              <h4>签到日历</h4>
+              <div class="analytics-calendar-legend">
+                <span><i class="legend-dot success"></i>成功</span>
+                <span><i class="legend-dot failure"></i>失败</span>
+              </div>
+            </div>
+            <div id="site-checkin-calendar">
+              <div class="analytics-loading">正在读取签到记录...</div>
+            </div>
+          </section>
+
+          <section id="site-balance-section" class="analytics-section">
+            <div class="analytics-section-header">
+              <h4>余额变化</h4>
+              <span class="analytics-section-hint">按日志中的余额记录统计</span>
+            </div>
+            <div id="site-balance-chart">
+              <div class="analytics-loading">正在读取余额变化...</div>
+            </div>
+            <div id="site-balance-list"></div>
+          </section>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" onclick="closeModal('site-analytics-modal')">关闭</button>
+        </div>
+      </div>
     <!-- Confirm Action Custom Modal -->
     <div id="confirm-modal" class="modal-overlay" onclick="handleOverlayClick(event, 'confirm-modal')">
       <div class="modal-card" style="max-width: 400px;">
