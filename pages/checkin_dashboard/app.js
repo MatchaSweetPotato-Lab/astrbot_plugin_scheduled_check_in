@@ -1836,6 +1836,46 @@ function getLogTitle(log) {
   return '自动定时签到';
 }
 
+/**
+ * Collapse a value to a single short line.
+ * Response bodies can be whole HTML pages or JSON documents, so the overview
+ * flattens every run of whitespace before truncating.
+ */
+function abridge(text, limit = 120) {
+  const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
+  return flat.length > limit ? `${flat.slice(0, limit)}…` : flat;
+}
+
+/** Derive overview counters from a log's per-site results. */
+function summarizeLog(log) {
+  const details = Array.isArray(log?.details) ? log.details : [];
+  let okCount = 0;
+  let totalQuota = 0;
+  let hasQuota = false;
+  const parts = [];
+
+  details.forEach(item => {
+    if (item?.success) okCount += 1;
+    const quota = Number(item?.total_quota);
+    if (Number.isFinite(quota) && quota > 0) {
+      totalQuota += quota;
+      hasQuota = true;
+    }
+    const name = item?.site_name || item?.site_id || '未命名站点';
+    const message = abridge(item?.message, 40);
+    parts.push(message ? `${name}: ${message}` : name);
+  });
+
+  return {
+    okCount,
+    total: details.length,
+    totalQuota: hasQuota ? totalQuota : null,
+    // Built from structured fields rather than log.report, which embeds the
+    // raw station messages verbatim.
+    preview: parts.length ? abridge(parts.join(' · '), 160) : abridge(log?.report, 160)
+  };
+}
+
 function createLogTimelineItem(log) {
   const item = document.createElement('div');
   item.className = 'timeline-item';
@@ -1850,11 +1890,203 @@ function createLogTimelineItem(log) {
   time.textContent = log.timestamp || '';
   header.append(title, time);
 
-  const content = document.createElement('div');
-  content.className = 'timeline-content';
-  content.textContent = log.report || '';
-  item.append(header, content);
+  const stats = summarizeLog(log);
+  const summary = document.createElement('div');
+  summary.className = 'timeline-summary';
+  if (stats.total > 0) {
+    const counts = document.createElement('span');
+    const allOk = stats.okCount === stats.total;
+    counts.className = `badge ${allOk ? 'badge-success' : 'badge-warning'}`;
+    counts.textContent = `成功 ${stats.okCount}/${stats.total}`;
+    summary.appendChild(counts);
+  } else {
+    const empty = document.createElement('span');
+    empty.className = 'badge badge-info';
+    empty.textContent = log.success ? '已完成' : '无站点结果';
+    summary.appendChild(empty);
+  }
+  if (stats.totalQuota !== null) {
+    const balance = document.createElement('span');
+    balance.className = 'badge badge-info';
+    balance.textContent = `总余额 ${formatBalance(stats.totalQuota)}`;
+    summary.appendChild(balance);
+  }
+
+  const preview = document.createElement('div');
+  preview.className = 'timeline-preview';
+  preview.textContent = stats.preview || '无更多信息';
+  preview.title = '点击「查看详情」查看完整报文';
+
+  const actions = document.createElement('div');
+  actions.className = 'timeline-actions';
+  actions.appendChild(
+    createActionButton('查看详情', 'btn-primary-plain', () => openLogDetail(log), false)
+  );
+
+  item.append(header, summary, preview, actions);
   return item;
+}
+
+function createLogDetailBlock(labelText, value, className = '') {
+  const block = document.createElement('div');
+  block.className = `log-detail-block${className ? ` ${className}` : ''}`;
+  const label = document.createElement('div');
+  label.className = 'log-detail-label';
+  label.textContent = labelText;
+  const pre = document.createElement('pre');
+  pre.className = 'log-detail-pre';
+  if (className.includes('log-detail-report') || className.includes('summary')) {
+    pre.classList.add('log-detail-summary');
+  }
+  pre.textContent = value || '';
+  block.append(label, pre);
+  return block;
+}
+
+function createLogAttemptElement(attempt, index) {
+  const item = attempt || {};
+  const attemptElement = document.createElement('div');
+  attemptElement.className = `log-attempt ${item.success === true ? 'success' : 'failed'}`;
+
+  const header = document.createElement('div');
+  header.className = 'log-attempt-header';
+  const step = document.createElement('span');
+  step.className = 'log-attempt-step';
+  step.textContent = item.step || `请求 ${index + 1}`;
+  const status = document.createElement('span');
+  status.className = 'log-attempt-status';
+  status.textContent = item.status !== null && item.status !== undefined
+    ? `HTTP ${item.status}`
+    : '未收到 HTTP 响应';
+  header.append(step, status);
+
+  const url = document.createElement('div');
+  url.className = 'log-attempt-url';
+  url.textContent = `${item.method || ''} ${item.url || ''}`.trim();
+  attemptElement.append(header, url);
+
+  if (item.message) {
+    const message = document.createElement('div');
+    message.className = 'log-detail-message';
+    message.textContent = item.message;
+    attemptElement.appendChild(message);
+  }
+  if (item.error) {
+    const error = document.createElement('div');
+    error.className = 'log-detail-error';
+    error.textContent = `异常：${item.error}`;
+    attemptElement.appendChild(error);
+  }
+  if (item.response) {
+    const responseLength = item.response_length ? `（${item.response_length} 字符）` : '';
+    attemptElement.appendChild(
+      createLogDetailBlock(`响应内容${responseLength}`, item.response)
+    );
+  }
+  return attemptElement;
+}
+
+function createLogResultElement(result, index) {
+  const item = result || {};
+  const resultElement = document.createElement('section');
+  resultElement.className = 'log-detail-result';
+
+  const resultHeader = document.createElement('div');
+  resultHeader.className = 'log-detail-result-header';
+  const siteInfo = document.createElement('div');
+  const site = document.createElement('div');
+  site.className = 'log-detail-site';
+  site.textContent = item.site_name || `站点 ${index + 1}`;
+  const siteId = document.createElement('div');
+  siteId.className = 'log-detail-site-id';
+  siteId.textContent = `ID：${item.site_id || '未记录'}`;
+  siteInfo.append(site, siteId);
+  const resultStatus = document.createElement('div');
+  resultStatus.className = `log-detail-status ${item.success ? 'success' : 'failed'}`;
+  resultStatus.textContent = item.success ? '成功' : (item.expired ? '鉴权失败' : '失败');
+  resultHeader.append(siteInfo, resultStatus);
+  resultElement.appendChild(resultHeader);
+
+  const message = document.createElement('div');
+  message.className = 'log-detail-message';
+  message.textContent = item.message || '未记录结果消息';
+  resultElement.appendChild(message);
+
+  const quota = Number(item.total_quota);
+  if (Number.isFinite(quota) && quota > 0) {
+    const balance = document.createElement('div');
+    balance.className = 'log-detail-balance';
+    balance.textContent = `余额：${formatBalance(quota)}`;
+    resultElement.appendChild(balance);
+  }
+
+  if (item.error_detail) {
+    resultElement.appendChild(
+      createLogDetailBlock('请求摘要', item.error_detail, 'log-detail-summary-block')
+    );
+  }
+
+  const attempts = Array.isArray(item.attempts) ? item.attempts : [];
+  const attemptsLabel = document.createElement('div');
+  attemptsLabel.className = 'log-detail-label log-detail-attempts-label';
+  attemptsLabel.textContent = `请求链路（${attempts.length} 次）`;
+  resultElement.appendChild(attemptsLabel);
+
+  const attemptList = document.createElement('div');
+  attemptList.className = 'log-attempt-list';
+  if (attempts.length > 0) {
+    attempts.forEach((attempt, attemptIndex) => {
+      attemptList.appendChild(createLogAttemptElement(attempt, attemptIndex));
+    });
+  } else {
+    const empty = document.createElement('div');
+    empty.className = 'log-detail-empty';
+    empty.textContent = '该条历史记录没有保存请求级详情（旧版本日志）。';
+    attemptList.appendChild(empty);
+  }
+  resultElement.appendChild(attemptList);
+  return resultElement;
+}
+
+function openLogDetail(log) {
+  if (!log) return;
+  const title = document.getElementById('log-detail-title');
+  const body = document.getElementById('log-detail-body');
+  if (!body) return;
+
+  if (title) title.textContent = `签到日志详情 · ${log.timestamp || ''}`;
+  body.replaceChildren();
+
+  const overview = document.createElement('div');
+  overview.className = 'log-detail-overview';
+  [
+    ['类型', getLogTitle(log)],
+    ['时间', log.timestamp || '未记录']
+  ].forEach(([labelText, value]) => {
+    const field = document.createElement('div');
+    const label = document.createElement('span');
+    label.textContent = labelText;
+    const strong = document.createElement('strong');
+    strong.textContent = value;
+    field.append(label, strong);
+    overview.appendChild(field);
+  });
+  body.appendChild(overview);
+
+  body.appendChild(createLogDetailBlock('汇总', log.report || '未记录汇总', 'log-detail-report'));
+
+  const details = Array.isArray(log.details) ? log.details : [];
+  if (details.length > 0) {
+    details.forEach((result, resultIndex) => {
+      body.appendChild(createLogResultElement(result, resultIndex));
+    });
+  } else {
+    const empty = document.createElement('div');
+    empty.className = 'log-detail-empty';
+    empty.textContent = '这条日志没有站点详情。';
+    body.appendChild(empty);
+  }
+  openModal('log-detail-modal');
 }
 
 function renderLogMessage(container, message) {

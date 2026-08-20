@@ -564,16 +564,6 @@ input:checked + .slider:before {
   color: var(--text-muted);
 }
 
-.timeline-content {
-  font-size: 13px;
-  color: #475569;
-  white-space: pre-wrap;
-  word-break: break-all;
-  overflow-wrap: anywhere;
-  font-family: monospace;
-  margin-top: 6px;
-}
-
 .empty-text {
   text-align: center;
   color: var(--text-muted);
@@ -1435,6 +1425,28 @@ input:checked + .slider:before {
   display: flex;
   justify-content: flex-end;
   margin-top: 10px;
+}
+
+/* Overview row: counters plus an abridged preview. Full report bodies live in
+   the detail modal, so this is capped at two lines and never grows the row. */
+.timeline-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.timeline-preview {
+  font-size: 13px;
+  color: #475569;
+  margin-top: 8px;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  word-break: break-all;
+  overflow-wrap: anywhere;
 }
 
 .log-detail-modal-card {

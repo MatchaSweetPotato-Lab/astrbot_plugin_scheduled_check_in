@@ -429,6 +429,24 @@
       </div>
     </div>
 
+    <!-- Log Detail Modal: full report, per-site results and request traces.
+         The drawer overview only shows an abridged preview, since a response
+         body can be a whole HTML page or JSON document. -->
+    <div id="log-detail-modal" class="modal-overlay" onclick="handleOverlayClick(event, 'log-detail-modal')">
+      <div class="modal-card log-detail-modal-card">
+        <div class="modal-header">
+          <h3 id="log-detail-title">签到日志详情</h3>
+          <button class="modal-close" onclick="closeModal('log-detail-modal')">&times;</button>
+        </div>
+        <div class="modal-body" id="log-detail-body">
+          <div class="empty-text">选择一条日志查看详情</div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn" onclick="closeModal('log-detail-modal')">关闭</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Site Check-In Calendar and Balance Modal -->
     <div id="site-analytics-modal" class="modal-overlay" onclick="handleOverlayClick(event, 'site-analytics-modal')">
       <div class="modal-card site-analytics-modal-card">
@@ -473,6 +491,8 @@
           <button class="btn" onclick="closeModal('site-analytics-modal')">关闭</button>
         </div>
       </div>
+    </div>
+
     <!-- Confirm Action Custom Modal -->
     <div id="confirm-modal" class="modal-overlay" onclick="handleOverlayClick(event, 'confirm-modal')">
       <div class="modal-card" style="max-width: 400px;">
