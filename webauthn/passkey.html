@@ -149,6 +149,9 @@
     const API_BASE = `/api/v1/plugins/extensions/${PLUGIN}`;
 
     let state = { slots: [], rp_id: '', vault: {} };
+    // The RP ID must match the page's own host. A reverse proxy makes the
+    // server's Host header the upstream one, so never trust it for this.
+    const RP_ID = window.location.hostname;
     let busy = false;
 
     // ---------- helpers ----------
@@ -274,11 +277,18 @@
       row.innerHTML = parts.join(' ');
 
       document.getElementById('rp-hint').innerHTML =
-        `当前域名（RP ID）：<code>${state.rp_id || '未知'}</code>。` +
-        '通行密钥与域名绑定，换用其他地址访问时需要为该地址单独注册。';
+        `当前域名（RP ID）：<code>${RP_ID}</code>。` +
+        '通行密钥与域名绑定，换用其他地址访问时需要为该地址单独注册。' +
+        // A mismatch means the reverse proxy is not forwarding the original
+        // host. Harmless here because the page's own value is used, but worth
+        // surfacing since it affects anything else that trusts the header.
+        (state.rp_id && state.rp_id.toLowerCase() !== RP_ID.toLowerCase()
+          ? `<br>服务端从请求头推断的域名是 <code>${state.rp_id}</code>，与本页不一致；`
+            + '已按本页域名注册。如需一致，请让反向代理转发 <code>X-Forwarded-Host</code>。'
+          : '');
 
       const matching = (state.slots || []).filter(
-        slot => slot.type === 'webauthn_prf' && slot.rp_id.toLowerCase() === (state.rp_id || '').toLowerCase()
+        slot => slot.type === 'webauthn_prf' && slot.rp_id.toLowerCase() === RP_ID.toLowerCase()
       );
       document.getElementById('btn-unlock').disabled = !vault.locked || matching.length === 0;
       document.getElementById('btn-register').disabled = !vault.enabled || vault.locked !== false;
@@ -317,7 +327,7 @@
         title.className = 'slot-title';
         const badge = slot.type === 'user_key' ? 'badge-info' : 'badge-success';
         const mismatch = slot.type === 'webauthn_prf'
-          && slot.rp_id.toLowerCase() !== (state.rp_id || '').toLowerCase();
+          && slot.rp_id.toLowerCase() !== RP_ID.toLowerCase();
         title.innerHTML =
           `<span class="badge ${badge}">${TYPE_LABELS[slot.type] || slot.type}</span>` +
           `<span>${slot.label || '未命名'}</span>` +
@@ -350,7 +360,7 @@
 
     async function refresh() {
       try {
-        const data = await api('/api/vault/slots');
+        const data = await api(`/api/vault/slots?rp_id=${encodeURIComponent(RP_ID)}`);
         state = { slots: data.slots || [], rp_id: data.rp_id || '', vault: data.vault || {} };
         renderStatus();
         renderSlots();
@@ -365,12 +375,12 @@
       setBusy(true, 'btn-register');
       banner('ok-banner', '');
       try {
-        const setup = await api('/api/vault/slots/webauthn/begin-register', {});
+        const setup = await api('/api/vault/slots/webauthn/begin-register', { rp_id: RP_ID });
         const saltBytes = b64ToBytes(setup.prf_salt);
 
         const created = await navigator.credentials.create({
           publicKey: {
-            rp: { id: setup.rp_id, name: setup.rp_name },
+            rp: { id: RP_ID, name: setup.rp_name },
             user: {
               id: b64ToBytes(setup.user_id),
               name: setup.user_name || 'astrbot',
@@ -404,7 +414,7 @@
         // The PRF output is fetched with a follow-up assertion on purpose:
         // most authenticators report prf.enabled at create() time but do not
         // return results until an actual get() evaluates the salt.
-        const prfOutput = await evaluatePrf(setup.rp_id, credentialId, saltBytes);
+        const prfOutput = await evaluatePrf(RP_ID, credentialId, saltBytes);
 
         const transports = typeof created.response.getTransports === 'function'
           ? created.response.getTransports()
@@ -415,6 +425,7 @@
           prf_output: prfOutput,
           prf_salt: setup.prf_salt,
           label: document.getElementById('label-input').value.trim(),
+          rp_id: RP_ID,
           transports
         });
         document.getElementById('label-input').value = '';
@@ -460,7 +471,7 @@
       setBusy(true, 'btn-unlock');
       banner('ok-banner', '');
       try {
-        const setup = await api('/api/vault/slots/webauthn/begin-unlock', {});
+        const setup = await api('/api/vault/slots/webauthn/begin-unlock', { rp_id: RP_ID });
         const allowed = setup.allow_credentials || [];
         if (!allowed.length) throw new Error('当前地址没有已注册的通行密钥');
 
@@ -473,7 +484,7 @@
 
         const assertion = await navigator.credentials.get({
           publicKey: {
-            rpId: setup.rp_id,
+            rpId: RP_ID,
             challenge: b64ToBytes(setup.challenge),
             allowCredentials: allowed.map(item => ({
               type: 'public-key',
@@ -530,7 +541,7 @@
       } else if (name === 'InvalidStateError') {
         message = '该认证器已经为本站注册过通行密钥了。';
       } else if (name === 'SecurityError') {
-        message = `域名与 RP ID 不匹配，无法在当前地址（${state.rp_id || '未知'}）完成${action}。`;
+        message = `域名与 RP ID 不匹配，无法在当前地址（${RP_ID}）完成${action}。`;
       } else if (name === 'NotSupportedError') {
         message = '当前浏览器或认证器不支持所需的 WebAuthn 参数。';
       }

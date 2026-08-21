@@ -810,24 +810,65 @@ class ScheduledCheckInPlugin(Star):
     # Key Slot Routes (WebAuthn PRF)
     # ------------------------------------------------------------------
     @staticmethod
-    def _current_rp_id() -> str:
-        """Derive the WebAuthn RP ID from the request Host.
+    @staticmethod
+    def _host_to_rp_id(host: str) -> str:
+        """Reduce a Host-style value to a bare hostname.
 
-        The RP ID must be a bare domain, so the port is stripped. A credential
-        is bound to the RP ID it was created under, which is why each address
-        the dashboard is reached at needs its own slot.
+        The RP ID must be a domain with no port or scheme.
         """
-        host = ""
-        try:
-            host = str(request.headers.get("host") or "").strip()
-        except Exception:
-            host = ""
-        if not host:
+        value = str(host or "").strip()
+        if not value:
             return ""
+        # A forwarding chain is comma separated; the first entry is the client's.
+        value = value.split(",")[0].strip()
+        if "//" in value:
+            value = value.split("//", 1)[1]
+        value = value.split("/", 1)[0]
         # Strip the port, taking care not to break an IPv6 literal.
-        if host.startswith("["):
-            return host.partition("]")[0].lstrip("[").lower()
-        return host.split(":", 1)[0].lower()
+        if value.startswith("["):
+            return value.partition("]")[0].lstrip("[").lower()
+        return value.split(":", 1)[0].lower()
+
+    @classmethod
+    def _current_rp_id(cls, override: Any = None) -> str:
+        """Determine the WebAuthn RP ID for this request.
+
+        A reverse proxy forwards to AstrBot on its own address, so the ``Host``
+        header is the upstream one — deriving the RP ID from it yields something
+        like ``127.0.0.1`` while the browser is really on the public domain, and
+        the credential is then rejected. The page therefore reports its own
+        ``location.hostname``, which is authoritative, and that is preferred
+        over any header. Forwarding headers come next, with ``Host`` last.
+
+        Args:
+            override: Hostname reported by the page, if any.
+
+        Returns:
+            A bare lowercase hostname, or an empty string when undeterminable.
+        """
+        reported = cls._host_to_rp_id(override)
+        if reported:
+            return reported
+
+        try:
+            headers = request.headers
+        except Exception:
+            return ""
+
+        forwarded_host = cls._host_to_rp_id(headers.get("x-forwarded-host"))
+        if forwarded_host:
+            return forwarded_host
+
+        # RFC 7239: Forwarded: for=...;host=example.com;proto=https
+        forwarded = str(headers.get("forwarded") or "")
+        for part in forwarded.split(";"):
+            key, _, value = part.strip().partition("=")
+            if key.strip().lower() == "host":
+                candidate = cls._host_to_rp_id(value.strip().strip('"'))
+                if candidate:
+                    return candidate
+
+        return cls._host_to_rp_id(headers.get("host"))
 
     async def api_get_slots(self) -> Any:
         """Web API: List key slots.
@@ -838,7 +879,13 @@ class ScheduledCheckInPlugin(Star):
         Returns:
             JSON response with the slots and the current RP ID.
         """
-        rp_id = self._current_rp_id()
+        reported = ""
+        try:
+            if hasattr(request, "query") and request.query:
+                reported = request.query.get("rp_id") or ""
+        except Exception:
+            reported = ""
+        rp_id = self._current_rp_id(reported)
         slots = self.db.list_slots()
         return json_response(
             {
@@ -861,7 +908,9 @@ class ScheduledCheckInPlugin(Star):
         """
         if not self.db.vault.unlocked:
             return error_response("请先解锁配置，再注册通行密钥")
-        rp_id = self._current_rp_id()
+        _parsed, body = await _read_json_body()
+        reported = body.get("rp_id") if isinstance(body, dict) else ""
+        rp_id = self._current_rp_id(reported)
         if not rp_id:
             return error_response("无法确定当前域名，无法注册通行密钥")
 
@@ -902,7 +951,7 @@ class ScheduledCheckInPlugin(Star):
                 credential_id=str(body.get("credential_id", "")),
                 prf_output=str(body.get("prf_output", "")),
                 prf_salt=str(body.get("prf_salt", "")),
-                rp_id=self._current_rp_id(),
+                rp_id=self._current_rp_id(body.get("rp_id")),
                 label=str(body.get("label", "")).strip(),
                 transports=body.get("transports"),
             )
@@ -930,7 +979,9 @@ class ScheduledCheckInPlugin(Star):
         Returns:
             JSON response with the ceremony parameters.
         """
-        rp_id = self._current_rp_id()
+        _parsed, body = await _read_json_body()
+        reported = body.get("rp_id") if isinstance(body, dict) else ""
+        rp_id = self._current_rp_id(reported)
         if not rp_id:
             return error_response("无法确定当前域名，无法使用通行密钥")
 
