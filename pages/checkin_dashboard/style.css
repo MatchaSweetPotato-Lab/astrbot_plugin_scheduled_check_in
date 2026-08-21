@@ -444,27 +444,6 @@ input:checked + .slider:before {
   line-height: 1.4;
 }
 
-.radio-group {
-  display: flex;
-  gap: 16px;
-}
-
-.radio-label {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 14px;
-  cursor: pointer;
-}
-
-.auth-options-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  flex-wrap: wrap;
-}
-
 .checkbox-label {
   display: inline-flex;
   align-items: center;
@@ -1415,16 +1394,6 @@ input:checked + .slider:before {
   }
 }
 
-/* Log detail view: per-attempt request trace (from PR #9) */
-.token-mask {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  background-color: #f1f5f9;
-  padding: 3px 8px;
-  border-radius: 4px;
-  font-size: 12px;
-  color: #475569;
-}
-
 .logs-filter-bar {
   padding: 12px 20px;
   border-bottom: 1px solid var(--border);
@@ -1477,32 +1446,6 @@ input:checked + .slider:before {
   display: flex;
   justify-content: flex-end;
   gap: 6px;
-}
-
-.settings-toggle-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-}
-
-.settings-toggle-content {
-  min-width: 0;
-}
-
-.settings-toggle-label {
-  color: #334155;
-  font-size: 14px;
-  font-weight: 500;
-}
-
-.settings-toggle-row > .switch {
-  flex: 0 0 auto;
-  margin-left: 16px;
-}
-
-.settings-dependent-field.is-disabled {
-  opacity: 0.55;
 }
 
 .form-control:disabled {

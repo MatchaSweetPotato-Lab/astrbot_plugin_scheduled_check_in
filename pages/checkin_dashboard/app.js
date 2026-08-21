@@ -64,6 +64,14 @@ const OAUTH_COOKIE_NOTES = {
   linuxdo_oauth: '需要 linux.do 的完整 Cookie（_t、_forum_session）。'
 };
 
+// Github fingerprints the client on each authorize request. A server-side call
+// looks unlike the browser the cookie was issued to, so the session can be
+// invalidated — sometimes logging the user out of github.com as well.
+const OAUTH_COOKIE_VOLATILITY = {
+  github_oauth: 'Github 会对请求环境做检测，服务端发起的授权可能触发风控并使该 Cookie 失效'
+    + '（有时会连带注销浏览器登录）。失效后需重新复制，必要时改用 LinuxDO OAuth 或 Token / Cookie 凭据。'
+};
+
 // Endpoints each framework already knows, shown as placeholder hints.
 const FRAMEWORK_DEFAULTS = {
   'new-api': {
@@ -1035,6 +1043,7 @@ function buildOauthCookieEditor(credential, summaryEl) {
     hidden.value = credential.value;
     if (summaryEl) summaryEl.textContent = credentialSummary(credential);
     const missing = missingCookies(credential.type, credential.value);
+    const volatility = OAUTH_COOKIE_VOLATILITY[credential.type];
     if (!credential.value) {
       status.className = 'form-hint';
       status.textContent = OAUTH_COOKIE_NOTES[credential.type] || '';
@@ -1042,8 +1051,11 @@ function buildOauthCookieEditor(credential, summaryEl) {
       status.className = 'form-hint cred-cookie-warn';
       status.textContent = `缺少 ${missing.join('、')}，授权可能被拒绝`;
     } else {
+      // Complete is not the same as durable, so say so exactly here — this is
+      // the moment the user would otherwise assume it is set up for good.
       status.className = 'form-hint cred-cookie-ok';
-      status.textContent = `已填写全部 ${required.length} 项必需 Cookie`;
+      status.textContent = `已填写全部 ${required.length} 项必需 Cookie`
+        + (volatility ? `。注意：${volatility}` : '');
     }
   };
 

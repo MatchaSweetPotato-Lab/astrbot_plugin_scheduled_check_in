@@ -121,6 +121,12 @@
    登录后用新会话 Cookie 查询余额；额度变化会作为 `额度增加 +$ N` 记入简报，
    否则记为「OAuth 重新登录成功（登录即签到）」。
 
+> **Github 凭据容易失效。** Github 会对请求环境做检测，服务端发起的授权请求与该 Cookie
+> 原本所属的浏览器特征不一致，可能触发风控使 Cookie 失效，**有时会连带注销你在浏览器里的
+> github.com 登录**。表现为签到日志中「Github OAuth 授权」一步返回 302 跳转到
+> `github.com/login`。此时需要重新复制完整 Cookie；若反复失效，建议改用 `LinuxDO OAuth`
+> 或普通的 `Token` / `Cookie` 凭据。这是 Github 侧的策略，插件无法规避。
+
 ### 获取 new-api-user
 
 New-API 用 `new-api-user` 请求头把 Cookie 会话绑定到数字账号 ID。在 **签到** / **余额** 页的

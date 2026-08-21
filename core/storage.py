@@ -13,8 +13,6 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .crypto import (
-    LOCKED_PLACEHOLDER,
-    InvalidVaultKeyError,
     Vault,
     decode_bytes,
     decode_key,
