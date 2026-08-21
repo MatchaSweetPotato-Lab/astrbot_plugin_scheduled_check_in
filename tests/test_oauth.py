@@ -10,6 +10,8 @@ from core.oauth import (
     LINUXDO_OAUTH,
     PROVIDERS,
     OAuthLoginClient,
+    _extract_flow_token,
+    _safe_location,
     get_provider,
 )
 from tests.fakes import FakeResponse, FakeSession
@@ -284,6 +286,148 @@ class FailedLoginTests(unittest.IsolatedAsyncioTestCase):
         result = await make_client(BoomSession({})).login(GITHUB_OAUTH, "user_session=abc")
         self.assertFalse(result.success)
         self.assertIn("dns failure", result.message)
+
+
+class FlowTokenShapeTests(unittest.TestCase):
+    """Forks disagree on where the OAuth state token lives."""
+
+    def test_nested_flow_token(self) -> None:
+        self.assertEqual(_extract_flow_token({"data": {"flow_token": "T"}}), "T")
+
+    def test_nested_aliases(self) -> None:
+        for key in ("state", "token", "oauth_state", "flowToken"):
+            self.assertEqual(_extract_flow_token({"data": {key: "T"}}), "T", key)
+
+    def test_data_as_a_plain_string(self) -> None:
+        self.assertEqual(_extract_flow_token({"success": True, "data": "T"}), "T")
+
+    def test_top_level_keys(self) -> None:
+        self.assertEqual(_extract_flow_token({"flow_token": "T"}), "T")
+        self.assertEqual(_extract_flow_token({"state": "T"}), "T")
+
+    def test_bare_string_response(self) -> None:
+        self.assertEqual(_extract_flow_token("T"), "T")
+
+    def test_unrecognised_shapes_yield_nothing(self) -> None:
+        for payload in ({}, {"data": None}, {"data": {}}, {"data": {"foo": "bar"}}, None, 5, []):
+            self.assertEqual(_extract_flow_token(payload), "", repr(payload))
+
+    def test_blank_values_are_ignored(self) -> None:
+        self.assertEqual(_extract_flow_token({"data": {"flow_token": "   "}}), "")
+
+
+class SafeLocationTests(unittest.TestCase):
+    def test_code_and_state_are_redacted(self) -> None:
+        """A redirect carries the authorization code; it must not be logged."""
+        safe = _safe_location("https://x.test/cb?code=SECRET&state=ALSOSECRET&keep=1")
+        self.assertNotIn("SECRET", safe)
+        self.assertNotIn("ALSOSECRET", safe)
+        self.assertIn("code=***", safe)
+        self.assertIn("state=***", safe)
+        self.assertIn("keep=1", safe)
+
+    def test_plain_url_is_preserved(self) -> None:
+        self.assertEqual(_safe_location("https://x.test/login"), "https://x.test/login")
+
+    def test_empty_input(self) -> None:
+        self.assertEqual(_safe_location(""), "")
+
+
+class FlowTokenFallbackTests(unittest.IsolatedAsyncioTestCase):
+    """Diagnostics and tolerance around the /api/oauth/state endpoint."""
+
+    def _client(self, state_response, trace=None):
+        routes = {
+            ("GET", f"{BASE}/api/status"): FakeResponse(
+                200, '{"data":{"github_oauth":true,"github_client_id":"cid"}}'
+            ),
+            ("POST", f"{BASE}/api/oauth/state"): state_response,
+            ("GET", GITHUB_AUTHORIZE): FakeResponse(
+                302, "", headers={"location": f"{BASE}/api/oauth/github?code=C&state=S"}
+            ),
+            ("GET", f"{BASE}/api/oauth/github"): FakeResponse(
+                200, "{}", cookies={"session": "live"}
+            ),
+        }
+        session = FakeSession(routes)
+        recorder = (lambda **kw: trace.append(kw)) if trace is not None else None
+        return session, OAuthLoginClient(session, BASE, "chrome131", None, on_attempt=recorder)
+
+    async def test_a_string_data_field_still_logs_in(self) -> None:
+        _, client = self._client(FakeResponse(200, '{"success":true,"data":"ABC"}'))
+        result = await client.login(GITHUB_OAUTH, "user_session=x")
+        self.assertTrue(result.success)
+
+    async def test_a_missing_state_endpoint_falls_back_to_a_local_state(self) -> None:
+        """Older stations have no state endpoint and accept a client-chosen one."""
+        for status in (404, 405):
+            session, client = self._client(FakeResponse(status, "not found"))
+            result = await client.login(GITHUB_OAUTH, "user_session=x")
+            self.assertTrue(result.success, status)
+            authorize = session.calls_to("/login/oauth/authorize")[0]
+            self.assertTrue(authorize["params"]["state"])
+
+    async def test_an_unknown_shape_reports_the_body(self) -> None:
+        """The station's own response is the only clue, so surface it."""
+        _, client = self._client(FakeResponse(200, '{"success":true,"data":{"foo":"bar"}}'))
+        result = await client.login(GITHUB_OAUTH, "user_session=x")
+        self.assertFalse(result.success)
+        self.assertIn("flow_token", result.message)
+        self.assertIn('"foo"', result.message)
+
+    async def test_a_station_message_is_preferred_over_the_body(self) -> None:
+        _, client = self._client(FakeResponse(200, '{"success":false,"message":"请求过于频繁"}'))
+        result = await client.login(GITHUB_OAUTH, "user_session=x")
+        self.assertIn("请求过于频繁", result.message)
+
+    async def test_every_leg_is_traced_on_success(self) -> None:
+        trace: list[dict] = []
+        _, client = self._client(FakeResponse(200, '{"data":{"flow_token":"T"}}'), trace)
+        await client.login(GITHUB_OAUTH, "user_session=x")
+        self.assertEqual(
+            [item["step"] for item in trace],
+            ["探测 OAuth 配置", "获取 OAuth state", "Github OAuth 授权", "OAuth 回调"],
+        )
+        self.assertTrue(all(item["success"] for item in trace))
+
+    async def test_the_failing_leg_is_traced(self) -> None:
+        trace: list[dict] = []
+        _, client = self._client(FakeResponse(200, '{"data":{"foo":"bar"}}'), trace)
+        await client.login(GITHUB_OAUTH, "user_session=x")
+        failed = [item for item in trace if item.get("error")]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["step"], "获取 OAuth state")
+        self.assertEqual(failed[0]["status"], 200)
+        self.assertIn('"foo"', failed[0]["response_text"])
+
+    async def test_the_traced_authorize_leg_hides_the_code(self) -> None:
+        trace: list[dict] = []
+        _, client = self._client(FakeResponse(200, '{"data":{"flow_token":"T"}}'), trace)
+        await client.login(GITHUB_OAUTH, "user_session=x")
+        joined = " ".join(str(item) for item in trace)
+        self.assertNotIn("code=C&", joined)
+
+    async def test_tracing_failures_do_not_break_the_login(self) -> None:
+        def boom(**_kwargs):
+            raise RuntimeError("recorder exploded")
+
+        session = FakeSession(
+            {
+                ("GET", f"{BASE}/api/status"): FakeResponse(
+                    200, '{"data":{"github_oauth":true,"github_client_id":"cid"}}'
+                ),
+                ("POST", f"{BASE}/api/oauth/state"): FakeResponse(200, '{"data":{"flow_token":"T"}}'),
+                ("GET", GITHUB_AUTHORIZE): FakeResponse(
+                    302, "", headers={"location": f"{BASE}/api/oauth/github?code=C&state=T"}
+                ),
+                ("GET", f"{BASE}/api/oauth/github"): FakeResponse(
+                    200, "{}", cookies={"session": "live"}
+                ),
+            }
+        )
+        client = OAuthLoginClient(session, BASE, "chrome131", None, on_attempt=boom)
+        result = await client.login(GITHUB_OAUTH, "user_session=x")
+        self.assertTrue(result.success)
 
 
 if __name__ == "__main__":

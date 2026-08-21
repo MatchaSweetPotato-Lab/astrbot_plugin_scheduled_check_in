@@ -398,6 +398,9 @@ class BaseCheckInAdapter(ABC):
             self.base_url,
             self.impersonate,
             self.proxy,
+            # Record every leg, so a login failure is visible in the log detail
+            # view instead of collapsing into a one-line message.
+            on_attempt=self._record_attempt,
         )
         result = await client.login(str(credential.get("type") or ""), credential.get("value"))
         if not result.success:
