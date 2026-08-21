@@ -48,6 +48,15 @@ const CREDENTIAL_LABELS = {
 
 const OAUTH_TYPES = ['github_oauth', 'linuxdo_oauth'];
 
+// Suggested names used when a credential is created. Short on purpose, since
+// they show up in the collapsed card header and the action pickers.
+const DEFAULT_CREDENTIAL_LABELS = {
+  token: 'Token',
+  cookie: 'Cookie',
+  github_oauth: 'Github',
+  linuxdo_oauth: 'LinuxDO'
+};
+
 // The full cookie string is required: Github rejects an authorize request
 // carrying only user_session and redirects to its login page instead.
 const OAUTH_COOKIE_NOTES = {
@@ -759,7 +768,9 @@ function addCredential(type) {
   credentialDraft.push({
     id: nextCredentialId(),
     type,
-    label: '',
+    // Pre-filled from the type so a card is never nameless; the user may edit
+    // or clear it, and an empty label falls back to the type in the pickers.
+    label: DEFAULT_CREDENTIAL_LABELS[type] || CREDENTIAL_LABELS[type] || '',
     value: '',
     auto_bearer: type === 'token' ? true : undefined,
     has_session: false
@@ -1604,6 +1615,30 @@ async function copyPasskeyUrl() {
     failureTitle: '复制失败，请手动复制下面的地址',
     noun: '地址'
   });
+}
+
+/**
+ * Re-read the vault state without reloading the page.
+ *
+ * Unlocking and registering happen in a separate tab, so this dashboard has no
+ * way to learn about it. Rather than making the user reload the whole AstrBot
+ * page, pull the state and repaint everything that depends on it.
+ */
+async function refreshVaultState(options = {}) {
+  const { quiet = false } = options;
+  try {
+    await loadVaultState();
+    await loadSites();
+    if (!quiet) {
+      const locked = isVaultLocked();
+      showToast(locked ? '仍处于锁定状态' : '已同步：配置已解锁', locked ? 'warning' : 'success');
+    }
+    return true;
+  } catch (e) {
+    console.error('refreshVaultState error:', e);
+    if (!quiet) showToast('刷新状态失败', 'error');
+    return false;
+  }
 }
 
 /**
@@ -2579,4 +2614,13 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     });
   }
+
+  // Unlocking happens in another tab, so re-sync on return. Only while locked,
+  // to avoid a request every time the user switches tabs, and quietly, since
+  // the user did not ask for this refresh.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && isVaultLocked()) {
+      refreshVaultState({ quiet: true });
+    }
+  });
 });

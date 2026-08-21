@@ -49,8 +49,17 @@
     .empty { color: var(--text-muted); font-size: 14px; text-align: center; padding: 20px 0; }
     .field { margin-bottom: 14px; }
     label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; }
-    input[type=text] { width: 100%; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 14px; }
-    input[type=text]:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(59,130,246,.12); }
+    input[type=text], input[type=password] { width: 100%; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 14px; line-height: 20px; background: #fff; color: var(--text); }
+    input[type=text]:focus, input[type=password]:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(59,130,246,.12); }
+    input[readonly] { background: #f8fafc; color: var(--text-muted); }
+    /* The key is one long base64 line, so keep it monospaced and give room for
+       the reveal button. */
+    .key-input-row { position: relative; display: flex; }
+    /* flex: 1 is required — as a flex item the input will not grow, and
+       width: 100% resolves against its content size, leaving it tiny. */
+    .key-input-row input { flex: 1; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; padding-right: 64px; }
+    .key-reveal { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); border: none; background: none; color: var(--text-muted); font-size: 12px; cursor: pointer; padding: 4px 8px; border-radius: 6px; }
+    .key-reveal:hover { background: #f1f5f9; color: var(--text); }
     .hint { font-size: 12px; color: var(--text-muted); margin-top: 6px; }
     .toast-wrap { position: fixed; top: 16px; right: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 99; }
     .toast { padding: 11px 16px; border-radius: 8px; font-size: 14px; color: #fff; box-shadow: var(--shadow); max-width: 380px; cursor: pointer; }
@@ -116,9 +125,12 @@
         </div>
         <div class="field">
           <label for="unlock-key">AES-256-GCM 密钥</label>
-          <input type="password" id="unlock-key" name="password"
-                 autocomplete="current-password"
-                 placeholder="粘贴启用加密时保存的 Base64 密钥" />
+          <div class="key-input-row">
+            <input type="password" id="unlock-key" name="password"
+                   autocomplete="current-password"
+                   placeholder="粘贴启用加密时保存的 Base64 密钥" />
+            <button type="button" class="key-reveal" id="key-reveal">显示</button>
+          </div>
         </div>
         <div class="row">
           <button class="btn btn-primary" type="submit" id="btn-unlock-key">解锁</button>
@@ -155,6 +167,28 @@
     let busy = false;
 
     // ---------- helpers ----------
+    // ---------- helpers ----------
+    /**
+     * Guess a device name from the user agent, used to pre-fill the label.
+     * Only a hint — the user can edit or clear it.
+     */
+    function guessDeviceName() {
+      const ua = navigator.userAgent;
+      const platform = /Windows/i.test(ua) ? 'Windows'
+        : /iPhone|iPad/i.test(ua) ? 'iPhone/iPad'
+        : /Android/i.test(ua) ? 'Android'
+        : /Mac OS X/i.test(ua) ? 'Mac'
+        : /Linux/i.test(ua) ? 'Linux'
+        : '';
+      const browser = /Edg\//i.test(ua) ? 'Edge'
+        : /OPR\//i.test(ua) ? 'Opera'
+        : /Firefox\//i.test(ua) ? 'Firefox'
+        : /Chrome\//i.test(ua) ? 'Chrome'
+        : /Safari\//i.test(ua) ? 'Safari'
+        : '';
+      return [platform, browser].filter(Boolean).join(' ') || '我的设备';
+    }
+
     function toast(message, type = 'success', ms = 4000) {
       const el = document.createElement('div');
       el.className = `toast toast-${type}`;
@@ -428,7 +462,9 @@
           rp_id: RP_ID,
           transports
         });
-        document.getElementById('label-input').value = '';
+        // Restore the suggested name rather than emptying the field, so a
+        // second device can be registered without retyping one.
+        document.getElementById('label-input').value = guessDeviceName();
         toast(result.message || '通行密钥已注册', 'success');
         banner('ok-banner', '<strong>注册成功</strong>下次锁定后即可用该设备解锁。');
         await refresh();
@@ -615,6 +651,19 @@
     // deployment rather than overwriting a single shared entry.
     document.getElementById('unlock-account').value = `astrbot-vault@${window.location.host}`;
     document.getElementById('unlock-form').addEventListener('submit', submitKeyUnlock);
+
+    const keyReveal = document.getElementById('key-reveal');
+    keyReveal.addEventListener('click', () => {
+      const input = document.getElementById('unlock-key');
+      const hidden = input.type === 'password';
+      input.type = hidden ? 'text' : 'password';
+      keyReveal.textContent = hidden ? '隐藏' : '显示';
+      input.focus();
+    });
+
+    // Pre-fill a guessed device name so the field is never empty on registration.
+    // The user can edit or clear it; an empty label is accepted.
+    document.getElementById('label-input').value = guessDeviceName();
     checkEnvironment();
     refresh();
   </script>

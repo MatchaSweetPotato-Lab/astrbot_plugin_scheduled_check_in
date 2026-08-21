@@ -22,6 +22,7 @@
       <div class="lock-banner-actions">
         <button class="btn btn-primary" onclick="openUnlockModal()">输入密钥解锁</button>
         <button class="btn" onclick="openPasskeyModal()">使用通行密钥</button>
+        <button class="btn" onclick="refreshVaultState()" title="在独立页面解锁后，点此同步状态">刷新状态</button>
         <button class="btn btn-danger-plain" onclick="openResetVaultModal()">我忘了 Key</button>
       </div>
     </div>
@@ -414,7 +415,8 @@
           </div>
         </div>
         <div class="modal-footer">
-          <button class="btn btn-primary" onclick="closeModal('passkey-modal')">好</button>
+          <button class="btn" onclick="refreshVaultState()">刷新状态</button>
+          <button class="btn btn-primary" onclick="closeModal('passkey-modal')">了解</button>
         </div>
       </div>
     </div>
