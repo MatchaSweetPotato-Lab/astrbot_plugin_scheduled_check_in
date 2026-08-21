@@ -28,7 +28,9 @@ def github_routes(overrides: dict | None = None) -> dict:
         ("GET", f"{BASE}/api/status"): FakeResponse(
             200, '{"data":{"github_oauth":true,"github_client_id":"cid-1"}}'
         ),
-        ("POST", f"{BASE}/api/oauth/state"): FakeResponse(200, '{"data":{"flow_token":"flow-1"}}'),
+        ("GET", f"{BASE}/api/oauth/state"): FakeResponse(
+            200, '{"success":true,"data":"flow-1"}', cookies={"session": "srv"}
+        ),
         ("GET", GITHUB_AUTHORIZE): FakeResponse(
             302, "", headers={"location": f"{BASE}/oauth/github?code=CODE-1&state=flow-1"}
         ),
@@ -109,11 +111,12 @@ class SuccessfulLoginTests(unittest.IsolatedAsyncioTestCase):
         exchange = session.calls_to("/api/oauth/github")[0]
         self.assertEqual(exchange["params"], {"code": "CODE-1", "state": "flow-1"})
 
-    async def test_state_request_declares_a_login_intent(self) -> None:
+    async def test_the_state_request_names_the_provider(self) -> None:
         session = FakeSession(github_routes())
         await make_client(session).login(GITHUB_OAUTH, "user_session=abc")
         state_call = session.calls_to("/api/oauth/state")[0]
-        self.assertEqual(state_call["json"], {"provider": "github", "intent": "login"})
+        self.assertEqual(state_call["method"], "GET")
+        self.assertEqual(state_call["params"], {"provider": "github"})
 
     async def test_the_proxy_applies_to_every_leg(self) -> None:
         session = FakeSession(github_routes())
@@ -137,7 +140,7 @@ class SuccessfulLoginTests(unittest.IsolatedAsyncioTestCase):
                 ("GET", f"{BASE}/api/status"): FakeResponse(
                     200, '{"data":{"linuxdo_oauth":true,"linuxdo_client_id":"cid-2"}}'
                 ),
-                ("POST", f"{BASE}/api/oauth/state"): FakeResponse(200, '{"data":{"flow_token":"f"}}'),
+                ("GET", f"{BASE}/api/oauth/state"): FakeResponse(200, '{"data":"f"}'),
                 ("GET", LINUXDO_AUTHORIZE): FakeResponse(
                     302, "", headers={"location": f"{BASE}/api/oauth/linuxdo?code=C&state=f"}
                 ),
@@ -208,7 +211,7 @@ class FailedLoginTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession(
             github_routes(
                 {
-                    ("POST", f"{BASE}/api/oauth/state"): FakeResponse(
+                    ("GET", f"{BASE}/api/oauth/state"): FakeResponse(
                         200, '{"success":false,"message":"频率过高"}'
                     )
                 }
@@ -344,7 +347,7 @@ class FlowTokenFallbackTests(unittest.IsolatedAsyncioTestCase):
             ("GET", f"{BASE}/api/status"): FakeResponse(
                 200, '{"data":{"github_oauth":true,"github_client_id":"cid"}}'
             ),
-            ("POST", f"{BASE}/api/oauth/state"): state_response,
+            ("GET", f"{BASE}/api/oauth/state"): state_response,
             ("GET", GITHUB_AUTHORIZE): FakeResponse(
                 302, "", headers={"location": f"{BASE}/api/oauth/github?code=C&state=S"}
             ),
@@ -365,6 +368,7 @@ class FlowTokenFallbackTests(unittest.IsolatedAsyncioTestCase):
         """Older stations have no state endpoint and accept a client-chosen one."""
         for status in (404, 405):
             session, client = self._client(FakeResponse(status, "not found"))
+            session.routes[("POST", f"{BASE}/api/oauth/state")] = FakeResponse(status, "not found")
             result = await client.login(GITHUB_OAUTH, "user_session=x")
             self.assertTrue(result.success, status)
             authorize = session.calls_to("/login/oauth/authorize")[0]
@@ -375,7 +379,7 @@ class FlowTokenFallbackTests(unittest.IsolatedAsyncioTestCase):
         _, client = self._client(FakeResponse(200, '{"success":true,"data":{"foo":"bar"}}'))
         result = await client.login(GITHUB_OAUTH, "user_session=x")
         self.assertFalse(result.success)
-        self.assertIn("flow_token", result.message)
+        self.assertIn("state", result.message)
         self.assertIn('"foo"', result.message)
 
     async def test_a_station_message_is_preferred_over_the_body(self) -> None:
@@ -521,6 +525,100 @@ class RejectedSessionMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertIn("完整 Cookie", result.message)
         self.assertIn("__Host-user_session_same_site", result.message)
+
+
+class StateEndpointMethodTests(unittest.IsolatedAsyncioTestCase):
+    """The state endpoint's verb and its session cookie both matter."""
+
+    @staticmethod
+    def _routes(state_routes: dict) -> dict:
+        routes = {
+            ("GET", f"{BASE}/api/status"): FakeResponse(
+                200, '{"data":{"github_oauth":true,"github_client_id":"cid"}}'
+            ),
+            ("GET", GITHUB_AUTHORIZE): FakeResponse(
+                302, "", headers={"location": f"{BASE}/api/oauth/github?code=C&state=S"}
+            ),
+            ("GET", f"{BASE}/api/oauth/github"): FakeResponse(
+                200, "{}", cookies={"session": "final"}
+            ),
+        }
+        routes.update(state_routes)
+        return routes
+
+    async def test_get_is_tried_before_post(self) -> None:
+        """Classic one-api registers the state route under GET only."""
+        session = FakeSession(self._routes({
+            ("GET", f"{BASE}/api/oauth/state"): FakeResponse(200, '{"data":"S"}'),
+        }))
+        result = await make_client(session).login(GITHUB_OAUTH, "user_session=abc")
+        self.assertTrue(result.success)
+        self.assertEqual(session.calls_to("/api/oauth/state")[0]["method"], "GET")
+        self.assertEqual(session.count_to("/api/oauth/state"), 1)
+
+    async def test_post_is_used_when_get_is_not_registered(self) -> None:
+        session = FakeSession(self._routes({
+            ("GET", f"{BASE}/api/oauth/state"): FakeResponse(
+                404, '{"error":{"message":"Invalid URL (GET /api/oauth/state)"}}'
+            ),
+            ("POST", f"{BASE}/api/oauth/state"): FakeResponse(200, '{"data":{"flow_token":"S"}}'),
+        }))
+        result = await make_client(session).login(GITHUB_OAUTH, "user_session=abc")
+        self.assertTrue(result.success)
+        methods = [call["method"] for call in session.calls_to("/api/oauth/state")]
+        self.assertEqual(methods, ["GET", "POST"])
+
+    async def test_the_state_session_cookie_reaches_the_callback(self) -> None:
+        """Without it the station compares against an empty session and answers
+        "state is empty or not same"."""
+        session = FakeSession(self._routes({
+            ("GET", f"{BASE}/api/oauth/state"): FakeResponse(
+                200, '{"data":"S"}', cookies={"session": "srv-side"}
+            ),
+        }))
+        await make_client(session).login(GITHUB_OAUTH, "user_session=abc")
+        callback = session.calls_to("/api/oauth/github")[0]
+        self.assertEqual(callback["headers"]["Cookie"], "session=srv-side")
+
+    async def test_the_same_state_is_sent_to_provider_and_callback(self) -> None:
+        session = FakeSession(self._routes({
+            ("GET", f"{BASE}/api/oauth/state"): FakeResponse(200, '{"data":"THE-STATE"}'),
+        }))
+        await make_client(session).login(GITHUB_OAUTH, "user_session=abc")
+        authorize = session.calls_to("/login/oauth/authorize")[0]
+        callback = session.calls_to("/api/oauth/github")[0]
+        self.assertEqual(authorize["params"]["state"], "THE-STATE")
+        self.assertEqual(callback["params"]["state"], "THE-STATE")
+
+    async def test_no_cookie_header_when_the_station_sets_none(self) -> None:
+        session = FakeSession(self._routes({
+            ("GET", f"{BASE}/api/oauth/state"): FakeResponse(200, '{"data":"S"}', cookies={}),
+        }))
+        await make_client(session).login(GITHUB_OAUTH, "user_session=abc")
+        callback = session.calls_to("/api/oauth/github")[0]
+        self.assertNotIn("Cookie", callback["headers"] or {})
+
+    async def test_a_rejected_state_is_reported_verbatim(self) -> None:
+        """The station's own wording is the clearest diagnosis."""
+        session = FakeSession(self._routes({
+            ("GET", f"{BASE}/api/oauth/state"): FakeResponse(200, '{"data":"S"}'),
+            ("GET", f"{BASE}/api/oauth/github"): FakeResponse(
+                403, '{"message":"state is empty or not same","success":false}', cookies={}
+            ),
+        }))
+        result = await make_client(session).login(GITHUB_OAUTH, "user_session=abc")
+        self.assertFalse(result.success)
+        self.assertIn("state is empty or not same", result.message)
+
+    async def test_both_verbs_missing_falls_back_to_a_local_state(self) -> None:
+        session = FakeSession(self._routes({
+            ("GET", f"{BASE}/api/oauth/state"): FakeResponse(404, "nope"),
+            ("POST", f"{BASE}/api/oauth/state"): FakeResponse(404, "nope"),
+        }))
+        result = await make_client(session).login(GITHUB_OAUTH, "user_session=abc")
+        self.assertTrue(result.success)
+        authorize = session.calls_to("/login/oauth/authorize")[0]
+        self.assertTrue(authorize["params"]["state"])
 
 
 if __name__ == "__main__":

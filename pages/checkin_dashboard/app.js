@@ -48,14 +48,8 @@ const CREDENTIAL_LABELS = {
 
 const OAUTH_TYPES = ['github_oauth', 'linuxdo_oauth'];
 
-// Placeholder and hint text for OAuth credentials. The full cookie string is
-// required: Github rejects an authorize request carrying only user_session and
-// redirects to its login page instead.
-const OAUTH_COOKIE_HINTS = {
-  github_oauth: '粘贴 github.com 的完整 Cookie，例如 user_session=…; __Host-user_session_same_site=…; _gh_sess=…',
-  linuxdo_oauth: '粘贴 linux.do 的完整 Cookie，例如 _t=…; _forum_session=…'
-};
-
+// The full cookie string is required: Github rejects an authorize request
+// carrying only user_session and redirects to its login page instead.
 const OAUTH_COOKIE_NOTES = {
   github_oauth: '需要 github.com 的完整 Cookie（user_session、__Host-user_session_same_site、_gh_sess、logged_in），仅有 user_session 会被 Github 拒绝。',
   linuxdo_oauth: '需要 linux.do 的完整 Cookie（_t、_forum_session）。'
@@ -795,32 +789,126 @@ function readCredentialDraftFromDom() {
   });
 }
 
+// Cookies each OAuth provider needs, mirroring core/oauth.py PROVIDERS.
+const OAUTH_REQUIRED_COOKIES = {
+  github_oauth: ['user_session', '__Host-user_session_same_site', '_gh_sess', 'logged_in'],
+  linuxdo_oauth: ['_t', '_forum_session']
+};
+
+const OAUTH_COOKIE_DOMAIN = {
+  github_oauth: 'github.com',
+  linuxdo_oauth: 'connect.linux.do'
+};
+
+/** Parse a raw Cookie header into an ordered name/value map. */
+function parseCookieString(raw) {
+  const jar = {};
+  String(raw || '').split(';').forEach(part => {
+    const index = part.indexOf('=');
+    if (index <= 0) return;
+    const name = part.slice(0, index).trim();
+    if (name) jar[name] = part.slice(index + 1).trim();
+  });
+  return jar;
+}
+
+function buildCookieString(jar) {
+  return Object.entries(jar)
+    .filter(([name, value]) => name && value)
+    .map(([name, value]) => `${name}=${value}`)
+    .join('; ');
+}
+
+/**
+ * Pull the Cookie header out of a pasted "Copy as cURL" command.
+ * Chrome emits -H 'Cookie: ...', PowerShell copies use double quotes, and
+ * newer Chrome uses -b 'Cookie'. All three are accepted.
+ */
+function extractCookieFromCurl(text) {
+  const raw = String(text || '');
+  if (!/\bcurl\b/i.test(raw)) return '';
+  const patterns = [
+    /-H\s+'cookie:\s*([^']*)'/i,
+    /-H\s+"cookie:\s*((?:[^"\\]|\\.)*)"/i,
+    /-b\s+'([^']*)'/i,
+    /-b\s+"((?:[^"\\]|\\.)*)"/i
+  ];
+  for (const pattern of patterns) {
+    const match = raw.match(pattern);
+    if (match) return match[1].replace(/\\"/g, '"').trim();
+  }
+  return '';
+}
+
+/** Describe which required cookies are absent from a cookie string. */
+function missingCookies(type, value) {
+  const required = OAUTH_REQUIRED_COOKIES[type] || [];
+  const jar = parseCookieString(value);
+  return required.filter(name => !jar[name]);
+}
+
+function credentialSummary(credential) {
+  if (OAUTH_TYPES.includes(credential.type)) {
+    if (!credential.value) return '未填写';
+    const missing = missingCookies(credential.type, credential.value);
+    return missing.length ? `缺少 ${missing.length} 项 Cookie` : 'Cookie 完整';
+  }
+  if (!credential.value) return '未填写';
+  const text = String(credential.value);
+  return text.length <= 10 ? '******' : `${text.slice(0, 4)}***${text.slice(-4)}`;
+}
+
 function buildCredentialCard(credential) {
   const isOauth = OAUTH_TYPES.includes(credential.type);
   const card = document.createElement('div');
-  card.className = 'cred-card';
+  card.className = 'cred-card collapsed';
   card.dataset.credId = credential.id;
 
+  // ---------- header (always visible, toggles the body) ----------
   const header = document.createElement('div');
   header.className = 'cred-card-header';
-  const title = document.createElement('div');
-  title.className = 'cred-title';
+
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'cred-toggle';
+  toggle.setAttribute('aria-expanded', 'false');
+
+  const caret = document.createElement('span');
+  caret.className = 'cred-caret';
+  caret.textContent = '▸';
   const tag = document.createElement('span');
   tag.className = `cred-type-tag${isOauth ? ' oauth' : ''}`;
   tag.textContent = CREDENTIAL_LABELS[credential.type] || credential.type;
-  title.appendChild(tag);
+  const name = document.createElement('span');
+  name.className = 'cred-name';
+  name.textContent = credential.label || '未命名';
+  const summary = document.createElement('span');
+  summary.className = 'cred-summary';
+  summary.textContent = credentialSummary(credential);
+  toggle.append(caret, tag, name, summary);
+
   const remove = document.createElement('button');
   remove.type = 'button';
   remove.className = 'btn-icon-danger';
   remove.title = '删除此凭据';
   remove.textContent = '×';
-  remove.addEventListener('click', () => {
+  remove.addEventListener('click', event => {
+    event.stopPropagation();
     readCredentialDraftFromDom();
     removeCredential(credential.id);
   });
-  header.append(title, remove);
+  header.append(toggle, remove);
   card.appendChild(header);
 
+  const body = document.createElement('div');
+  body.className = 'cred-card-body';
+  toggle.addEventListener('click', () => {
+    const collapsed = card.classList.toggle('collapsed');
+    caret.textContent = collapsed ? '▸' : '▾';
+    toggle.setAttribute('aria-expanded', String(!collapsed));
+  });
+
+  // ---------- label ----------
   const labelGroup = document.createElement('div');
   labelGroup.className = 'form-group';
   const labelText = document.createElement('label');
@@ -832,32 +920,35 @@ function buildCredentialCard(credential) {
   labelInput.value = credential.label || '';
   labelInput.addEventListener('input', () => {
     credential.label = labelInput.value.trim();
+    name.textContent = credential.label || '未命名';
     renderActionCredentialOptions('checkin');
     renderActionCredentialOptions('balance');
   });
   labelGroup.append(labelText, labelInput);
-  card.appendChild(labelGroup);
+  body.appendChild(labelGroup);
 
-  const valueGroup = document.createElement('div');
-  valueGroup.className = 'form-group';
-  const valueLabel = document.createElement('label');
-  valueLabel.textContent = isOauth ? '第三方会话 Cookie *' : `${CREDENTIAL_LABELS[credential.type]} *`;
-  const valueInput = document.createElement('textarea');
-  valueInput.className = 'form-control cred-value';
-  valueInput.rows = isOauth ? 3 : 3;
-  valueInput.placeholder = isOauth
-    ? OAUTH_COOKIE_HINTS[credential.type] || ''
-    : (credential.type === 'token' ? '粘贴 Access Token' : '例如 session=xxxx; other=yyyy');
-  valueInput.value = credential.value || '';
-  valueGroup.append(valueLabel, valueInput);
+  // ---------- value ----------
   if (isOauth) {
-    const hint = document.createElement('div');
-    hint.className = 'form-hint';
-    hint.textContent = OAUTH_COOKIE_NOTES[credential.type]
-      || '插件会用它自动登录，并把站点会话 Cookie 存在此凭据内。';
-    valueGroup.appendChild(hint);
+    body.appendChild(buildOauthCookieEditor(credential, summary));
+  } else {
+    const valueGroup = document.createElement('div');
+    valueGroup.className = 'form-group';
+    const valueLabel = document.createElement('label');
+    valueLabel.textContent = `${CREDENTIAL_LABELS[credential.type]} *`;
+    const valueInput = document.createElement('textarea');
+    valueInput.className = 'form-control cred-value';
+    valueInput.rows = 3;
+    valueInput.placeholder = credential.type === 'token'
+      ? '粘贴 Access Token'
+      : '例如 session=xxxx; other=yyyy';
+    valueInput.value = credential.value || '';
+    valueInput.addEventListener('input', () => {
+      credential.value = valueInput.value.trim();
+      summary.textContent = credentialSummary(credential);
+    });
+    valueGroup.append(valueLabel, valueInput);
+    body.appendChild(valueGroup);
   }
-  card.appendChild(valueGroup);
 
   if (credential.type === 'token') {
     const inlineGroup = document.createElement('div');
@@ -873,7 +964,7 @@ function buildCredentialCard(credential) {
     autoText.textContent = '自动补全 Bearer';
     autoLabel.append(autoInput, autoText);
     inlineGroup.appendChild(autoLabel);
-    card.appendChild(inlineGroup);
+    body.appendChild(inlineGroup);
   }
 
   if (isOauth) {
@@ -883,10 +974,149 @@ function buildCredentialCard(credential) {
     state.textContent = hasSession
       ? `站点会话已保存${credential.session_updated_at ? ` (${credential.session_updated_at})` : ''}`
       : '尚未登录，首次签到时会自动完成 OAuth';
-    card.appendChild(state);
+    body.appendChild(state);
   }
 
+  card.appendChild(body);
   return card;
+}
+
+/**
+ * Cookie editor with two interchangeable modes: one field per required cookie,
+ * or a single box accepting a full Cookie header or a pasted cURL command.
+ * Both write the same normalized string to `.cred-value`.
+ */
+function buildOauthCookieEditor(credential, summaryEl) {
+  const wrap = document.createElement('div');
+  wrap.className = 'form-group cred-cookie-editor';
+
+  const headerRow = document.createElement('div');
+  headerRow.className = 'kv-header';
+  const label = document.createElement('label');
+  label.style.margin = '0';
+  label.textContent = `${OAUTH_COOKIE_DOMAIN[credential.type] || '第三方'} Cookie *`;
+  const modes = document.createElement('div');
+  modes.className = 'cred-mode-switch';
+  headerRow.append(label, modes);
+  wrap.appendChild(headerRow);
+
+  // The canonical value lives here; both modes keep it in sync.
+  const hidden = document.createElement('textarea');
+  hidden.className = 'cred-value';
+  hidden.hidden = true;
+  hidden.value = credential.value || '';
+  wrap.appendChild(hidden);
+
+  const formPane = document.createElement('div');
+  formPane.className = 'cred-cookie-form';
+  const rawPane = document.createElement('div');
+  rawPane.className = 'cred-cookie-raw';
+  rawPane.style.display = 'none';
+
+  const required = OAUTH_REQUIRED_COOKIES[credential.type] || [];
+  const fields = {};
+
+  const status = document.createElement('div');
+  status.className = 'form-hint';
+
+  const commit = value => {
+    credential.value = value.trim();
+    hidden.value = credential.value;
+    if (summaryEl) summaryEl.textContent = credentialSummary(credential);
+    const missing = missingCookies(credential.type, credential.value);
+    if (!credential.value) {
+      status.className = 'form-hint';
+      status.textContent = OAUTH_COOKIE_NOTES[credential.type] || '';
+    } else if (missing.length) {
+      status.className = 'form-hint cred-cookie-warn';
+      status.textContent = `缺少 ${missing.join('、')}，授权可能被拒绝`;
+    } else {
+      status.className = 'form-hint cred-cookie-ok';
+      status.textContent = `已填写全部 ${required.length} 项必需 Cookie`;
+    }
+  };
+
+  // ---- structured mode ----
+  required.forEach(cookieName => {
+    const row = document.createElement('div');
+    row.className = 'kv-row';
+    const nameLabel = document.createElement('span');
+    nameLabel.className = 'cred-cookie-name';
+    nameLabel.textContent = cookieName;
+    nameLabel.title = cookieName;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'form-control';
+    input.placeholder = '值';
+    input.addEventListener('input', () => {
+      const jar = parseCookieString(hidden.value);
+      const typed = input.value.trim();
+      if (typed) jar[cookieName] = typed;
+      else delete jar[cookieName];
+      commit(buildCookieString(jar));
+    });
+    fields[cookieName] = input;
+    row.append(nameLabel, input);
+    formPane.appendChild(row);
+  });
+
+  const extraHint = document.createElement('div');
+  extraHint.className = 'form-hint';
+  extraHint.textContent = '其他 Cookie 会在切换到「完整粘贴」时保留。';
+  formPane.appendChild(extraHint);
+
+  // ---- raw mode ----
+  const rawInput = document.createElement('textarea');
+  rawInput.className = 'form-control';
+  rawInput.rows = 4;
+  rawInput.placeholder = '粘贴完整 Cookie，或直接粘贴 DevTools 的「Copy as cURL」命令';
+  rawInput.addEventListener('input', () => {
+    const fromCurl = extractCookieFromCurl(rawInput.value);
+    if (fromCurl) {
+      // A pasted cURL command is replaced by just its Cookie header.
+      rawInput.value = fromCurl;
+      showToast('已从 cURL 命令中提取 Cookie', 'success');
+    }
+    commit(rawInput.value);
+    syncFormFromValue();
+  });
+  rawPane.appendChild(rawInput);
+
+  function syncFormFromValue() {
+    const jar = parseCookieString(hidden.value);
+    required.forEach(cookieName => {
+      if (fields[cookieName]) fields[cookieName].value = jar[cookieName] || '';
+    });
+  }
+
+  const setMode = mode => {
+    const isRaw = mode === 'raw';
+    formPane.style.display = isRaw ? 'none' : 'block';
+    rawPane.style.display = isRaw ? 'block' : 'none';
+    modes.querySelectorAll('button').forEach(button => {
+      button.classList.toggle('active', button.dataset.mode === mode);
+    });
+    if (isRaw) rawInput.value = hidden.value;
+    else syncFormFromValue();
+  };
+
+  [['form', '分项填写'], ['raw', '完整粘贴']].forEach(([mode, text]) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn btn-sm';
+    button.dataset.mode = mode;
+    button.textContent = text;
+    button.addEventListener('click', () => setMode(mode));
+    modes.appendChild(button);
+  });
+
+  wrap.append(formPane, rawPane, status);
+  syncFormFromValue();
+  commit(hidden.value);
+  // Default to the raw box when a value already exists, since a pasted string
+  // may hold cookies beyond the required ones.
+  setMode(credential.value ? 'raw' : 'form');
+  return wrap;
 }
 
 function renderCredentials() {

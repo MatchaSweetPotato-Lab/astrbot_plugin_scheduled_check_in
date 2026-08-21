@@ -797,6 +797,87 @@ input:checked + .slider:before {
   margin-bottom: 0;
 }
 
+/* Collapsible credential cards: collapsed by default so a long list stays
+   scannable, with the summary carried in the header. */
+.cred-card-header {
+  gap: 8px;
+}
+
+.cred-toggle {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: var(--text);
+}
+
+.cred-caret {
+  color: var(--text-muted);
+  font-size: 12px;
+  width: 12px;
+  flex: none;
+}
+
+.cred-name {
+  font-size: 14px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cred-summary {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-muted);
+  flex: none;
+}
+
+.cred-card.collapsed .cred-card-body {
+  display: none;
+}
+
+.cred-card.collapsed .cred-card-header {
+  margin-bottom: 0;
+}
+
+/* Cookie editor: structured fields or one raw box */
+.cred-mode-switch {
+  display: flex;
+  gap: 4px;
+}
+
+.cred-mode-switch .btn.active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+
+.cred-cookie-name {
+  flex: 0 0 190px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cred-cookie-warn {
+  color: #92400e;
+}
+
+.cred-cookie-ok {
+  color: var(--success-hover);
+}
+
 .cred-inline-row {
   display: flex;
   align-items: center;

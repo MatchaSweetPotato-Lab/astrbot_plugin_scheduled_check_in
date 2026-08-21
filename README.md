@@ -32,7 +32,12 @@
   - 填入第三方站点的**完整 Cookie** 后，插件自动完成 `/api/status` → `/api/oauth/state` → 第三方授权 → `/api/oauth/{provider}` 全流程。
     - Github 需要 `user_session`、`__Host-user_session_same_site`、`_gh_sess`、`logged_in`——**只填 `user_session` 会被 Github 重定向到登录页**。
     - LinuxDO 需要 `_t`、`_forum_session`。
-    - 若站点没有 `/api/oauth/state` 接口（返回 404/405），插件会自动改用本地生成的 state。
+    - `state` 接口自动适配：先试 `GET /api/oauth/state`（经典 one-api），再试 `POST`（较新分支）；
+      两者都不存在时改用本地生成的 state。
+    - 站点通常把 state 存在**服务端会话**里，插件会把该接口下发的会话 Cookie 一并带到回调，
+      否则站点会以 `state is empty or not same` 拒绝。
+    - 凭据支持「分项填写」与「完整粘贴」两种输入方式，后者可直接粘贴 DevTools 的
+      「Copy as cURL」命令，插件会自动提取其中的 Cookie。
   - 换取到的站点会话 Cookie 回写到该 OAuth 凭据内部，不会覆盖用户手填的 Cookie 凭据。
   - **签到协议选择 `OAuth（重新登录签到）`** 时，视"重新登录"本身为签到动作：部分站点二次开发后关闭了通用签到端点，只有重新登录才会发放额度。此时插件每次签到都会重新走一次完整 OAuth 登录，**不会**复用已保存的会话；余额查询仍复用会话，不会消耗当日签到。
   - 其余协议下会话过期（401/403）时自动重新登录一次并重试。

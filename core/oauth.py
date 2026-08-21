@@ -357,68 +357,92 @@ class OAuthLoginClient:
                      response_text=body)
         return client_id
 
-    async def _fetch_flow_token(self, provider: OAuthProvider) -> str:
+    async def _fetch_flow_token(self, provider: OAuthProvider) -> tuple[str, str]:
         """Ask the station for a single-use OAuth ``state`` token.
 
-        Forks disagree on this endpoint: some nest the value under
-        ``data.flow_token``, some return ``data`` as the token string itself,
-        some name it ``state``, and older builds have no such endpoint at all
-        and expect the client to invent its own state. All of those are handled,
-        and anything unrecognised is reported with the body so the log detail
-        view shows what actually came back.
+        Classic one-api / New-API registers this as ``GET`` and answers with the
+        state as a bare ``data`` string, while storing it in a **server-side
+        session** keyed by a cookie set on this very response. That cookie has
+        to travel to the callback, or the station compares the returned state
+        against an empty session and answers ``state is empty or not same``.
+        Newer forks use ``POST`` and nest the value under ``data.flow_token``,
+        so both methods are tried.
+
+        Returns:
+            Tuple of ``(state, station_cookie)``. The cookie is empty when the
+            station did not set one.
         """
         url = f"{self.base_url}/api/oauth/state"
-        try:
-            response = await self._request(
-                "POST",
-                url,
-                headers={"Content-Type": "application/json"},
-                json_body={"provider": provider.slug, "intent": "login"},
-            )
-        except Exception as exc:
-            self._record("获取 OAuth state", "POST", url, error=str(exc))
-            raise OAuthError(f"获取 OAuth state 失败: {exc}") from exc
+        attempts: list[tuple[str, int | None, str]] = []
 
-        status = getattr(response, "status_code", None)
-        body = getattr(response, "text", "") or ""
+        for method in ("GET", "POST"):
+            step = "获取 OAuth state"
+            try:
+                if method == "GET":
+                    response = await self._request(
+                        "GET", url, params={"provider": provider.slug}
+                    )
+                else:
+                    response = await self._request(
+                        "POST",
+                        url,
+                        headers={"Content-Type": "application/json"},
+                        json_body={"provider": provider.slug, "intent": "login"},
+                    )
+            except Exception as exc:
+                self._record(step, method, url, error=str(exc))
+                raise OAuthError(f"获取 OAuth state 失败: {exc}") from exc
 
-        # Older stations have no state endpoint; they accept a client-chosen
-        # state because there is nothing server-side to compare it against.
-        if status in (404, 405):
-            local_state = secrets.token_urlsafe(24)
-            self._record(
-                "获取 OAuth state", "POST", url, status=status, success=True,
-                response_text=body, message="站点无 state 接口，改用本地生成的 state",
-            )
-            logger.info("No /api/oauth/state on %s (HTTP %s); using a local state.", self.base_url, status)
-            return local_state
+            status = getattr(response, "status_code", None)
+            body = getattr(response, "text", "") or ""
 
-        try:
-            payload = json.loads(body)
-        except (TypeError, ValueError) as exc:
-            self._record(
-                "获取 OAuth state", "POST", url, status=status,
-                response_text=body, error="响应非 JSON",
-            )
-            raise OAuthError("OAuth state 接口未返回 JSON") from exc
+            # A 404/405 here means the route is not registered for this verb;
+            # the other verb may still work, so keep going before giving up.
+            if status in (404, 405):
+                attempts.append((method, status, body))
+                self._record(
+                    step, method, url, status=status, response_text=body,
+                    message="该方法不被支持，尝试其他方法",
+                )
+                continue
 
-        flow_token = _extract_flow_token(payload)
-        if flow_token:
-            self._record(
-                "获取 OAuth state", "POST", url, status=status, success=True,
-                response_text=body,
-            )
-            return flow_token
+            try:
+                payload = json.loads(body)
+            except (TypeError, ValueError):
+                attempts.append((method, status, body))
+                self._record(step, method, url, status=status,
+                             response_text=body, error="响应非 JSON")
+                continue
 
-        message = ""
-        if isinstance(payload, dict):
-            message = str(payload.get("message") or "").strip()
-        detail = message or f"响应中没有可用的 state 字段：{_abridge(body)}"
+            flow_token = _extract_flow_token(payload)
+            if flow_token:
+                station_cookie = _cookie_string(getattr(response, "cookies", {}) or {})
+                self._record(
+                    step, method, url, status=status, success=True,
+                    response_text=body,
+                    message=("已取得 state 与会话 Cookie" if station_cookie
+                             else "已取得 state（站点未下发会话 Cookie）"),
+                )
+                return flow_token, station_cookie
+
+            message = ""
+            if isinstance(payload, dict):
+                message = str(payload.get("message") or "").strip()
+            detail = message or f"响应中没有可用的 state 字段：{_abridge(body)}"
+            self._record(step, method, url, status=status,
+                         response_text=body, error=detail)
+            raise OAuthError(f"OAuth state 接口未返回 state（{detail}）")
+
+        # Neither verb exists. Older builds validated nothing, so a local state
+        # is worth trying, but a station that does validate will reject it.
+        local_state = secrets.token_urlsafe(24)
+        tried = ", ".join(f"{m} HTTP {s}" for m, s, _ in attempts)
         self._record(
-            "获取 OAuth state", "POST", url, status=status,
-            response_text=body, error=detail,
+            "获取 OAuth state", "-", url, success=True,
+            message=f"站点无 state 接口（{tried}），改用本地生成的 state",
         )
-        raise OAuthError(f"OAuth state 接口未返回 flow_token（{detail}）")
+        logger.info("No /api/oauth/state on %s (%s); using a local state.", self.base_url, tried)
+        return local_state, ""
 
     async def _authorize(
         self,
@@ -476,13 +500,31 @@ class OAuthLoginClient:
             f"请先在浏览器登录该站点并完成一次 OAuth 授权"
         )
 
-    async def _exchange(self, provider: OAuthProvider, code: str, state: str) -> str:
-        """Trade the authorization code for the station's session cookie."""
+    async def _exchange(
+        self,
+        provider: OAuthProvider,
+        code: str,
+        state: str,
+        station_cookie: str = "",
+    ) -> str:
+        """Trade the authorization code for the station's session cookie.
+
+        Args:
+            provider: Identity provider being used.
+            code: Authorization code from the provider.
+            state: State that was sent to the provider.
+            station_cookie: Cookie the station set when it issued the state. It
+                keys the server-side session holding that state, so without it
+                the station compares against an empty session and rejects the
+                callback with ``state is empty or not same``.
+        """
         url = f"{self.base_url}/api/oauth/{provider.slug}"
+        headers = {"Cookie": station_cookie} if station_cookie else None
         try:
             response = await self._request(
                 "GET",
                 url,
+                headers=headers,
                 params={"code": code, "state": state},
                 allow_redirects=False,
             )
@@ -552,9 +594,9 @@ class OAuthLoginClient:
 
         try:
             client_id = await self._fetch_client_id(provider)
-            state = await self._fetch_flow_token(provider)
+            state, station_cookie = await self._fetch_flow_token(provider)
             code = await self._authorize(provider, client_id, state, cookie)
-            session_cookie = await self._exchange(provider, code, state)
+            session_cookie = await self._exchange(provider, code, state, station_cookie)
         except OAuthError as exc:
             logger.info("OAuth login failed for %s at %s: %s", provider.slug, self.base_url, exc)
             return OAuthLoginResult(False, str(exc))
