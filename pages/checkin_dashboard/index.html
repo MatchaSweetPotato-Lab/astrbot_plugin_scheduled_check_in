@@ -355,6 +355,12 @@
             <textarea id="vault-unlock-key" class="form-control" rows="3" placeholder="粘贴启用加密时保存的 Base64 密钥"></textarea>
           </div>
           <div class="form-hint">解锁状态仅保留在内存中，插件重载后需要重新输入。</div>
+          <div class="form-hint">
+            想让浏览器密码管理器记住密钥？请在<strong>独立页面</strong>解锁——本页处于沙箱 iframe，
+            浏览器不允许在这里存取凭据。
+            <button type="button" class="btn btn-sm btn-primary-plain" style="margin-top: 8px;"
+                    onclick="openPasskeyModal()">获取独立页面地址</button>
+          </div>
         </div>
         <div class="modal-footer">
           <button class="btn" onclick="closeModal('vault-unlock-modal')">取消</button>

@@ -101,6 +101,37 @@
     </div>
 
     <div class="card">
+      <h2>用 Base64 密钥解锁</h2>
+      <!-- A real form on a top-level, same-origin page: this is what lets the
+           browser's password manager autofill and offer to save the key. The
+           dashboard iframe cannot do this — credential storage requires a
+           document same-origin with all its ancestors, and that iframe is
+           sandboxed into an opaque origin. -->
+      <form id="unlock-form" method="post" action="#" autocomplete="on">
+        <div class="field">
+          <label for="unlock-account">账户</label>
+          <input type="text" id="unlock-account" name="username"
+                 autocomplete="username" readonly />
+          <div class="hint">仅用于让密码管理器区分不同站点的密钥，不会发送给服务端。</div>
+        </div>
+        <div class="field">
+          <label for="unlock-key">AES-256-GCM 密钥</label>
+          <input type="password" id="unlock-key" name="password"
+                 autocomplete="current-password"
+                 placeholder="粘贴启用加密时保存的 Base64 密钥" />
+        </div>
+        <div class="row">
+          <button class="btn btn-primary" type="submit" id="btn-unlock-key">解锁</button>
+          <label class="hint" style="display: flex; align-items: center; gap: 6px;">
+            <input type="checkbox" id="unlock-remember" checked />
+            成功后询问浏览器是否保存密钥
+          </label>
+        </div>
+      </form>
+      <div class="hint" id="unlock-key-hint" style="margin-top: 10px;"></div>
+    </div>
+
+    <div class="card">
       <h2>已注册的密钥槽位</h2>
       <div id="slots"></div>
       <div class="hint" style="margin-top: 14px;">
@@ -251,6 +282,9 @@
       );
       document.getElementById('btn-unlock').disabled = !vault.locked || matching.length === 0;
       document.getElementById('btn-register').disabled = !vault.enabled || vault.locked !== false;
+      // The key form is only meaningful while locked, but stays enabled so a
+      // password manager can still autofill it before the state loads.
+      document.getElementById('btn-unlock-key').disabled = !vault.locked;
 
       if (!vault.enabled) {
         banner('state-banner',
@@ -503,7 +537,73 @@
       toast(`${action}失败：${message}`, 'error', 8000);
     }
 
+    // ---------- unlock with the base64 key ----------
+    /**
+     * Ask the browser to remember the key.
+     *
+     * Chromium exposes PasswordCredential, so store() raises the save prompt
+     * directly. Firefox and Safari have no such API and rely on form-submit
+     * heuristics instead, which a fetch-based submit does not trigger — there
+     * the manager may still autofill but will not offer to save. Reported
+     * honestly in the hint rather than silently doing nothing.
+     */
+    async function rememberKey(account, key) {
+      if (typeof window.PasswordCredential !== 'function'
+          || typeof navigator.credentials?.store !== 'function') {
+        return '浏览器未提供凭据存储接口，请手动保存到密码管理器';
+      }
+      try {
+        await navigator.credentials.store(
+          new PasswordCredential({ id: account, password: key, name: account })
+        );
+        return '已请求浏览器保存密钥';
+      } catch (error) {
+        return `浏览器拒绝保存：${error.name}`;
+      }
+    }
+
+    async function submitKeyUnlock(event) {
+      if (event) event.preventDefault();
+      const keyInput = document.getElementById('unlock-key');
+      const accountInput = document.getElementById('unlock-account');
+      const hint = document.getElementById('unlock-key-hint');
+      const key = (keyInput.value || '').trim();
+      if (!key) {
+        hint.className = 'hint';
+        hint.textContent = '请先粘贴密钥';
+        return;
+      }
+
+      const button = document.getElementById('btn-unlock-key');
+      button.disabled = true;
+      try {
+        const result = await api('/api/vault/unlock', { key });
+        toast(result.message || '解锁成功', 'success');
+        banner('ok-banner', '<strong>已解锁</strong>可以回到插件管理面板继续操作了。');
+
+        let note = '解锁成功。';
+        if (document.getElementById('unlock-remember').checked) {
+          note += ' ' + await rememberKey(accountInput.value || 'astrbot-vault', key);
+        }
+        hint.className = 'hint';
+        hint.textContent = note;
+        keyInput.value = '';
+        // refresh() -> renderStatus() owns the button state from here, so it
+        // stays disabled now that the vault is unlocked.
+        await refresh();
+      } catch (error) {
+        hint.className = 'hint';
+        hint.textContent = `解锁失败：${error.message}`;
+        toast(`解锁失败：${error.message}`, 'error', 6000);
+        button.disabled = false;
+      }
+    }
+
     // ---------- init ----------
+    // Key the saved credential to this host, so a manager can hold one key per
+    // deployment rather than overwriting a single shared entry.
+    document.getElementById('unlock-account').value = `astrbot-vault@${window.location.host}`;
+    document.getElementById('unlock-form').addEventListener('submit', submitKeyUnlock);
     checkEnvironment();
     refresh();
   </script>

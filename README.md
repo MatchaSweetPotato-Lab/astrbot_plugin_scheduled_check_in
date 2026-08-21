@@ -165,6 +165,19 @@ http://<你的面板地址>/api/v1/plugins/extensions/astrbot_plugin_scheduled_c
 注册流程：**解锁配置 → 打开该页面 → 注册当前设备 → 完成一次生物识别 / PIN 验证**。
 之后锁定时，在该页面点「使用通行密钥解锁」即可。
 
+### 让浏览器密码管理器记住 Base64 密钥
+
+该独立页面还提供一个标准登录表单（`autocomplete="username"` + `current-password"`），
+可被浏览器密码管理器自动填充；勾选「成功后询问浏览器是否保存密钥」时会在解锁成功后请求保存。
+
+- **Chromium（Chrome / Edge）**：通过 `navigator.credentials.store` 直接弹出保存提示。
+- **Firefox / Safari**：没有该接口，保存依赖表单提交启发式，本页用 fetch 提交因此不会弹窗——
+  自动填充仍然可用，保存需手动添加到密码管理器。页面会如实说明当前浏览器的结果。
+
+> 管理面板的解锁弹窗**无法**接入密码管理器：浏览器要求凭据存取所在文档与其所有祖先同源，
+> 而插件页面被沙箱置于不透明源（`window.origin === "null"`），调用会直接抛
+> `NotAllowedError`。因此需要密码管理器时请使用独立页面。
+
 ### 环境要求（重要）
 
 WebAuthn 要求**安全上下文**，且 RP ID 必须是**域名**：
