@@ -178,8 +178,9 @@ http://<你的面板地址>/api/v1/plugins/extensions/astrbot_plugin_scheduled_c
 
 ### 让浏览器密码管理器记住 Base64 密钥
 
-该独立页面还提供一个标准登录表单（`autocomplete="username"` + `current-password"`），
+该独立页面提供一个标准密码表单（`autocomplete="current-password"`），
 可被浏览器密码管理器自动填充；勾选「成功后询问浏览器是否保存密钥」时会在解锁成功后请求保存。
+表单不含账户字段——密码管理器本身按域名区分条目，浏览器也支持只有密码的表单。
 
 - **Chromium（Chrome / Edge）**：通过 `navigator.credentials.store` 直接弹出保存提示。
 - **Firefox / Safari**：没有该接口，保存依赖表单提交启发式，本页用 fetch 提交因此不会弹窗——

@@ -118,12 +118,6 @@
            sandboxed into an opaque origin. -->
       <form id="unlock-form" method="post" action="#" autocomplete="on">
         <div class="field">
-          <label for="unlock-account">账户</label>
-          <input type="text" id="unlock-account" name="username"
-                 autocomplete="username" readonly />
-          <div class="hint">仅用于让密码管理器区分不同站点的密钥，不会发送给服务端。</div>
-        </div>
-        <div class="field">
           <label for="unlock-key">AES-256-GCM 密钥</label>
           <div class="key-input-row">
             <input type="password" id="unlock-key" name="password"
@@ -585,6 +579,11 @@
     }
 
     // ---------- unlock with the base64 key ----------
+    // PasswordCredential requires a non-empty id, so the manager entry gets a
+    // fixed label. No username field is shown: managers already scope entries
+    // by origin, and browsers handle password-only forms.
+    const VAULT_CREDENTIAL_ID = 'astrbot-vault';
+
     /**
      * Ask the browser to remember the key.
      *
@@ -594,14 +593,18 @@
      * the manager may still autofill but will not offer to save. Reported
      * honestly in the hint rather than silently doing nothing.
      */
-    async function rememberKey(account, key) {
+    async function rememberKey(key) {
       if (typeof window.PasswordCredential !== 'function'
           || typeof navigator.credentials?.store !== 'function') {
         return '浏览器未提供凭据存储接口，请手动保存到密码管理器';
       }
       try {
         await navigator.credentials.store(
-          new PasswordCredential({ id: account, password: key, name: account })
+          new PasswordCredential({
+            id: VAULT_CREDENTIAL_ID,
+            password: key,
+            name: VAULT_CREDENTIAL_ID
+          })
         );
         return '已请求浏览器保存密钥';
       } catch (error) {
@@ -612,7 +615,6 @@
     async function submitKeyUnlock(event) {
       if (event) event.preventDefault();
       const keyInput = document.getElementById('unlock-key');
-      const accountInput = document.getElementById('unlock-account');
       const hint = document.getElementById('unlock-key-hint');
       const key = (keyInput.value || '').trim();
       if (!key) {
@@ -630,7 +632,7 @@
 
         let note = '解锁成功。';
         if (document.getElementById('unlock-remember').checked) {
-          note += ' ' + await rememberKey(accountInput.value || 'astrbot-vault', key);
+          note += ' ' + await rememberKey(key);
         }
         hint.className = 'hint';
         hint.textContent = note;
@@ -649,7 +651,6 @@
     // ---------- init ----------
     // Key the saved credential to this host, so a manager can hold one key per
     // deployment rather than overwriting a single shared entry.
-    document.getElementById('unlock-account').value = `astrbot-vault@${window.location.host}`;
     document.getElementById('unlock-form').addEventListener('submit', submitKeyUnlock);
 
     const keyReveal = document.getElementById('key-reveal');
