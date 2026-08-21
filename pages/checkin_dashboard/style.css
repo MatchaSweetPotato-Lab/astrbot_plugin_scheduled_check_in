@@ -726,7 +726,15 @@ input:checked + .slider:before {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+.kv-header-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .section-divider {

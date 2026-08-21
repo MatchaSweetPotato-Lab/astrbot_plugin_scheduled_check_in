@@ -21,7 +21,7 @@ from .core.http_client import (
     normalize_impersonate,
 )
 from .core.scheduler import LOCKED_MESSAGE, CheckInScheduler
-from .core.site_schema import SITE_TYPE_NEW_API, normalize_site_type
+from .core.site_schema import NEW_API_USER_HEADER, SITE_TYPE_NEW_API, normalize_site_type
 from .core.storage import SLOT_WEBAUTHN, DEFAULT_SETTINGS, DatabaseManager
 
 logger = logging.getLogger("astrbot")
@@ -268,6 +268,7 @@ class ScheduledCheckInPlugin(Star):
             ("/api/sites", self.api_get_sites, ["GET"], "获取站点列表"),
             ("/api/sites", self.api_save_sites, ["POST"], "保存站点配置"),
             ("/api/sites/test", self.api_test_site, ["POST"], "测试站点连接"),
+            ("/api/sites/probe-new-api-user", self.api_probe_new_api_user, ["POST"], "探测 new-api-user"),
             ("/api/sites/recheckin", self.api_recheckin_site, ["POST"], "重新签到单个站点"),
             ("/api/sites/activity", self.api_get_site_activity, ["GET"], "获取站点签到日历与余额变化"),
             ("/api/checkin/run", self.api_run_checkin, ["POST"], "触发一键打卡"),
@@ -374,6 +375,48 @@ class ScheduledCheckInPlugin(Star):
                 persist_writeback(self.db, site_id, adapter.writeback)
             self.record_history([result], log_type="test")
             return json_response(result.to_dict())
+
+    async def api_probe_new_api_user(self) -> Any:
+        """Web API: Fetch the station's numeric user id for ``new-api-user``.
+
+        New-API scopes a Cookie session to a numeric account id via this header.
+        One-API has no such concept and does not return an id, in which case the
+        failure is reported plainly rather than guessed at.
+
+        Returns:
+            JSON response with the probed id, or an error explaining why not.
+        """
+        parsed, site_config = await _read_json_body()
+        if not parsed or not isinstance(site_config, dict):
+            return error_response("请求体必须是合法 JSON 对象")
+        if self.is_config_locked() or site_config.get("locked"):
+            return error_response(LOCKED_MESSAGE)
+        if not str(site_config.get("base_url") or "").strip():
+            return error_response("请先填写 Base URL")
+
+        if normalize_site_type(site_config.get("type")) != SITE_TYPE_NEW_API:
+            return error_response("仅 New-API 框架支持 new-api-user，请将框架类型设为 New-API")
+
+        try:
+            async with create_client_session(self.get_settings()) as session:
+                adapter = create_adapter(site_config, session, self.acw_cache_file)
+                user_id, detail = await adapter.probe_new_api_user_id()
+        except Exception as exc:
+            logger.error(f"Error probing new-api-user: {exc}", exc_info=True)
+            return error_response(f"探测失败: {exc}")
+
+        if not user_id:
+            return error_response(
+                detail or "未能获取 new-api-user。One-API 没有该字段，若站点为 One-API 可忽略此项。"
+            )
+        return json_response(
+            {
+                "status": "ok",
+                "user_id": user_id,
+                "header": NEW_API_USER_HEADER,
+                "message": f"已获取 {NEW_API_USER_HEADER} = {user_id}",
+            }
+        )
 
     async def api_recheckin_site(self) -> Any:
         """Web API: Force a check-in for one configured site."""

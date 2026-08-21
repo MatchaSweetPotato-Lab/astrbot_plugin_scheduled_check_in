@@ -168,7 +168,12 @@
             <div class="form-group">
               <div class="kv-header">
                 <label style="margin: 0;">自定义请求头 (可选)</label>
-                <button type="button" class="btn btn-sm btn-primary-plain" onclick="addHeaderRow('checkin')">+ 添加 Header</button>
+                <div class="kv-header-actions">
+                  <button type="button" class="btn btn-sm" id="checkin-fetch-user"
+                          onclick="fetchNewApiUser('checkin')"
+                          title="通过 /api/user/self 获取 new-api-user 并填入下方">获取 new-api-user</button>
+                  <button type="button" class="btn btn-sm btn-primary-plain" onclick="addHeaderRow('checkin')">+ 添加 Header</button>
+                </div>
               </div>
               <div id="checkin-headers-container" class="kv-editor"></div>
               <div class="form-hint" id="checkin-headers-hint"></div>
@@ -207,7 +212,12 @@
             <div class="form-group">
               <div class="kv-header">
                 <label style="margin: 0;">自定义请求头 (可选)</label>
-                <button type="button" class="btn btn-sm btn-primary-plain" onclick="addHeaderRow('balance')">+ 添加 Header</button>
+                <div class="kv-header-actions">
+                  <button type="button" class="btn btn-sm" id="balance-fetch-user"
+                          onclick="fetchNewApiUser('balance')"
+                          title="通过 /api/user/self 获取 new-api-user 并填入下方">获取 new-api-user</button>
+                  <button type="button" class="btn btn-sm btn-primary-plain" onclick="addHeaderRow('balance')">+ 添加 Header</button>
+                </div>
               </div>
               <div id="balance-headers-container" class="kv-editor"></div>
               <div class="form-hint" id="balance-headers-hint"></div>

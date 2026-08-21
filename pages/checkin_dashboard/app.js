@@ -1201,13 +1201,16 @@ function renderFrameworkHints() {
   const isOauth = document.getElementById('checkin-protocol')?.value === 'oauth';
   if (checkinHint) {
     checkinHint.textContent = isOauth
-      ? '通常留空。若站点仍保留签到端点，登录成功后会继续请求它。'
+      ? 'Path 会被忽略：登录本身即签到，不再请求任何签到端点。'
       : defaults.checkin;
   }
   if (balanceHint) balanceHint.textContent = defaults.balance;
   ['checkin', 'balance'].forEach(name => {
     const headerHint = document.getElementById(`${name}-headers-hint`);
     if (headerHint) headerHint.textContent = defaults.newApiUser;
+    // Only New-API exposes a new-api-user id to fetch.
+    const fetchButton = document.getElementById(`${name}-fetch-user`);
+    if (fetchButton) fetchButton.style.display = type === 'new-api' ? '' : 'none';
   });
 }
 
@@ -1235,6 +1238,101 @@ function readActionForm(action) {
     credential_id: document.getElementById(`${action}-credential`)?.value || '',
     headers: getHeaderPairs(action),
     solve_acw_sc_v2: document.getElementById(`${action}-solve-acw`)?.checked === true
+  };
+}
+
+/**
+ * Fetch new-api-user from the station and write it into this action's headers.
+ *
+ * New-API scopes a Cookie session to a numeric account id through this header.
+ * One-API has no equivalent, so a failure there is expected and is reported as
+ * such rather than as a breakage.
+ */
+async function fetchNewApiUser(action) {
+  const button = document.getElementById(`${action}-fetch-user`);
+  const siteType = document.getElementById('site-type')?.value || 'new-api';
+  if (siteType !== 'new-api') {
+    showToast('仅 New-API 框架需要 new-api-user，请先将框架类型设为 New-API', 'warning');
+    return;
+  }
+  const baseUrl = document.getElementById('site-url')?.value.trim();
+  if (!baseUrl) {
+    showToast('请先填写 Base URL', 'warning');
+    switchSiteTab('basic');
+    return;
+  }
+
+  readCredentialDraftFromDom();
+  if (credentialDraft.length === 0) {
+    showToast('请先在「凭据」页添加一个 Token 或 Cookie 凭据', 'warning');
+    switchSiteTab('credentials');
+    return;
+  }
+
+  const original = button ? button.textContent : '';
+  if (button) {
+    button.disabled = true;
+    button.textContent = '获取中…';
+  }
+  try {
+    // Send the in-progress form rather than the saved site, so the value can be
+    // fetched before the site has ever been saved.
+    const data = await apiPost('/api/sites/probe-new-api-user', buildSitePayloadFromForm());
+    if (!data || data.status !== 'ok' || !data.user_id) {
+      showToast(data?.message || '获取 new-api-user 失败', 'error', 7000);
+      return;
+    }
+    setHeaderRows(action, upsertHeaderPair(getHeaderPairs(action), data.header, data.user_id));
+    showToast(data.message || `已填入 ${data.header}`, 'success');
+  } catch (e) {
+    showToast('获取 new-api-user 请求失败', 'error');
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = original;
+    }
+  }
+}
+
+/** Set a header pair by case-insensitive name, appending when absent. */
+function upsertHeaderPair(pairs, key, value) {
+  const wanted = String(key || '').toLowerCase();
+  const next = pairs.map(pair => ({ ...pair }));
+  const existing = next.find(pair => pair.key.toLowerCase() === wanted);
+  if (existing) {
+    existing.value = String(value);
+    return next;
+  }
+  next.push({ key, value: String(value) });
+  return next;
+}
+
+/** Build a site payload from the editor, for actions that run before saving. */
+function buildSitePayloadFromForm() {
+  const previous = isEdit && editIndex >= 0 ? sites[editIndex] : null;
+  return {
+    id: previous ? previous.id : '',
+    name: document.getElementById('site-name')?.value.trim() || '',
+    type: document.getElementById('site-type')?.value || 'new-api',
+    base_url: document.getElementById('site-url')?.value.trim() || '',
+    proxy: document.getElementById('site-proxy')?.value.trim() || '',
+    credentials: credentialDraft.map(credential => {
+      const entry = {
+        id: credential.id,
+        type: credential.type,
+        label: credential.label || '',
+        value: credential.value || ''
+      };
+      if (credential.type === 'token') entry.auto_bearer = credential.auto_bearer !== false;
+      // Carry the stored session so the probe can reuse it instead of logging in.
+      if (OAUTH_TYPES.includes(credential.type) && credential.session_cookie) {
+        entry.session_cookie = credential.session_cookie;
+      }
+      return entry;
+    }),
+    checkin: readActionForm('checkin'),
+    balance: readActionForm('balance'),
+    enabled: document.getElementById('site-enabled')?.checked === true
   };
 }
 

@@ -734,6 +734,45 @@ class BaseCheckInAdapter(ABC):
         """Return the station's own ``/api/user/self`` URL."""
         return f"{self.base_url}{_NEW_API_SELF_PATH}"
 
+    async def probe_new_api_user_id(self) -> tuple[str, str]:
+        """Ask the station for the account id used by ``new-api-user``.
+
+        Driven by the dashboard's fetch button, so it reports a reason rather
+        than failing silently the way the automatic probe does.
+
+        Returns:
+            Tuple of ``(user_id, detail)``. The id is empty when unavailable, in
+            which case the detail says why.
+        """
+        auth = await self._authenticate(self.balance, allow_login=False)
+        if not auth.ok:
+            return "", auth.error
+        if auth.oauth:
+            return "", "OAuth 凭据的会话本身已标识用户，无需 new-api-user"
+
+        try:
+            response, auth = await self._request_action(
+                "GET",
+                self._self_url(),
+                auth,
+                self.balance,
+                step="探测 new-api-user",
+            )
+        except Exception as exc:
+            return "", f"请求 {_NEW_API_SELF_PATH} 失败: {exc}"
+
+        payload, error = self._parse_json(response)
+        if error or payload is None:
+            return "", error or "响应无法解析"
+
+        self._remember_new_api_user(payload)
+        if not self._new_api_user_id:
+            return "", (
+                f"{_NEW_API_SELF_PATH} 响应中没有 data.id 字段，"
+                "该站点可能是 One-API（不需要 new-api-user）"
+            )
+        return self._new_api_user_id, ""
+
     def _remember_new_api_user(self, payload: dict[str, Any]) -> None:
         """Cache the station user id out of any ``/api/user/self`` style payload."""
         data = payload.get("data")
@@ -992,6 +1031,12 @@ class NewApiAdapter(BaseCheckInAdapter):
         if login_is_checkin and initial_error:
             initial_quota, initial_error = await self.query_balance()
 
+        if login_is_checkin:
+            # The login *is* the sign-in on these stations, so stop here. Probing
+            # the check-in endpoints afterwards only adds 404/401 noise, and the
+            # station has already credited the day.
+            return await self._finish_login_checkin(initial_quota, initial_error, logged_in)
+
         success, message, expired, endpoint_missing = await self._attempt_checkin(auth)
         total_quota, balance_error = await self.query_balance(step="查询最终余额")
 
@@ -1000,12 +1045,6 @@ class NewApiAdapter(BaseCheckInAdapter):
             gained = round(total_quota - initial_quota, 3)
             success = True
             message = f"额度增加 +$ {gained}" + (f"（{message}）" if message else "")
-
-        if endpoint_missing and logged_in and not success:
-            # These stations disable the check-in endpoint and credit the bonus
-            # on login instead, so a completed login is the check-in.
-            success = True
-            message = "OAuth 重新登录成功（站点已关闭签到接口，登录即打卡）"
 
         if balance_error:
             expired = expired or "401" in balance_error
@@ -1023,6 +1062,52 @@ class NewApiAdapter(BaseCheckInAdapter):
             expired=expired,
             # Surface the trace when the balance read failed even though the
             # check-in itself worked, so a stale figure has an explanation.
+            detail_on_success=bool(balance_error),
+        )
+
+    async def _finish_login_checkin(
+        self,
+        initial_quota: float,
+        initial_error: str,
+        logged_in: bool,
+    ) -> CheckInResult:
+        """Complete an OAuth check-in, where logging in is the sign-in itself.
+
+        The freshly issued session cookie is already written back to the
+        credential, so the closing balance read reuses it rather than logging in
+        again. No check-in endpoint is contacted at all.
+
+        Args:
+            initial_quota: Balance read before the login, if it was readable.
+            initial_error: Why that read failed, if it did.
+            logged_in: Whether a fresh login actually happened.
+
+        Returns:
+            The check-in result.
+        """
+        total_quota, balance_error = await self.query_balance(step="查询最终余额")
+
+        gained = 0.0
+        if not initial_error and not balance_error and total_quota > initial_quota:
+            gained = round(total_quota - initial_quota, 3)
+
+        if gained > 0:
+            message = f"额度增加 +$ {gained}（OAuth 重新登录即签到）"
+        elif logged_in:
+            message = "OAuth 重新登录成功（登录即签到）"
+        else:
+            message = "OAuth 会话仍有效，未重新登录"
+
+        if balance_error and not initial_error:
+            # Keep the figure we already confirmed rather than reporting zero.
+            total_quota = initial_quota
+
+        return self._result(
+            success=True,
+            message=message,
+            total_quota=total_quota,
+            gained_quota=gained,
+            expired=False,
             detail_on_success=bool(balance_error),
         )
 
@@ -1085,6 +1170,19 @@ class GenericRestAdapter(BaseCheckInAdapter):
             return self._result(False, auth.error, expired=True)
         logged_in = login_is_checkin and not auth.reused_session
 
+        if login_is_checkin:
+            # The login is the sign-in; requesting anything else afterwards
+            # would only add noise, exactly as for New-API stations.
+            total_quota, balance_error = await self.query_balance(step="查询最终余额")
+            return self._result(
+                success=True,
+                message=("OAuth 重新登录成功（登录即签到）" if logged_in
+                         else "OAuth 会话仍有效，未重新登录"),
+                total_quota=total_quota,
+                expired=False,
+                detail_on_success=bool(balance_error),
+            )
+
         url = self._action_url(self.checkin)
         method = self._action_method(self.checkin, "GET" if not self.checkin.get("path") else "POST")
         try:
@@ -1097,10 +1195,6 @@ class GenericRestAdapter(BaseCheckInAdapter):
             return self._result(False, auth.error, expired=True)
 
         success, message = _interpret_generic_response(response, self._waf_message)
-        if logged_in and not success and response.status == 404:
-            # No check-in endpoint here either; the login was the check-in.
-            success = True
-            message = "OAuth 重新登录成功（站点已关闭签到接口，登录即打卡）"
 
         total_quota, balance_error = await self.query_balance()
         if balance_error:

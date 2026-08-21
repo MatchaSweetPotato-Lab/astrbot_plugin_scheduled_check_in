@@ -403,6 +403,64 @@ class NewApiTestConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.expired)
 
 
+class ProbeNewApiUserTests(unittest.IsolatedAsyncioTestCase):
+    """The dashboard's fetch button needs a reason on failure, not silence."""
+
+    async def test_it_returns_the_station_account_id(self) -> None:
+        session = FakeSession(
+            {("GET", f"{BASE}/api/user/self"): FakeResponse(200, self_payload(0, 2259))}
+        )
+        user_id, detail = await create_adapter(make_site(), session).probe_new_api_user_id()
+        self.assertEqual(user_id, "2259")
+        self.assertEqual(detail, "")
+
+    async def test_a_response_without_an_id_explains_one_api(self) -> None:
+        """One-API has no such field, which is not an error worth alarming about."""
+        session = FakeSession(
+            {("GET", f"{BASE}/api/user/self"): FakeResponse(200, '{"data":{"quota":5},"success":true}')}
+        )
+        user_id, detail = await create_adapter(make_site(), session).probe_new_api_user_id()
+        self.assertEqual(user_id, "")
+        self.assertIn("One-API", detail)
+
+    async def test_an_auth_failure_is_reported(self) -> None:
+        session = FakeSession(
+            {("GET", f"{BASE}/api/user/self"): FakeResponse(401, '{"success":false}')}
+        )
+        user_id, detail = await create_adapter(make_site(), session).probe_new_api_user_id()
+        self.assertEqual(user_id, "")
+        self.assertTrue(detail)
+
+    async def test_a_missing_credential_is_reported(self) -> None:
+        session = FakeSession({})
+        user_id, detail = await create_adapter(make_site(credentials=[]), session).probe_new_api_user_id()
+        self.assertEqual(user_id, "")
+        self.assertIn("凭据", detail)
+
+    async def test_an_oauth_credential_needs_no_header(self) -> None:
+        """Its session already identifies the user, so the header is redundant."""
+        site = make_site(credentials=[{"id": "gh", "type": "github_oauth", "value": "user_session=x",
+                                      "session_cookie": "session=live"}])
+        user_id, detail = await create_adapter(site, FakeSession({})).probe_new_api_user_id()
+        self.assertEqual(user_id, "")
+        self.assertIn("无需", detail)
+
+    async def test_the_probe_never_logs_in(self) -> None:
+        """Fetching a header must not consume an OAuth station's daily sign-in."""
+        site = make_site(credentials=[{"id": "gh", "type": "github_oauth", "value": "user_session=x"}])
+        session = FakeSession({})
+        await create_adapter(site, session).probe_new_api_user_id()
+        self.assertEqual(session.count_to("/api/oauth/github"), 0)
+
+    async def test_it_appears_in_the_request_trace(self) -> None:
+        session = FakeSession(
+            {("GET", f"{BASE}/api/user/self"): FakeResponse(200, self_payload(0, 7))}
+        )
+        adapter = create_adapter(make_site(), session)
+        await adapter.probe_new_api_user_id()
+        self.assertIn("探测 new-api-user", [a["step"] for a in adapter.attempts])
+
+
 class GenericRestTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_path_gets_the_base_url(self) -> None:
         session = FakeSession({("GET", BASE): FakeResponse(200, '{"success":true,"message":"ok"}')})
@@ -557,8 +615,10 @@ class OAuthCheckInTests(unittest.IsolatedAsyncioTestCase):
             checkin={"protocol": "oauth"},
         )
         await create_adapter(site, session).check_in()
-        checkin_calls = session.calls_to("/api/user/checkin")
-        self.assertEqual(checkin_calls[0]["headers"]["Cookie"], "session=fresh-session")
+        # Under the OAuth protocol no check-in endpoint is called, so the
+        # refreshed session shows up on the balance read instead.
+        reads = session.calls_to("/api/user/self")
+        self.assertEqual(reads[-1]["headers"]["Cookie"], "session=fresh-session")
 
     async def test_the_site_proxy_covers_the_third_party_leg(self) -> None:
         session = FakeSession(
@@ -695,7 +755,7 @@ class LoginAsCheckInTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await create_adapter(self._site(), session).check_in()
         self.assertTrue(result.success)
-        self.assertIn("登录即打卡", result.message)
+        self.assertIn("登录即签到", result.message)
 
     async def test_a_bonus_credited_on_login_is_reported(self) -> None:
         session = FakeSession(
@@ -756,24 +816,34 @@ class LoginAsCheckInTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await create_adapter(self._site(), FakeSession(routes)).check_in()
         self.assertFalse(result.success)
-        self.assertNotIn("登录即打卡", result.message)
+        self.assertNotIn("登录即签到", result.message)
 
-    async def test_a_working_endpoint_is_still_used_after_the_login(self) -> None:
-        """Stations that kept the endpoint get both the login and the request."""
+    async def test_no_checkin_endpoint_is_contacted(self) -> None:
+        """The login already signed in, so probing endpoints afterwards would
+        only add 404/401 noise to the trace."""
         session = FakeSession(
             self._routes(
                 [FakeResponse(200, self_payload(0)), FakeResponse(200, self_payload(0))],
             )
         )
+        # Even a *working* endpoint must be left alone under this protocol.
         session.routes[("POST", f"{BASE}/api/user/checkin")] = FakeResponse(
             200, '{"success":true,"message":"签到成功"}'
         )
         result = await create_adapter(self._site(), session).check_in()
         self.assertTrue(result.success)
-        self.assertEqual(result.message, "签到成功")
+        self.assertEqual(session.count_to("/api/user/checkin"), 0)
+        self.assertEqual(session.count_to("/api/user/pay/checkin"), 0)
+
+    async def test_the_fresh_cookie_is_used_for_the_closing_balance(self) -> None:
+        """The new session must be reused rather than logging in twice."""
+        session = FakeSession(
+            self._routes([FakeResponse(200, self_payload(0)), FakeResponse(200, self_payload(0))])
+        )
+        await create_adapter(self._site(), session).check_in()
+        closing_read = session.calls_to("/api/user/self")[-1]
+        self.assertEqual(closing_read["headers"]["Cookie"], "session=fresh")
         self.assertEqual(session.count_to("/api/oauth/github"), 1)
-        checkin_call = session.calls_to("/api/user/checkin")[0]
-        self.assertEqual(checkin_call["headers"]["Cookie"], "session=fresh")
 
     async def test_balance_reads_alone_reuse_the_stored_session(self) -> None:
         """Only the check-in forces a login; a plain balance read must not."""
@@ -802,9 +872,12 @@ class LoginAsCheckInTests(unittest.IsolatedAsyncioTestCase):
         routes = self._routes(FakeResponse(404, "nope"))
         routes[("GET", BASE)] = FakeResponse(404, "not found")
         site = self._site(type="generic_rest")
-        result = await create_adapter(site, FakeSession(routes)).check_in()
+        session = FakeSession(routes)
+        result = await create_adapter(site, session).check_in()
         self.assertTrue(result.success)
-        self.assertIn("登录即打卡", result.message)
+        self.assertIn("登录即签到", result.message)
+        # Consistent with New-API: nothing is requested after the login.
+        self.assertEqual(session.count_to(BASE), 0)
 
 
 class AdapterFactoryTests(unittest.TestCase):
