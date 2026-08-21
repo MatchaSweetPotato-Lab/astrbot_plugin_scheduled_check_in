@@ -29,7 +29,10 @@
   - 内置动态 **Key-Value 编辑器** 可为两个动作分别自定义任意 Header。New-API 站点在「跟随框架」模式下会自动探测 `new-api-user` 并回写到对应配置中。
 
 - **🔐 Github / LinuxDO OAuth 自动登录（含"登录即签到"站点）**
-  - 填入第三方会话 Cookie（Github 的 `user_session`、LinuxDO 的 `_t`）后，插件自动完成 `/api/status` → `/api/oauth/state` → 第三方授权 → `/api/oauth/{provider}` 全流程。
+  - 填入第三方站点的**完整 Cookie** 后，插件自动完成 `/api/status` → `/api/oauth/state` → 第三方授权 → `/api/oauth/{provider}` 全流程。
+    - Github 需要 `user_session`、`__Host-user_session_same_site`、`_gh_sess`、`logged_in`——**只填 `user_session` 会被 Github 重定向到登录页**。
+    - LinuxDO 需要 `_t`、`_forum_session`。
+    - 若站点没有 `/api/oauth/state` 接口（返回 404/405），插件会自动改用本地生成的 state。
   - 换取到的站点会话 Cookie 回写到该 OAuth 凭据内部，不会覆盖用户手填的 Cookie 凭据。
   - **签到协议选择 `OAuth（重新登录签到）`** 时，视"重新登录"本身为签到动作：部分站点二次开发后关闭了通用签到端点，只有重新登录才会发放额度。此时插件每次签到都会重新走一次完整 OAuth 登录，**不会**复用已保存的会话；余额查询仍复用会话，不会消耗当日签到。
   - 其余协议下会话过期（401/403）时自动重新登录一次并重试。

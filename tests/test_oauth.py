@@ -11,6 +11,7 @@ from core.oauth import (
     PROVIDERS,
     OAuthLoginClient,
     _extract_flow_token,
+    _missing_cookies,
     _safe_location,
     get_provider,
 )
@@ -237,7 +238,9 @@ class FailedLoginTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await make_client(session).login(GITHUB_OAUTH, "user_session=stale")
         self.assertFalse(result.success)
-        self.assertIn("失效", result.message)
+        # A partial cookie is reported as incomplete; only a complete one that
+        # is still refused is described as expired.
+        self.assertIn("未接受该会话 Cookie", result.message)
 
     async def test_consent_page_instead_of_a_redirect(self) -> None:
         """The user has to approve the OAuth app in a browser once."""
@@ -383,7 +386,10 @@ class FlowTokenFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def test_every_leg_is_traced_on_success(self) -> None:
         trace: list[dict] = []
         _, client = self._client(FakeResponse(200, '{"data":{"flow_token":"T"}}'), trace)
-        await client.login(GITHUB_OAUTH, "user_session=x")
+        # A complete cookie skips the pre-flight completeness warning, leaving
+        # exactly the four request legs.
+        full = "; ".join(f"{name}=v" for name in PROVIDERS[GITHUB_OAUTH].all_cookies)
+        await client.login(GITHUB_OAUTH, full)
         self.assertEqual(
             [item["step"] for item in trace],
             ["探测 OAuth 配置", "获取 OAuth state", "Github OAuth 授权", "OAuth 回调"],
@@ -428,6 +434,93 @@ class FlowTokenFallbackTests(unittest.IsolatedAsyncioTestCase):
         client = OAuthLoginClient(session, BASE, "chrome131", None, on_attempt=boom)
         result = await client.login(GITHUB_OAUTH, "user_session=x")
         self.assertTrue(result.success)
+
+
+class CookieCompletenessTests(unittest.TestCase):
+    """Github rejects an authorize request carrying only user_session."""
+
+    def test_github_lists_its_companion_cookies(self) -> None:
+        provider = PROVIDERS[GITHUB_OAUTH]
+        self.assertEqual(provider.cookie_hint, "user_session")
+        self.assertIn("__Host-user_session_same_site", provider.all_cookies)
+        self.assertIn("_gh_sess", provider.all_cookies)
+        self.assertEqual(provider.all_cookies[0], "user_session")
+
+    def test_authorize_host_is_the_cookie_domain(self) -> None:
+        self.assertEqual(PROVIDERS[GITHUB_OAUTH].authorize_host, "github.com")
+        self.assertEqual(PROVIDERS[LINUXDO_OAUTH].authorize_host, "connect.linux.do")
+
+    def test_missing_cookies_are_detected(self) -> None:
+        provider = PROVIDERS[GITHUB_OAUTH]
+        self.assertEqual(
+            _missing_cookies(provider, "user_session=a"),
+            ["__Host-user_session_same_site", "_gh_sess", "logged_in"],
+        )
+
+    def test_a_complete_cookie_reports_nothing_missing(self) -> None:
+        provider = PROVIDERS[GITHUB_OAUTH]
+        full = "; ".join(f"{name}=v" for name in provider.all_cookies)
+        self.assertEqual(_missing_cookies(provider, full), [])
+
+    def test_whitespace_and_ordering_do_not_matter(self) -> None:
+        provider = PROVIDERS[GITHUB_OAUTH]
+        jumbled = "  logged_in=yes ;_gh_sess=c;  __Host-user_session_same_site=b ; user_session=a  "
+        self.assertEqual(_missing_cookies(provider, jumbled), [])
+
+
+class RejectedSessionMessageTests(unittest.IsolatedAsyncioTestCase):
+    """A login-page redirect must not be blamed on expiry alone."""
+
+    def _routes(self) -> dict:
+        return {
+            ("GET", f"{BASE}/api/status"): FakeResponse(
+                200, '{"data":{"github_oauth":true,"github_client_id":"cid"}}'
+            ),
+            ("POST", f"{BASE}/api/oauth/state"): FakeResponse(
+                404, '{"error":{"message":"Invalid URL (POST /api/oauth/state)"}}'
+            ),
+            ("GET", GITHUB_AUTHORIZE): FakeResponse(
+                302, "", headers={"location": "https://github.com/login?client_id=cid&return_to=/x"}
+            ),
+        }
+
+    async def test_a_partial_cookie_names_what_is_missing(self) -> None:
+        client = make_client(FakeSession(self._routes()))
+        result = await client.login(GITHUB_OAUTH, "user_session=abc")
+        self.assertFalse(result.success)
+        self.assertIn("缺少", result.message)
+        self.assertIn("__Host-user_session_same_site", result.message)
+        self.assertIn("github.com", result.message)
+
+    async def test_a_complete_cookie_reports_rejection_not_omission(self) -> None:
+        full = "; ".join(f"{n}=v" for n in PROVIDERS[GITHUB_OAUTH].all_cookies)
+        client = make_client(FakeSession(self._routes()))
+        result = await client.login(GITHUB_OAUTH, full)
+        self.assertFalse(result.success)
+        self.assertNotIn("缺少", result.message)
+        self.assertIn("失效或被拒绝", result.message)
+
+    async def test_a_partial_cookie_is_warned_about_before_the_request(self) -> None:
+        trace: list[dict] = []
+        session = FakeSession(self._routes())
+        client = OAuthLoginClient(session, BASE, "chrome131", None,
+                                  on_attempt=lambda **kw: trace.append(kw))
+        await client.login(GITHUB_OAUTH, "user_session=abc")
+        checks = [item for item in trace if "凭据检查" in item["step"]]
+        self.assertEqual(len(checks), 1)
+        self.assertIn("_gh_sess", checks[0]["message"])
+
+    async def test_a_partial_cookie_is_still_attempted(self) -> None:
+        """Refusing outright would block a provider that happens to accept it."""
+        session = FakeSession(self._routes())
+        await make_client(session).login(GITHUB_OAUTH, "user_session=abc")
+        self.assertTrue(session.calls_to("/login/oauth/authorize"))
+
+    async def test_an_empty_cookie_names_the_whole_set(self) -> None:
+        result = await make_client(FakeSession({})).login(GITHUB_OAUTH, "   ")
+        self.assertFalse(result.success)
+        self.assertIn("完整 Cookie", result.message)
+        self.assertIn("__Host-user_session_same_site", result.message)
 
 
 if __name__ == "__main__":

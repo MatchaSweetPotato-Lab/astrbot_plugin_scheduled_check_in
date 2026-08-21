@@ -93,11 +93,25 @@ class OAuthProvider:
     client_id_key: str
     # Cookie the user copies out of their browser for the provider's domain.
     cookie_hint: str
+    # Additional cookies the provider needs before it treats a non-browser
+    # request as signed in. Github in particular answers a request carrying only
+    # user_session with a redirect to its login page.
+    companion_cookies: tuple[str, ...] = ()
     # Github infers the callback from the registered application, and rejects
     # any redirect_uri that does not match it exactly. LinuxDO derives the
     # callback from the request host and requires it to be sent.
     send_redirect_uri: bool = False
     extra_authorize_params: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def all_cookies(self) -> tuple[str, ...]:
+        """Every cookie name worth copying, primary first."""
+        return (self.cookie_hint, *self.companion_cookies)
+
+    @property
+    def authorize_host(self) -> str:
+        """Host whose cookies the user must copy, e.g. ``github.com``."""
+        return urlparse(self.authorize_url).netloc or self.authorize_url
 
 
 PROVIDERS: dict[str, OAuthProvider] = {
@@ -108,6 +122,10 @@ PROVIDERS: dict[str, OAuthProvider] = {
         enabled_key="github_oauth",
         client_id_key="github_client_id",
         cookie_hint="user_session",
+        # user_session on its own is not enough: Github checks the same-site
+        # mirror and its session cookie before honouring an authorize request,
+        # and otherwise redirects to its own login page.
+        companion_cookies=("__Host-user_session_same_site", "_gh_sess", "logged_in"),
     ),
     LINUXDO_OAUTH: OAuthProvider(
         slug="linuxdo",
@@ -116,6 +134,7 @@ PROVIDERS: dict[str, OAuthProvider] = {
         enabled_key="linuxdo_oauth",
         client_id_key="linuxdo_client_id",
         cookie_hint="_t",
+        companion_cookies=("_forum_session",),
         send_redirect_uri=True,
         extra_authorize_params={"response_type": "code"},
     ),
@@ -183,6 +202,42 @@ def _safe_location(location: str) -> str:
     query = "&".join(f"{k}={v}" for k, v in redacted.items())
     base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}" if parsed.netloc else parsed.path
     return f"{base}?{query}" if query else base
+
+
+def _cookie_names(cookie: str) -> set[str]:
+    """Return the cookie names present in a raw ``Cookie`` header value."""
+    names = set()
+    for part in str(cookie or "").split(";"):
+        name, _, _value = part.strip().partition("=")
+        if name.strip():
+            names.add(name.strip())
+    return names
+
+
+def _missing_cookies(provider: OAuthProvider, cookie: str) -> list[str]:
+    """Return the recommended cookies absent from what the user pasted."""
+    present = _cookie_names(cookie)
+    return [name for name in provider.all_cookies if name not in present]
+
+
+def _rejected_session_message(provider: OAuthProvider, cookie: str) -> str:
+    """Explain a provider bouncing an authorize request to its login page.
+
+    An expired cookie and an incomplete one look identical from here, and in
+    practice the second is more common: people copy only the cookie named in
+    the hint. So name the missing ones instead of only claiming expiry.
+    """
+    missing = _missing_cookies(provider, cookie)
+    if missing:
+        return (
+            f"{provider.label} 未接受该会话 Cookie（缺少 {', '.join(missing)}）。"
+            f"请从浏览器开发者工具复制 {provider.authorize_host} 的完整 Cookie，"
+            f"至少包含 {', '.join(provider.all_cookies)}，而不是只复制 {provider.cookie_hint}。"
+        )
+    return (
+        f"{provider.label} 会话 Cookie 已失效或被拒绝，"
+        f"请重新从浏览器复制 {provider.authorize_host} 的完整 Cookie。"
+    )
 
 
 class OAuthLoginClient:
@@ -415,9 +470,7 @@ class OAuthLoginClient:
             raise fail(f"{provider.label} 拒绝授权: {redirect_error}")
 
         if status in (401, 403) or (300 <= status < 400 and "login" in location.lower()):
-            raise fail(
-                f"{provider.label} 会话 Cookie 已失效，请重新从浏览器复制 {provider.cookie_hint}"
-            )
+            raise fail(_rejected_session_message(provider, third_party_cookie))
         raise fail(
             f"{provider.label} 未直接返回授权码 (HTTP {status})，"
             f"请先在浏览器登录该站点并完成一次 OAuth 授权"
@@ -475,7 +528,26 @@ class OAuthLoginClient:
         if not cookie:
             return OAuthLoginResult(
                 False,
-                f"{provider.label} 凭据为空，请填入 {provider.cookie_hint} Cookie",
+                f"{provider.label} 凭据为空，请填入 {provider.authorize_host} 的完整 Cookie"
+                f"（至少包含 {', '.join(provider.all_cookies)}）",
+            )
+
+        # Warn rather than refuse: a provider may still accept a partial cookie,
+        # and guessing wrong would block a working setup.
+        missing = _missing_cookies(provider, cookie)
+        if missing:
+            logger.info(
+                "%s cookie for %s is missing %s; the authorize leg may be rejected.",
+                provider.label,
+                self.base_url,
+                ", ".join(missing),
+            )
+            self._record(
+                f"{provider.label} 凭据检查",
+                "-",
+                provider.authorize_host,
+                success=True,
+                message=f"Cookie 缺少 {', '.join(missing)}，若授权被拒请补全",
             )
 
         try:

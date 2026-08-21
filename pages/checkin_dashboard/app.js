@@ -48,9 +48,17 @@ const CREDENTIAL_LABELS = {
 
 const OAUTH_TYPES = ['github_oauth', 'linuxdo_oauth'];
 
+// Placeholder and hint text for OAuth credentials. The full cookie string is
+// required: Github rejects an authorize request carrying only user_session and
+// redirects to its login page instead.
 const OAUTH_COOKIE_HINTS = {
-  github_oauth: '填入 github.com 的 user_session Cookie',
-  linuxdo_oauth: '填入 linux.do 的 _t Cookie'
+  github_oauth: '粘贴 github.com 的完整 Cookie，例如 user_session=…; __Host-user_session_same_site=…; _gh_sess=…',
+  linuxdo_oauth: '粘贴 linux.do 的完整 Cookie，例如 _t=…; _forum_session=…'
+};
+
+const OAUTH_COOKIE_NOTES = {
+  github_oauth: '需要 github.com 的完整 Cookie（user_session、__Host-user_session_same_site、_gh_sess、logged_in），仅有 user_session 会被 Github 拒绝。',
+  linuxdo_oauth: '需要 linux.do 的完整 Cookie（_t、_forum_session）。'
 };
 
 // Endpoints each framework already knows, shown as placeholder hints.
@@ -836,7 +844,7 @@ function buildCredentialCard(credential) {
   valueLabel.textContent = isOauth ? '第三方会话 Cookie *' : `${CREDENTIAL_LABELS[credential.type]} *`;
   const valueInput = document.createElement('textarea');
   valueInput.className = 'form-control cred-value';
-  valueInput.rows = isOauth ? 2 : 3;
+  valueInput.rows = isOauth ? 3 : 3;
   valueInput.placeholder = isOauth
     ? OAUTH_COOKIE_HINTS[credential.type] || ''
     : (credential.type === 'token' ? '粘贴 Access Token' : '例如 session=xxxx; other=yyyy');
@@ -845,7 +853,8 @@ function buildCredentialCard(credential) {
   if (isOauth) {
     const hint = document.createElement('div');
     hint.className = 'form-hint';
-    hint.textContent = '插件会用它自动登录，并把站点会话 Cookie 存在此凭据内。';
+    hint.textContent = OAUTH_COOKIE_NOTES[credential.type]
+      || '插件会用它自动登录，并把站点会话 Cookie 存在此凭据内。';
     valueGroup.appendChild(hint);
   }
   card.appendChild(valueGroup);
