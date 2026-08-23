@@ -57,10 +57,23 @@ class ProviderTests(unittest.TestCase):
         self.assertIsNone(get_provider("gitlab"))
         self.assertIsNone(get_provider(""))
 
-    def test_only_linuxdo_sends_a_redirect_uri(self) -> None:
-        """Github infers its callback from the registered application."""
-        self.assertFalse(PROVIDERS[GITHUB_OAUTH].send_redirect_uri)
-        self.assertTrue(PROVIDERS[LINUXDO_OAUTH].send_redirect_uri)
+    def test_no_provider_sends_a_redirect_uri(self) -> None:
+        """Both providers infer the callback from the registered application.
+
+        The station's own browser flow sends none, and a guessed one that does
+        not match the registration is grounds for refusal.
+        """
+        for credential_type in (GITHUB_OAUTH, LINUXDO_OAUTH):
+            params = PROVIDERS[credential_type].extra_authorize_params
+            self.assertNotIn("redirect_uri", params)
+
+    def test_authorize_params_match_the_station_browser_flow(self) -> None:
+        self.assertEqual(
+            PROVIDERS[GITHUB_OAUTH].extra_authorize_params, {"scope": "user:email"}
+        )
+        self.assertEqual(
+            PROVIDERS[LINUXDO_OAUTH].extra_authorize_params, {"response_type": "code"}
+        )
 
     def test_cookie_hints_name_the_provider_cookie(self) -> None:
         self.assertEqual(PROVIDERS[GITHUB_OAUTH].cookie_hint, "user_session")
@@ -92,6 +105,20 @@ class SuccessfulLoginTests(unittest.IsolatedAsyncioTestCase):
         await make_client(session).login(GITHUB_OAUTH, "user_session=abc")
         authorize = session.calls_to("/login/oauth/authorize")[0]
         self.assertEqual(authorize["headers"]["Cookie"], "user_session=abc")
+
+    async def test_the_query_string_matches_the_station_login_page(self) -> None:
+        """Pinned to new-api's own buildGitHubOAuthUrl.
+
+        The provider validates the request against the registered application,
+        so an extra parameter is not free: a guessed redirect_uri that misses
+        the registration is refused outright.
+        """
+        session = FakeSession(github_routes())
+        await make_client(session).login(GITHUB_OAUTH, "user_session=abc")
+        authorize = session.calls_to("/login/oauth/authorize")[0]
+        self.assertEqual(
+            authorize["params"], {"client_id": "cid-1", "state": "flow-1", "scope": "user:email"}
+        )
 
     async def test_does_not_follow_the_provider_redirect(self) -> None:
         """The authorization code lives in the Location header, not the target."""
@@ -154,8 +181,10 @@ class SuccessfulLoginTests(unittest.IsolatedAsyncioTestCase):
         result = await make_client(session).login(LINUXDO_OAUTH, "_t=abc")
         self.assertTrue(result.success)
         authorize = session.calls_to("/oauth2/authorize")[0]
-        self.assertEqual(authorize["params"]["redirect_uri"], f"{BASE}/api/oauth/linuxdo")
+        self.assertNotIn("redirect_uri", authorize["params"])
         self.assertEqual(authorize["params"]["response_type"], "code")
+        # A browser reaches the authorize page from the station's login page.
+        self.assertEqual(authorize["headers"]["Referer"], f"{BASE}/")
 
 
 class FailedLoginTests(unittest.IsolatedAsyncioTestCase):

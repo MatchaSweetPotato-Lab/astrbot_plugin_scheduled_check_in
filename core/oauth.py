@@ -1,20 +1,29 @@
 """OAuth login flows used to refresh relay-station session cookies.
 
-New-API style stations expose a standard three-legged flow:
+New-API style stations expose a standard four-legged flow:
 
 1. ``GET  {base_url}/api/status``          reveals whether a provider is enabled
    and its ``client_id``.
-2. ``POST {base_url}/api/oauth/state``     issues a short-lived ``flow_token``
-   used as the OAuth ``state``.
+2. ``GET  {base_url}/api/oauth/state``     issues a short-lived ``state``. Most
+   builds also bind it to a *server-side session*, so the cookie that response
+   sets has to be carried to leg 4 or the station rejects the callback with
+   ``state is empty or not same``. Newer branches serve the same route over
+   ``POST``; older ones have no such route at all.
 3. ``GET  {authorize_url}``                is called with the user's *third
    party* session cookie (``user_session`` for Github, ``_t`` for LinuxDO) and
-   redirects back with an authorization ``code``.
+   redirects back with an authorization ``code``. The query string mirrors the
+   station's own login page exactly — the callback is inferred from the
+   registered application, so sending a guessed ``redirect_uri`` is refused.
 4. ``GET  {base_url}/api/oauth/{provider}`` exchanges the code and returns the
    station's own session cookie.
 
 The third-party leg only redirects when the user has already approved the
 station's OAuth application in a browser at least once; otherwise the provider
 answers with a consent page, which is reported back as an actionable error.
+
+A provider that bounces to its own login page has rejected the *session*; one
+that answers 401/403 with no redirect has refused the *request*, which usually
+means something other than an expired cookie. The two are reported apart.
 """
 
 from __future__ import annotations
@@ -98,10 +107,10 @@ class OAuthProvider:
     # request as signed in. Github in particular answers a request carrying only
     # user_session with a redirect to its login page.
     companion_cookies: tuple[str, ...] = ()
-    # Github infers the callback from the registered application, and rejects
-    # any redirect_uri that does not match it exactly. LinuxDO derives the
-    # callback from the request host and requires it to be sent.
-    send_redirect_uri: bool = False
+    # Query parameters beyond client_id and state. These mirror the station's own
+    # browser flow exactly: every provider validates the authorize request
+    # against the registered application, so a parameter the browser omits is not
+    # a harmless extra — supplying a guessed one is grounds for rejection.
     extra_authorize_params: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -127,6 +136,7 @@ PROVIDERS: dict[str, OAuthProvider] = {
         # mirror and its session cookie before honouring an authorize request,
         # and otherwise redirects to its own login page.
         companion_cookies=("__Host-user_session_same_site", "_gh_sess", "logged_in"),
+        extra_authorize_params={"scope": "user:email"},
     ),
     LINUXDO_OAUTH: OAuthProvider(
         slug="linuxdo",
@@ -136,7 +146,6 @@ PROVIDERS: dict[str, OAuthProvider] = {
         client_id_key="linuxdo_client_id",
         cookie_hint="_t",
         companion_cookies=("_forum_session",),
-        send_redirect_uri=True,
         extra_authorize_params={"response_type": "code"},
     ),
 }
@@ -570,8 +579,6 @@ class OAuthLoginClient:
             unless the provider refreshed one of the cookies we already hold.
         """
         params = {"client_id": client_id, "state": state, **provider.extra_authorize_params}
-        if provider.send_redirect_uri:
-            params["redirect_uri"] = f"{self.base_url}/api/oauth/{provider.slug}"
 
         try:
             response = await self._request(
@@ -580,6 +587,10 @@ class OAuthLoginClient:
                 headers={
                     "Cookie": third_party_cookie,
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    # A browser arrives at the authorize page from the station's
+                    # login page. Some providers treat a referer-less navigation
+                    # as a cross-site request and refuse it.
+                    "Referer": f"{self.base_url}/",
                 },
                 params=params,
                 allow_redirects=False,

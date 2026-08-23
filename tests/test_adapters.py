@@ -752,7 +752,7 @@ class OAuthCheckInTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertIn("OAuth", result.message)
 
-    async def test_linuxdo_sends_a_redirect_uri(self) -> None:
+    async def test_linuxdo_authorize_matches_the_browser_flow(self) -> None:
         session = FakeSession(
             {
                 ("GET", f"{BASE}/api/status"): FakeResponse(
@@ -777,11 +777,16 @@ class OAuthCheckInTests(unittest.IsolatedAsyncioTestCase):
         await adapter.check_in()
 
         authorize = [c for c in session.calls if "connect.linux.do" in c["url"]][0]
-        self.assertEqual(authorize["params"]["redirect_uri"], f"{BASE}/api/oauth/linuxdo")
+        self.assertNotIn("redirect_uri", authorize["params"])
+        self.assertEqual(authorize["params"]["response_type"], "code")
         self.assertEqual(adapter.writeback.oauth_sessions["ld"], "session=new-sess")
 
-    async def test_github_does_not_send_a_redirect_uri(self) -> None:
-        """Github rejects any redirect_uri that does not match the registration."""
+    async def test_no_provider_sends_a_redirect_uri(self) -> None:
+        """Both providers reject a redirect_uri that misses the registration.
+
+        connect.linux.do answers a guessed one with a flat 403, so the authorize
+        leg has to send exactly what the station's own login page sends.
+        """
         session = FakeSession(
             self._github_routes({("GET", f"{BASE}/api/user/self"): FakeResponse(200, self_payload(0))})
         )
