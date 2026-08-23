@@ -608,10 +608,16 @@ class DatabaseManager:
         credentials: list[dict[str, Any]],
         previous: sqlite3.Row | dict[str, Any],
     ) -> list[dict[str, Any]]:
-        """Preserve OAuth session cookies the caller never received.
+        """Preserve OAuth secrets the caller never intended to change.
 
-        The dashboard is not given session cookies, so an unchanged credential
-        arrives back with an empty ``session_cookie``. Restore it from storage.
+        Two cases, both about the dashboard round-trip:
+
+        * The dashboard is not given session cookies, so an unchanged credential
+          arrives back with an empty ``session_cookie``.
+        * An OAuth cookie the user did not edit arrives back empty on purpose,
+          so that a save cannot overwrite a rotation that happened while the
+          editor was open. The form refuses to submit a genuinely blank
+          credential, so empty here always means "unchanged".
         """
         if not credentials:
             return credentials
@@ -628,12 +634,15 @@ class DatabaseManager:
         for credential in credentials:
             if "session_cookie" not in credential:
                 continue
-            if credential["session_cookie"]:
-                continue
             match = known.get(credential["id"])
-            if isinstance(match, dict) and match.get("type") == credential["type"]:
+            if not isinstance(match, dict) or match.get("type") != credential["type"]:
+                continue
+            if not credential["session_cookie"]:
                 credential["session_cookie"] = str(match.get("session_cookie") or "")
                 credential["session_updated_at"] = str(match.get("session_updated_at") or "")
+            if not credential.get("value"):
+                credential["value"] = str(match.get("value") or "")
+                credential["value_updated_at"] = str(match.get("value_updated_at") or "")
         return credentials
 
     def _seal_text(
@@ -781,6 +790,59 @@ class DatabaseManager:
                 (self.vault.encrypt_json(credentials), now_str, site_id.strip()),
             )
             return True
+
+    def update_credential_value(
+        self,
+        site_id: str,
+        credential_id: str,
+        value: str,
+    ) -> bool:
+        """Replace a credential's secret with a rotated one.
+
+        Providers rotate session cookies as they are used. Persisting the new
+        value keeps the next run from replaying one the provider has already
+        retired, which is what makes a stored cookie appear to "expire" on its
+        own. A blank value is refused so a bad response cannot wipe a working
+        credential.
+
+        Args:
+            site_id: Owning site.
+            credential_id: Credential whose value rotated.
+            value: The new secret.
+
+        Returns:
+            Whether a credential was updated.
+        """
+        new_value = str(value or "").strip()
+        if not new_value:
+            return False
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock, self._connection() as conn:
+            row = conn.execute(
+                "SELECT credentials FROM sites WHERE id = ?", (site_id.strip(),)
+            ).fetchone()
+            if row is None:
+                return False
+            credentials = self._decode_credentials(row["credentials"])
+            updated = False
+            for credential in credentials:
+                if credential.get("id") != str(credential_id).strip():
+                    continue
+                if credential.get("value") == new_value:
+                    return False
+                credential["value"] = new_value
+                credential["value_updated_at"] = now_str
+                updated = True
+                break
+            if not updated:
+                return False
+            conn.execute(
+                "UPDATE sites SET credentials = ?, updated_at = ? WHERE id = ?",
+                (self.vault.encrypt_json(credentials), now_str, site_id.strip()),
+            )
+        logger.info("Rotated credential %s on site %s.", credential_id, site_id)
+        return True
 
     def update_action_headers(
         self,

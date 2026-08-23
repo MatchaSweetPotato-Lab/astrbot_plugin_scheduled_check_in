@@ -111,6 +111,9 @@ class SiteWriteback:
     checkin_headers: list[dict[str, str]] | None = None
     balance_headers: list[dict[str, str]] | None = None
     oauth_sessions: dict[str, str] = field(default_factory=dict)
+    # Provider cookies the upstream rotated during a login, keyed by credential
+    # id. Storing them keeps the next run from replaying a retired session.
+    credential_values: dict[str, str] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
         """Return whether there is nothing to persist."""
@@ -118,6 +121,7 @@ class SiteWriteback:
             self.checkin_headers is None
             and self.balance_headers is None
             and not self.oauth_sessions
+            and not self.credential_values
         )
 
 
@@ -125,8 +129,8 @@ def persist_writeback(db: Any, site_id: str, writeback: SiteWriteback | None) ->
     """Persist runtime-discovered config updates for one site.
 
     Args:
-        db: Database manager exposing ``update_action_headers`` and
-            ``update_credential_session``.
+        db: Database manager exposing ``update_action_headers``,
+            ``update_credential_session`` and ``update_credential_value``.
         site_id: Site the writeback belongs to.
         writeback: Collected updates; ignored when empty or None.
     """
@@ -139,6 +143,8 @@ def persist_writeback(db: Any, site_id: str, writeback: SiteWriteback | None) ->
             db.update_action_headers(site_id, ACTION_BALANCE, writeback.balance_headers)
         for credential_id, session_cookie in writeback.oauth_sessions.items():
             db.update_credential_session(site_id, credential_id, session_cookie)
+        for credential_id, value in writeback.credential_values.items():
+            db.update_credential_value(site_id, credential_id, value)
     except Exception as exc:
         logger.warning(f"Could not persist discovered config for site {site_id}: {exc}")
 
@@ -403,6 +409,16 @@ class BaseCheckInAdapter(ABC):
             on_attempt=self._record_attempt,
         )
         result = await client.login(str(credential.get("type") or ""), credential.get("value"))
+
+        # Persist a rotated provider cookie whether or not the login succeeded:
+        # the provider may have moved the session on before rejecting, and
+        # replaying a value it has already retired guarantees the next failure.
+        if result.rotated_provider_cookie:
+            credential["value"] = result.rotated_provider_cookie
+            rotated_id = str(credential.get("id") or "")
+            if rotated_id:
+                self.writeback.credential_values[rotated_id] = result.rotated_provider_cookie
+
         if not result.success:
             return "", result.message
         credential["session_cookie"] = result.session_cookie

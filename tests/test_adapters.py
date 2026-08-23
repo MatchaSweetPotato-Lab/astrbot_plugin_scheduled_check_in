@@ -403,6 +403,100 @@ class NewApiTestConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.expired)
 
 
+class ProviderCookieRotationTests(unittest.IsolatedAsyncioTestCase):
+    """The provider cookie must follow the provider's rotation, or the stored
+    value goes stale and the next run replays a retired session."""
+
+    HELD = "user_session=OLD; _gh_sess=G1; logged_in=yes"
+
+    def _site(self):
+        return make_site(
+            credentials=[{"id": "gh", "type": "github_oauth", "label": "Github",
+                          "value": self.HELD}],
+            checkin={"protocol": "oauth"},
+        )
+
+    def _routes(self, authorize):
+        return {
+            ("GET", f"{BASE}/api/status"): FakeResponse(
+                200, '{"data":{"github_oauth":true,"github_client_id":"cid"}}'
+            ),
+            ("GET", f"{BASE}/api/oauth/state"): FakeResponse(200, '{"data":"st"}'),
+            ("GET", "https://github.com/login/oauth/authorize"): authorize,
+            ("GET", f"{BASE}/api/oauth/github"): FakeResponse(
+                200, "{}", cookies={"session": "fresh"}
+            ),
+            ("GET", f"{BASE}/api/user/self"): FakeResponse(200, self_payload(0)),
+        }
+
+    async def test_a_rotation_is_captured_for_writeback(self) -> None:
+        session = FakeSession(self._routes(FakeResponse(
+            302, "", headers={"location": f"{BASE}/cb?code=C&state=st"},
+            cookies={"_gh_sess": "G2"},
+        )))
+        adapter = create_adapter(self._site(), session)
+        result = await adapter.check_in()
+        self.assertTrue(result.success)
+        self.assertIn("_gh_sess=G2", adapter.writeback.credential_values["gh"])
+
+    async def test_the_other_cookies_are_preserved(self) -> None:
+        session = FakeSession(self._routes(FakeResponse(
+            302, "", headers={"location": f"{BASE}/cb?code=C&state=st"},
+            cookies={"_gh_sess": "G2"},
+        )))
+        adapter = create_adapter(self._site(), session)
+        await adapter.check_in()
+        stored = adapter.writeback.credential_values["gh"]
+        self.assertIn("user_session=OLD", stored)
+        self.assertIn("logged_in=yes", stored)
+
+    async def test_no_rotation_writes_nothing(self) -> None:
+        session = FakeSession(self._routes(FakeResponse(
+            302, "", headers={"location": f"{BASE}/cb?code=C&state=st"},
+        )))
+        adapter = create_adapter(self._site(), session)
+        await adapter.check_in()
+        self.assertEqual(adapter.writeback.credential_values, {})
+
+    async def test_a_rotation_is_kept_even_when_the_login_fails(self) -> None:
+        """The provider may move the session on before rejecting; replaying the
+        retired value would guarantee the next failure too."""
+        session = FakeSession(self._routes(FakeResponse(
+            302, "", headers={"location": "https://github.com/login"},
+            cookies={"_gh_sess": "G2"},
+        )))
+        adapter = create_adapter(self._site(), session)
+        result = await adapter.check_in()
+        self.assertFalse(result.success)
+        self.assertIn("_gh_sess=G2", adapter.writeback.credential_values["gh"])
+
+    async def test_the_credential_in_memory_is_updated(self) -> None:
+        """A later leg in the same run must use the rotated value."""
+        site = self._site()
+        session = FakeSession(self._routes(FakeResponse(
+            302, "", headers={"location": f"{BASE}/cb?code=C&state=st"},
+            cookies={"_gh_sess": "G2"},
+        )))
+        adapter = create_adapter(site, session)
+        await adapter.check_in()
+        self.assertIn("_gh_sess=G2", adapter.credentials[0]["value"])
+
+    def test_the_writeback_reports_a_rotation_as_pending(self) -> None:
+        self.assertTrue(SiteWriteback().is_empty())
+        self.assertFalse(SiteWriteback(credential_values={"gh": "x"}).is_empty())
+
+    def test_persist_writeback_routes_a_rotation(self) -> None:
+        calls = []
+
+        class Db:
+            def update_action_headers(self, *a): calls.append(("headers", *a)); return True
+            def update_credential_session(self, *a): calls.append(("session", *a)); return True
+            def update_credential_value(self, *a): calls.append(("value", *a)); return True
+
+        persist_writeback(Db(), "s1", SiteWriteback(credential_values={"gh": "new"}))
+        self.assertEqual(calls, [("value", "s1", "gh", "new")])
+
+
 class ProbeNewApiUserTests(unittest.IsolatedAsyncioTestCase):
     """The dashboard's fetch button needs a reason on failure, not silence."""
 

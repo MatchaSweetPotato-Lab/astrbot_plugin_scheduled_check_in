@@ -212,6 +212,10 @@ def normalize_credential(raw: Any, index: int = 0) -> dict[str, Any]:
     if cred_type in OAUTH_CREDENTIAL_TYPES:
         credential["session_cookie"] = str(source.get("session_cookie") or "").strip()
         credential["session_updated_at"] = str(source.get("session_updated_at") or "").strip()
+        # When the provider last rotated the cookie we hold. Kept here because
+        # normalization runs on every read and write, and an unlisted field
+        # would be dropped on the next save.
+        credential["value_updated_at"] = str(source.get("value_updated_at") or "").strip()
     return credential
 
 

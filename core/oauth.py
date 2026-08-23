@@ -148,6 +148,70 @@ class OAuthLoginResult:
     success: bool
     message: str
     session_cookie: str = ""
+    # The provider cookie after any rotation, when it changed during the flow.
+    # Empty means "unchanged"; the caller must not overwrite a working value
+    # with an empty string.
+    rotated_provider_cookie: str = ""
+
+
+def parse_cookie_header(value: str) -> dict[str, str]:
+    """Parse a ``Cookie`` header into a mapping, keeping the last of duplicates."""
+    jar: dict[str, str] = {}
+    for part in str(value or "").split(";"):
+        name, sep, cookie_value = part.strip().partition("=")
+        name = name.strip()
+        if name and sep:
+            jar[name] = cookie_value.strip()
+    return jar
+
+
+def format_cookie_header(jar: dict[str, str]) -> str:
+    """Render a cookie mapping back into a ``Cookie`` header value."""
+    return "; ".join(f"{name}={value}" for name, value in jar.items() if name)
+
+
+def merge_rotated_cookies(current: str, response_cookies: Any) -> str:
+    """Merge a response's ``Set-Cookie`` values over the stored cookie.
+
+    Providers rotate session cookies as they are used, and a browser stays
+    signed in precisely because it keeps the rotated values. Replaying one
+    frozen snapshot forever goes stale on its own and looks like a replayed
+    session. Only the names the response actually set are replaced, so a
+    partial response cannot drop the rest of the jar.
+
+    Args:
+        current: The cookie header currently stored for the credential.
+        response_cookies: Cookie jar from a provider response.
+
+    Returns:
+        The merged cookie header, or an empty string when nothing changed.
+    """
+    jar = parse_cookie_header(current)
+    if not jar:
+        return ""
+
+    changed = False
+    try:
+        items = list(response_cookies.items())
+    except Exception:
+        return ""
+
+    for name, raw in items:
+        name = str(name or "").strip()
+        if not name or name not in jar:
+            # Only refresh cookies we already hold. A provider may set unrelated
+            # cookies (analytics, flash messages) that add noise and no value.
+            continue
+        value = str(getattr(raw, "value", raw) or "")
+        # An expiry is signalled by a blank or sentinel value; keeping the old
+        # one is safer than storing a deletion.
+        if not value or value in ("deleted", '""'):
+            continue
+        if jar[name] != value:
+            jar[name] = value
+            changed = True
+
+    return format_cookie_header(jar) if changed else ""
 
 
 def get_provider(credential_type: str) -> OAuthProvider | None:
@@ -268,6 +332,11 @@ class OAuthLoginClient:
         self.impersonate = impersonate
         self.proxy = proxy or None
         self._on_attempt = on_attempt
+        # Set by the authorize leg. Held here rather than returned, because a
+        # rejected login still needs its rotation persisted — replaying a value
+        # the provider has already retired guarantees the next failure.
+        self._rotated_provider_cookie = ""
+
 
     def _record(
         self,
@@ -450,8 +519,13 @@ class OAuthLoginClient:
         client_id: str,
         state: str,
         third_party_cookie: str,
-    ) -> str:
-        """Exchange the third-party session cookie for an authorization code."""
+    ) -> tuple[str, str]:
+        """Exchange the third-party session cookie for an authorization code.
+
+        Returns:
+            Tuple of ``(code, rotated_cookie)``. The rotated cookie is empty
+            unless the provider refreshed one of the cookies we already hold.
+        """
         params = {"client_id": client_id, "state": state, **provider.extra_authorize_params}
         if provider.send_redirect_uri:
             params["redirect_uri"] = f"{self.base_url}/api/oauth/{provider.slug}"
@@ -483,11 +557,18 @@ class OAuthLoginClient:
                          error=detail)
             return OAuthError(detail)
 
+        # Capture rotation even on failure paths: the provider may have moved the
+        # session on before rejecting, and storing the new value keeps the next
+        # run from replaying one it has already retired.
+        rotated = merge_rotated_cookies(third_party_cookie, getattr(response, "cookies", {}))
+        if rotated:
+            self._rotated_provider_cookie = rotated
+
         code = _extract_code(location)
         if code:
             self._record(step, "GET", provider.authorize_url, status=status, success=True,
-                         message="已取得授权码")
-            return code
+                         message="已取得授权码" + ("（凭据 Cookie 已轮换，将回写）" if rotated else ""))
+            return code, rotated
 
         redirect_error = _extract_error(location)
         if redirect_error:
@@ -595,11 +676,23 @@ class OAuthLoginClient:
         try:
             client_id = await self._fetch_client_id(provider)
             state, station_cookie = await self._fetch_flow_token(provider)
-            code = await self._authorize(provider, client_id, state, cookie)
+            code, rotated_cookie = await self._authorize(provider, client_id, state, cookie)
             session_cookie = await self._exchange(provider, code, state, station_cookie)
         except OAuthError as exc:
             logger.info("OAuth login failed for %s at %s: %s", provider.slug, self.base_url, exc)
-            return OAuthLoginResult(False, str(exc))
+            return OAuthLoginResult(
+                False,
+                str(exc),
+                rotated_provider_cookie=self._rotated_provider_cookie,
+            )
 
+        if rotated_cookie:
+            logger.info("%s rotated its session cookie for %s; writing it back.",
+                        provider.label, self.base_url)
         logger.info("OAuth login succeeded for %s at %s", provider.slug, self.base_url)
-        return OAuthLoginResult(True, f"{provider.label} 登录成功", session_cookie)
+        return OAuthLoginResult(
+            True,
+            f"{provider.label} 登录成功",
+            session_cookie,
+            rotated_provider_cookie=rotated_cookie or self._rotated_provider_cookie,
+        )

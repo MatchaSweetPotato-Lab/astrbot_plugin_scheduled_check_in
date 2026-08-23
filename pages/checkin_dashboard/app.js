@@ -1352,9 +1352,14 @@ function buildSitePayloadFromForm() {
       const entry = {
         id: credential.id,
         type: credential.type,
-        label: credential.label || '',
-        value: credential.value || ''
+        label: credential.label || ''
       };
+      // Omitting the value means "unchanged"; storage restores the stored one.
+      // Only OAuth cookies rotate underneath us, so only they are eligible.
+      const untouchedOauthCookie = OAUTH_TYPES.includes(credential.type)
+        && credential.loadedValue
+        && credential.value === credential.loadedValue;
+      if (!untouchedOauthCookie) entry.value = credential.value || '';
       if (credential.type === 'token') entry.auto_bearer = credential.auto_bearer !== false;
       // Carry the stored session so the probe can reuse it instead of logging in.
       if (OAUTH_TYPES.includes(credential.type) && credential.session_cookie) {
@@ -1405,7 +1410,11 @@ function openEditSiteModal(index) {
 
   credentialDraft = (Array.isArray(site.credentials) ? site.credentials : []).map(credential => ({
     ...credential,
-    id: credential.id || nextCredentialId()
+    id: credential.id || nextCredentialId(),
+    // Remember what was loaded. An OAuth cookie the user never touches is
+    // omitted on save, so a rotation that happened while this editor was open
+    // is not reverted by an unrelated edit.
+    loadedValue: credential.value || ''
   }));
   renderCredentials();
   fillActionForm('checkin', site.checkin);
@@ -1460,9 +1469,14 @@ async function submitSiteForm() {
       const entry = {
         id: credential.id,
         type: credential.type,
-        label: credential.label || '',
-        value: credential.value || ''
+        label: credential.label || ''
       };
+      // Omitting the value means "unchanged"; storage restores the stored one.
+      // Only OAuth cookies rotate underneath us, so only they are eligible.
+      const untouchedOauthCookie = OAUTH_TYPES.includes(credential.type)
+        && credential.loadedValue
+        && credential.value === credential.loadedValue;
+      if (!untouchedOauthCookie) entry.value = credential.value || '';
       if (credential.type === 'token') entry.auto_bearer = credential.auto_bearer !== false;
       return entry;
     }),

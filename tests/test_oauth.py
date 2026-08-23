@@ -14,6 +14,8 @@ from core.oauth import (
     _missing_cookies,
     _safe_location,
     get_provider,
+    merge_rotated_cookies,
+    parse_cookie_header,
 )
 from tests.fakes import FakeResponse, FakeSession
 
@@ -619,6 +621,97 @@ class StateEndpointMethodTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.success)
         authorize = session.calls_to("/login/oauth/authorize")[0]
         self.assertTrue(authorize["params"]["state"])
+
+
+class CookieRotationTests(unittest.TestCase):
+    """A provider rotates session cookies as they are used. Replaying one frozen
+    snapshot is what makes a stored cookie appear to expire on its own."""
+
+    HELD = "user_session=OLD; __Host-user_session_same_site=SS; _gh_sess=G1; logged_in=yes"
+
+    def test_a_rotated_cookie_is_merged(self) -> None:
+        merged = merge_rotated_cookies(self.HELD, {"_gh_sess": "G2"})
+        self.assertIn("_gh_sess=G2", merged)
+
+    def test_the_rest_of_the_jar_survives(self) -> None:
+        merged = merge_rotated_cookies(self.HELD, {"_gh_sess": "G2"})
+        jar = parse_cookie_header(merged)
+        self.assertEqual(jar["user_session"], "OLD")
+        self.assertEqual(jar["__Host-user_session_same_site"], "SS")
+        self.assertEqual(jar["logged_in"], "yes")
+
+    def test_several_cookies_rotate_at_once(self) -> None:
+        merged = merge_rotated_cookies(self.HELD, {"_gh_sess": "G2", "user_session": "NEW"})
+        jar = parse_cookie_header(merged)
+        self.assertEqual(jar["_gh_sess"], "G2")
+        self.assertEqual(jar["user_session"], "NEW")
+
+    def test_an_unchanged_value_reports_no_rotation(self) -> None:
+        """Empty means "unchanged", so a caller never writes a pointless update."""
+        self.assertEqual(merge_rotated_cookies(self.HELD, {"_gh_sess": "G1"}), "")
+
+    def test_unrelated_cookies_are_ignored(self) -> None:
+        """Analytics and flash cookies add noise and no value."""
+        self.assertEqual(merge_rotated_cookies(self.HELD, {"_octo": "GH1.1"}), "")
+
+    def test_a_deletion_never_blanks_a_held_cookie(self) -> None:
+        for sentinel in ("", "deleted", '""'):
+            self.assertEqual(merge_rotated_cookies(self.HELD, {"_gh_sess": sentinel}), "", sentinel)
+
+    def test_no_response_cookies(self) -> None:
+        self.assertEqual(merge_rotated_cookies(self.HELD, {}), "")
+
+    def test_an_empty_stored_cookie_cannot_be_seeded(self) -> None:
+        """Rotation refreshes what we hold; it never invents a credential."""
+        self.assertEqual(merge_rotated_cookies("", {"_gh_sess": "G2"}), "")
+
+    def test_a_broken_jar_is_survived(self) -> None:
+        class Boom:
+            def items(self):
+                raise RuntimeError("no cookies here")
+
+        self.assertEqual(merge_rotated_cookies(self.HELD, Boom()), "")
+
+    def test_cookie_objects_are_unwrapped(self) -> None:
+        class Cookie:
+            def __init__(self, value): self.value = value
+
+        merged = merge_rotated_cookies(self.HELD, {"_gh_sess": Cookie("G9")})
+        self.assertIn("_gh_sess=G9", merged)
+
+
+class RotationReportingTests(unittest.IsolatedAsyncioTestCase):
+    HELD = "user_session=OLD; __Host-user_session_same_site=SS; _gh_sess=G1; logged_in=yes"
+
+    def _routes(self, authorize_cookies=None, authorize=None):
+        return github_routes({
+            ("GET", GITHUB_AUTHORIZE): authorize or FakeResponse(
+                302, "",
+                headers={"location": f"{BASE}/oauth/github?code=CODE-1&state=flow-1"},
+                cookies=authorize_cookies or {},
+            )
+        })
+
+    async def test_a_rotation_is_reported_on_success(self) -> None:
+        session = FakeSession(self._routes({"_gh_sess": "G2"}))
+        result = await make_client(session).login(GITHUB_OAUTH, self.HELD)
+        self.assertTrue(result.success)
+        self.assertIn("_gh_sess=G2", result.rotated_provider_cookie)
+
+    async def test_no_rotation_reports_nothing(self) -> None:
+        session = FakeSession(self._routes())
+        result = await make_client(session).login(GITHUB_OAUTH, self.HELD)
+        self.assertTrue(result.success)
+        self.assertEqual(result.rotated_provider_cookie, "")
+
+    async def test_the_trace_mentions_the_rotation(self) -> None:
+        trace: list[dict] = []
+        session = FakeSession(self._routes({"_gh_sess": "G2"}))
+        client = OAuthLoginClient(session, BASE, "chrome131", None,
+                                  on_attempt=lambda **kw: trace.append(kw))
+        await client.login(GITHUB_OAUTH, self.HELD)
+        authorize = [item for item in trace if "授权" in item["step"] and item["success"]]
+        self.assertTrue(any("轮换" in (item.get("message") or "") for item in authorize))
 
 
 if __name__ == "__main__":

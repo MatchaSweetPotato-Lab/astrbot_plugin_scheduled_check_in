@@ -968,6 +968,83 @@ class KeySlotStorageTests(unittest.TestCase):
         self.assertEqual(self.db.list_slots(), [])
 
 
+class CredentialRotationTests(unittest.TestCase):
+    """A provider cookie rotates underneath us; storage must keep the new one."""
+
+    HELD = "user_session=OLD; _gh_sess=G1; logged_in=yes"
+    ROTATED = "user_session=OLD; _gh_sess=G2; logged_in=yes"
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "data.db"
+        self.db = DatabaseManager(self.db_path)
+        self.db.save_sites([
+            make_site(credentials=[
+                {"id": "gh", "type": "github_oauth", "label": "Github",
+                 "value": self.HELD, "session_cookie": "session=live"},
+            ])
+        ])
+
+    def tearDown(self) -> None:
+        try:
+            self.temp_dir.cleanup()
+        except OSError:
+            pass
+
+    def _credential(self) -> dict:
+        return self.db.get_sites()[0]["credentials"][0]
+
+    def test_a_rotated_value_is_stored(self) -> None:
+        self.assertTrue(self.db.update_credential_value("site_1", "gh", self.ROTATED))
+        self.assertEqual(self._credential()["value"], self.ROTATED)
+
+    def test_the_rotation_is_timestamped(self) -> None:
+        self.db.update_credential_value("site_1", "gh", self.ROTATED)
+        self.assertTrue(self._credential()["value_updated_at"])
+
+    def test_an_unchanged_value_is_not_rewritten(self) -> None:
+        self.assertFalse(self.db.update_credential_value("site_1", "gh", self.HELD))
+
+    def test_a_blank_value_cannot_wipe_the_credential(self) -> None:
+        """A bad response must never destroy a working credential."""
+        for blank in ("", "   ", None):
+            self.assertFalse(self.db.update_credential_value("site_1", "gh", blank))
+        self.assertEqual(self._credential()["value"], self.HELD)
+
+    def test_an_unknown_credential_is_ignored(self) -> None:
+        self.assertFalse(self.db.update_credential_value("site_1", "nope", self.ROTATED))
+        self.assertFalse(self.db.update_credential_value("nope", "gh", self.ROTATED))
+
+    def test_the_session_cookie_is_untouched(self) -> None:
+        self.db.update_credential_value("site_1", "gh", self.ROTATED)
+        self.assertEqual(self._credential()["session_cookie"], "session=live")
+
+    def test_the_rotation_survives_encryption(self) -> None:
+        key = self.db.enable_encryption()
+        self.db.update_credential_value("site_1", "gh", self.ROTATED)
+        self.db.lock_encryption()
+        self.db.unlock_encryption(key)
+        self.assertEqual(self._credential()["value"], self.ROTATED)
+
+    def test_an_omitted_value_keeps_the_stored_one(self) -> None:
+        """The dashboard omits an untouched OAuth cookie so that saving an
+        unrelated edit cannot revert a rotation."""
+        self.db.update_credential_value("site_1", "gh", self.ROTATED)
+        payload = self.db.get_sites_for_display()
+        del payload[0]["credentials"][0]["value"]
+        payload[0]["name"] = "Renamed"
+        self.db.save_sites(payload)
+        self.assertEqual(self._credential()["value"], self.ROTATED)
+        self.assertEqual(self.db.get_sites()[0]["name"], "Renamed")
+
+    def test_a_supplied_value_still_wins(self) -> None:
+        """Editing the cookie by hand must not be ignored."""
+        payload = self.db.get_sites_for_display()
+        payload[0]["credentials"][0]["value"] = "user_session=TYPED"
+        self.db.save_sites(payload)
+        self.assertEqual(self._credential()["value"], "user_session=TYPED")
+
+
 class LegacyVaultUpgradeTests(unittest.TestCase):
     """A vault created before key slots must keep working untouched."""
 
