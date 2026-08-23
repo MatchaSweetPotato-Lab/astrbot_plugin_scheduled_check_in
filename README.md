@@ -195,6 +195,10 @@ http://<你的面板地址>/api/v1/plugins/extensions/astrbot_plugin_scheduled_c
 注册流程：**解锁配置 → 打开该页面 → 注册当前设备 → 完成一次生物识别 / PIN 验证**。
 之后锁定时，在该页面点「使用通行密钥解锁」即可。
 
+在独立页面解锁成功后，插件面板会自动同步并关闭「管理通行密钥」弹窗，无需手动点「刷新状态」。
+沙箱 iframe 处于不透明源，`BroadcastChannel`、`localStorage` 与跨标签页 `postMessage` 都不可用，
+因此这里靠轮询加密状态实现——仅在该弹窗打开期间轮询，关闭即停止。
+
 ### 让浏览器密码管理器记住 Base64 密钥
 
 该独立页面提供一个标准密码表单（`autocomplete="current-password"`），

@@ -29,6 +29,9 @@ let vaultState = { enabled: false, unlocked: false, locked: false };
 let keySlots = [];
 let activeAnalyticsSite = null;
 let analyticsMonth = '';
+// Set while the passkey hand-off dialog is open, to watch the other tab's work.
+let passkeyWatch = null;
+const PASSKEY_POLL_MS = 3000;
 const PLUGIN_ID = 'astrbot_plugin_scheduled_check_in';
 
 const SLOT_TYPE_LABELS = {
@@ -199,6 +202,9 @@ function openModal(id) {
 function closeModal(id) {
   const el = document.getElementById(id);
   if (el) el.classList.remove('active');
+  // Every way out of the passkey dialog — the close button, 了解, and an overlay
+  // click — lands here, so this is the one place the watch has to be stopped.
+  if (id === 'passkey-modal') stopPasskeyWatch();
 }
 
 function handleOverlayClick(event, id) {
@@ -1749,6 +1755,78 @@ function openPasskeyModal() {
   if (box) box.textContent = getPasskeyPageUrl();
   clearCopyStatus('passkey-url', 'passkey-url-status');
   openModal('passkey-modal');
+  startPasskeyWatch();
+}
+
+/**
+ * Watch for what the standalone passkey tab does, while this dialog is open.
+ *
+ * The other tab cannot tell this one directly: the iframe has an opaque origin,
+ * which rules out BroadcastChannel, localStorage and cross-tab postMessage
+ * alike. Polling the vault state is the only channel left, and it is only worth
+ * running while the dialog that sent the user there is still open.
+ */
+function startPasskeyWatch() {
+  stopPasskeyWatch();
+  const lockedAtOpen = isVaultLocked();
+  passkeyWatch = {
+    lockedAtOpen,
+    // Locked: poll, for the case where both tabs are visible side by side and
+    // no visibility change ever fires. Coming back to a backgrounded tab is
+    // already handled globally, so this deliberately adds no second listener.
+    timer: lockedAtOpen ? window.setInterval(syncPasskeyProgress, PASSKEY_POLL_MS) : null,
+    // Unlocked: an unlocked vault is the precondition for registering a device,
+    // so the only thing the other tab can change is the slot list — worth
+    // re-reading once, on return, but not worth polling for.
+    onVisible: lockedAtOpen ? null : () => {
+      if (!document.hidden) loadKeySlots();
+    }
+  };
+  if (passkeyWatch.onVisible) {
+    document.addEventListener('visibilitychange', passkeyWatch.onVisible);
+  }
+}
+
+function stopPasskeyWatch() {
+  if (!passkeyWatch) return;
+  if (passkeyWatch.timer) window.clearInterval(passkeyWatch.timer);
+  if (passkeyWatch.onVisible) {
+    document.removeEventListener('visibilitychange', passkeyWatch.onVisible);
+  }
+  passkeyWatch = null;
+}
+
+/** Poll for an unlock performed in the other tab, and adopt it when it lands. */
+async function syncPasskeyProgress() {
+  if (!passkeyWatch?.lockedAtOpen) return;
+
+  let unlocked = false;
+  try {
+    const data = await apiGet('/api/vault');
+    unlocked = data?.locked !== true;
+  } catch (e) {
+    // A dropped request is not a state change. Stay quiet and keep watching:
+    // the user is mid-unlock in another tab and a toast here helps nobody.
+    return;
+  }
+  // The dialog may have been closed by hand while the request was in flight.
+  if (!passkeyWatch || !unlocked) return;
+  await refreshVaultState({ quiet: true });
+}
+
+/**
+ * Dismiss the hand-off dialog once the tab it points at has done its job.
+ *
+ * Returns whether an open dialog was actually closed, so the caller can skip
+ * its own "已同步" toast rather than raise two for one event.
+ */
+function closePasskeyHandoff() {
+  const open = document.getElementById('passkey-modal')?.classList.contains('active');
+  stopPasskeyWatch();
+  if (!open) return false;
+  closeModal('passkey-modal');
+  showToast('已在其他标签页解锁，配置已同步', 'success');
+  return true;
 }
 
 async function copyPasskeyUrl() {
@@ -1771,10 +1849,15 @@ async function copyPasskeyUrl() {
 async function refreshVaultState(options = {}) {
   const { quiet = false } = options;
   try {
+    const wasLocked = isVaultLocked();
     await loadVaultState();
     await loadSites();
-    if (!quiet) {
-      const locked = isVaultLocked();
+    const locked = isVaultLocked();
+    // Whichever path noticed the unlock — this dialog's own poll, the manual
+    // button, or returning to the tab — the hand-off dialog has nothing left to
+    // say once the other tab has done its job.
+    const handedOff = wasLocked && !locked && closePasskeyHandoff();
+    if (!quiet && !handedOff) {
       showToast(locked ? '仍处于锁定状态' : '已同步：配置已解锁', locked ? 'warning' : 'success');
     }
     return true;
