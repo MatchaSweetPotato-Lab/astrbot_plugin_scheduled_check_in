@@ -107,6 +107,10 @@ class OAuthProvider:
     # request as signed in. Github in particular answers a request carrying only
     # user_session with a redirect to its login page.
     companion_cookies: tuple[str, ...] = ()
+    # Cookie that carries a solved bot-management challenge. Deliberately not in
+    # all_cookies: it is only needed when the host actually challenges, so
+    # demanding it up front would report a working credential as incomplete.
+    challenge_cookie: str = "cf_clearance"
     # Query parameters beyond client_id and state. These mirror the station's own
     # browser flow exactly: every provider validates the authorize request
     # against the registered application, so a parameter the browser omits is not
@@ -334,6 +338,61 @@ def _strip_html(text: str) -> str:
         r"<(script|style)\b.*?</\1>", " ", str(text or ""), flags=re.S | re.I
     )
     return " ".join(re.sub(r"<[^>]+>", " ", without_scripts).split())
+
+
+# Markers of a Cloudflare interstitial. The visible title is localised, so match
+# the machine-readable pieces too — the challenge script path and the form the
+# challenge posts back are stable across languages.
+_CLOUDFLARE_MARKERS: tuple[str, ...] = (
+    "just a moment",
+    "enable javascript and cookies to continue",
+    "/cdn-cgi/challenge-platform/",
+    "cf-browser-verification",
+    "cf_chl_opt",
+    "__cf_chl_",
+    "checking if the site connection is secure",
+    "attention required! | cloudflare",
+)
+
+
+def is_cloudflare_challenge(status: int, body: str, headers: Any = None) -> bool:
+    """Recognise Cloudflare's bot-management interstitial.
+
+    Worth telling apart from any other refusal: nothing about the user's cookie
+    is wrong, so every remedy for an expired session is the wrong advice. The
+    ``cf-mitigated`` header states it outright when present; otherwise the body
+    of the challenge page is the evidence.
+    """
+    if status not in (403, 503, 429):
+        return False
+    try:
+        mitigated = str((headers or {}).get("cf-mitigated") or "").strip().lower()
+    except Exception:
+        mitigated = ""
+    if mitigated == "challenge":
+        return True
+    text = str(body or "").lower()
+    return any(marker in text for marker in _CLOUDFLARE_MARKERS)
+
+
+def _cloudflare_challenge_message(provider: OAuthProvider, status: int) -> str:
+    """Explain a Cloudflare interstitial, and what actually gets past one.
+
+    The clearance cookie is bound to the IP address and User-Agent that solved
+    the challenge, which is the part users get wrong: copying it out of a browser
+    on another machine, or leaving a proxy in the way, invalidates it. Say so
+    rather than letting them retry the copy forever.
+    """
+    return (
+        f"{provider.authorize_host} 返回了 Cloudflare 人机验证页 (HTTP {status})，"
+        "这不是凭据失效——服务端请求无法执行验证页里的 JavaScript。"
+        f"可尝试：1. 在浏览器通过验证后，把 {provider.challenge_cookie} 一起复制进该凭据"
+        f"（与 {', '.join(provider.all_cookies)} 放在同一行）；"
+        "2. 该 Cookie 绑定 IP 与 User-Agent，需与浏览器同出口 IP（通常要去掉站点代理），"
+        "且「全局设置」的浏览器指纹要与该浏览器一致；"
+        "3. 它通常仅数十分钟有效，定时签到多半会再次被拦，"
+        f"更稳妥的做法是给该站点换用 Github OAuth 或普通 Token / Cookie 凭据。"
+    )
 
 
 def _rejected_session_message(provider: OAuthProvider, cookie: str) -> str:
@@ -586,11 +645,17 @@ class OAuthLoginClient:
                 provider.authorize_url,
                 headers={
                     "Cookie": third_party_cookie,
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    # A browser arrives at the authorize page from the station's
-                    # login page. Some providers treat a referer-less navigation
-                    # as a cross-site request and refuse it.
+                    # A browser reaches this page by clicking the provider button
+                    # on the station's login page. Send that navigation's full
+                    # signature — a Referer without the matching Sec-Fetch-Site
+                    # describes a request no browser can make, and bot scoring
+                    # reads the inconsistency. Everything else (Accept,
+                    # Sec-Ch-Ua, Accept-Language) is left to the impersonation,
+                    # which already sends the real Chrome values; overriding one
+                    # by hand only makes the header set disagree with the
+                    # User-Agent it claims.
                     "Referer": f"{self.base_url}/",
+                    "Sec-Fetch-Site": "cross-site",
                 },
                 params=params,
                 allow_redirects=False,
@@ -638,6 +703,11 @@ class OAuthLoginClient:
             # Bounced to the provider's own login page: the session was not
             # accepted, so an expired or incomplete cookie is the likely cause.
             raise fail(_rejected_session_message(provider, third_party_cookie))
+        if is_cloudflare_challenge(status, body, getattr(response, "headers", None)):
+            # Checked before the generic refusal: a challenge page says nothing
+            # about the credential, so every remedy for a bad cookie is wrong
+            # advice here and would send the user re-copying it for nothing.
+            raise fail(_cloudflare_challenge_message(provider, status))
         if status in (401, 403):
             # No redirect at all. The session may be fine while the *request* is
             # refused — a blocked client, a rate limit, or an application that

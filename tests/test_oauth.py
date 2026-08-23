@@ -14,6 +14,7 @@ from core.oauth import (
     _missing_cookies,
     _safe_location,
     get_provider,
+    is_cloudflare_challenge,
     merge_rotated_cookies,
     parse_cookie_header,
 )
@@ -757,9 +758,9 @@ class RotationReportingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("轮换" in (item.get("message") or "") for item in authorize))
 
 
-class RefusedAuthorizeTests(unittest.IsolatedAsyncioTestCase):
-    """A flat refusal is a different failure from a bounce to the login page,
-    and conflating them sends the user to re-copy a cookie that is fine."""
+class LinuxdoAuthorizeHelpers:
+    """Shared LinuxDO route table. A plain mixin, not a TestCase: subclassing a
+    TestCase to borrow helpers would re-run all of its tests under the new name."""
 
     COOKIE = "_t=abc; _forum_session=fs"
 
@@ -780,6 +781,11 @@ class RefusedAuthorizeTests(unittest.IsolatedAsyncioTestCase):
         recorder = (lambda **kw: trace.append(kw)) if trace is not None else None
         client = OAuthLoginClient(session, BASE, "chrome131", None, on_attempt=recorder)
         return await client.login(LINUXDO_OAUTH, cookie or self.COOKIE)
+
+
+class RefusedAuthorizeTests(LinuxdoAuthorizeHelpers, unittest.IsolatedAsyncioTestCase):
+    """A flat refusal is a different failure from a bounce to the login page,
+    and conflating them sends the user to re-copy a cookie that is fine."""
 
     async def test_a_403_does_not_claim_the_cookie_expired(self) -> None:
         result = await self._login(FakeResponse(403, '{"error":"forbidden"}'))
@@ -837,6 +843,116 @@ class RefusedAuthorizeTests(unittest.IsolatedAsyncioTestCase):
         """The authorize request goes to connect.linux.do, not the forum."""
         result = await self._login(FakeResponse(403, "nope"))
         self.assertIn("connect.linux.do", result.message)
+
+
+# The page connect.linux.do actually returned, trimmed to its identifying parts.
+CLOUDFLARE_PAGE = (
+    '<html dir="ltr"> <head> <title>Just a moment...</title> '
+    '<meta http-equiv="Content-Type" content="text/html; charset=utf-8"> '
+    '<meta name="viewport" content="width=device-width, initial-scale=1"/> '
+    '<link rel="icon" href="data:image/svg+xml;base64,PD94bWwg"/> </head> '
+    "<body> Enable JavaScript and cookies to continue </body></html>"
+)
+
+
+class CloudflareDetectionTests(unittest.TestCase):
+    """A challenge page is not a credential problem, and must not read as one."""
+
+    def test_recognises_the_interstitial_body(self) -> None:
+        self.assertTrue(is_cloudflare_challenge(403, CLOUDFLARE_PAGE))
+
+    def test_recognises_the_mitigation_header_alone(self) -> None:
+        """A localised page may match no body marker; the header still states it."""
+        self.assertTrue(
+            is_cloudflare_challenge(403, "denied", {"cf-mitigated": "challenge"})
+        )
+
+    def test_recognises_the_challenge_script_path(self) -> None:
+        body = '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1"></script>'
+        self.assertTrue(is_cloudflare_challenge(503, body))
+
+    def test_a_plain_refusal_is_not_a_challenge(self) -> None:
+        self.assertFalse(is_cloudflare_challenge(403, "Forbidden: app not authorized"))
+
+    def test_a_success_is_never_a_challenge(self) -> None:
+        """Guards against reading a legitimate page that merely quotes the text."""
+        self.assertFalse(is_cloudflare_challenge(200, CLOUDFLARE_PAGE))
+
+    def test_unparsable_headers_fall_back_to_the_body(self) -> None:
+        class Hostile:
+            def get(self, key):
+                raise RuntimeError("no mapping here")
+
+        self.assertTrue(is_cloudflare_challenge(403, CLOUDFLARE_PAGE, Hostile()))
+        self.assertFalse(is_cloudflare_challenge(403, "plain", Hostile()))
+
+
+class CloudflareChallengeLoginTests(LinuxdoAuthorizeHelpers, unittest.IsolatedAsyncioTestCase):
+    """End-to-end wording for a challenged authorize leg."""
+
+    async def test_does_not_blame_the_credential(self) -> None:
+        result = await self._login(FakeResponse(403, CLOUDFLARE_PAGE))
+        self.assertFalse(result.success)
+        self.assertIn("Cloudflare", result.message)
+        self.assertIn("不是凭据失效", result.message)
+        # None of the wrong remedies for an expired or incomplete cookie.
+        self.assertNotIn("已失效或被拒绝", result.message)
+        self.assertNotIn("尚未在浏览器中授权", result.message)
+
+    async def test_names_the_clearance_cookie_and_its_bindings(self) -> None:
+        result = await self._login(FakeResponse(403, CLOUDFLARE_PAGE))
+        self.assertIn("cf_clearance", result.message)
+        # The two things that silently invalidate a copied clearance cookie.
+        self.assertIn("IP", result.message)
+        self.assertIn("指纹", result.message)
+
+    async def test_offers_the_durable_alternative(self) -> None:
+        """A clearance cookie expires long before the next scheduled run."""
+        result = await self._login(FakeResponse(403, CLOUDFLARE_PAGE))
+        self.assertIn("Github OAuth", result.message)
+
+    async def test_records_the_page_in_the_trace(self) -> None:
+        trace: list[dict] = []
+        await self._login(FakeResponse(403, CLOUDFLARE_PAGE), trace=trace)
+        authorize = [entry for entry in trace if "授权" in entry.get("step", "")][0]
+        self.assertIn("Just a moment", authorize.get("response_text", ""))
+
+    async def test_the_clearance_cookie_is_not_demanded_up_front(self) -> None:
+        """It is only needed when challenged, so a credential without it is complete."""
+        self.assertNotIn("cf_clearance", PROVIDERS[LINUXDO_OAUTH].all_cookies)
+        self.assertEqual(_missing_cookies(PROVIDERS[LINUXDO_OAUTH], self.COOKIE), [])
+
+    async def test_a_supplied_clearance_cookie_is_sent_through(self) -> None:
+        """Nothing filters the credential, so the user can add it themselves."""
+        cookie = f"{self.COOKIE}; cf_clearance=solved-token"
+        session = FakeSession(self._routes(FakeResponse(403, CLOUDFLARE_PAGE)))
+        client = OAuthLoginClient(session, BASE, "chrome131", None)
+        await client.login(LINUXDO_OAUTH, cookie)
+        authorize = session.calls_to("/oauth2/authorize")[0]
+        self.assertIn("cf_clearance=solved-token", authorize["headers"]["Cookie"])
+
+
+class AuthorizeFingerprintTests(unittest.IsolatedAsyncioTestCase):
+    """The authorize leg has to look like the navigation it claims to be.
+
+    curl_cffi's impersonation already sends Chrome's real Accept, Sec-Ch-Ua and
+    Sec-Fetch-* values. Overriding one by hand leaves a header set that
+    disagrees with its own User-Agent, which is what bot scoring looks for.
+    """
+
+    async def test_does_not_override_the_impersonated_accept(self) -> None:
+        session = FakeSession(github_routes())
+        await make_client(session).login(GITHUB_OAUTH, "user_session=abc")
+        authorize = session.calls_to("/login/oauth/authorize")[0]
+        self.assertNotIn("Accept", authorize["headers"])
+
+    async def test_sends_a_consistent_cross_site_navigation(self) -> None:
+        """A Referer with Sec-Fetch-Site: none describes an impossible request."""
+        session = FakeSession(github_routes())
+        await make_client(session).login(GITHUB_OAUTH, "user_session=abc")
+        headers = session.calls_to("/login/oauth/authorize")[0]["headers"]
+        self.assertEqual(headers["Referer"], f"{BASE}/")
+        self.assertEqual(headers["Sec-Fetch-Site"], "cross-site")
 
 
 if __name__ == "__main__":

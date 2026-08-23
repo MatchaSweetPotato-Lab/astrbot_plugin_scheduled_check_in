@@ -72,7 +72,12 @@ const OAUTH_COOKIE_NOTES = {
 // invalidated — sometimes logging the user out of github.com as well.
 const OAUTH_COOKIE_VOLATILITY = {
   github_oauth: 'Github 会对请求环境做检测，服务端发起的授权可能触发风控并使该 Cookie 失效'
-    + '（有时会连带注销浏览器登录）。失效后需重新复制，必要时改用 LinuxDO OAuth 或 Token / Cookie 凭据。'
+    + '（有时会连带注销浏览器登录）。失效后需重新复制，必要时改用 LinuxDO OAuth 或 Token / Cookie 凭据。',
+  // Cloudflare fronts connect.linux.do and can serve a JS challenge that no
+  // server-side request can solve. Say it here rather than only after it fails.
+  linuxdo_oauth: 'connect.linux.do 由 Cloudflare 托管，可能返回人机验证页而拦截服务端请求。'
+    + '此时可把浏览器通过验证后的 cf_clearance 一并复制进来（绑定 IP 与 User-Agent，通常需去掉代理），'
+    + '但其有效期很短；长期签到更适合用 Github OAuth 或 Token / Cookie 凭据。'
 };
 
 // Endpoints each framework already knows, shown as placeholder hints.

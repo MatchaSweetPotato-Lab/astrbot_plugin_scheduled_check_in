@@ -134,6 +134,21 @@
 > 站点可能在拒绝前就已更换会话，继续重放旧值只会保证下一次也失败。
 > 在编辑弹窗中未改动的 OAuth Cookie 保存时会被跳过，因此期间发生的轮换不会被覆盖回旧值。
 
+> **LinuxDO 可能被 Cloudflare 拦截。** `connect.linux.do` 由 Cloudflare 托管，可能对服务端请求返回
+> 人机验证页（`Just a moment... / Enable JavaScript and cookies to continue`，HTTP 403）。
+> 这**不是凭据失效**——验证页要求执行 JavaScript，任何服务端 HTTP 请求都无法完成。插件会明确识别
+> 这种响应并单独提示，不会误报成 Cookie 过期。可尝试：
+>
+> 1. 在浏览器通过验证后，把 `cf_clearance` 与 `_t`、`_forum_session` 一起复制进该凭据；
+> 2. `cf_clearance` **绑定出口 IP 与 User-Agent**：需与浏览器同一出口（通常要清空站点代理），
+>    且「全局设置」的浏览器指纹要与该浏览器版本一致，否则复制过来也无效；
+> 3. 它的有效期通常只有几十分钟，**定时签到大概率会再次被拦**。需要长期稳定时，
+>    建议该站点改用 `Github OAuth` 或普通 `Token` / `Cookie` 凭据。
+>
+> 插件不内置绕过人机验证的能力：授权请求已按真实浏览器的完整签名发出（TLS 指纹、
+> `Accept`、`Sec-Ch-Ua`、`Sec-Fetch-*` 均由指纹库提供，并带上与 `Sec-Fetch-Site: cross-site`
+> 一致的 `Referer`），能否通过取决于 Cloudflare 对该出口 IP 的判定——机房 IP 被拦的概率明显更高。
+
 > **Github 凭据仍可能失效。** Github 会对请求环境做检测，服务端发起的授权请求与该 Cookie
 > 原本所属的浏览器特征不一致，可能触发风控使 Cookie 失效，**有时会连带注销你在浏览器里的
 > github.com 登录**。表现为签到日志中「Github OAuth 授权」一步返回 302 跳转到
