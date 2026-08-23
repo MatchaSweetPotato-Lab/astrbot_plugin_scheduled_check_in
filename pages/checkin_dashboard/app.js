@@ -1177,6 +1177,19 @@ function renderActionCredentialOptions(action) {
   const usable = credentialDraft.filter(credential =>
     wantsOauth ? OAUTH_TYPES.includes(credential.type) : true
   );
+
+  // OAUTH_TYPES is in the same order the backend resolves them, so the label
+  // can name what will actually be picked instead of a generic priority that
+  // may not apply — with only LinuxDO configured, "优先 Github" is misleading.
+  const presentOauth = OAUTH_TYPES.filter(type => usable.some(item => item.type === type));
+  if (wantsOauth) {
+    if (presentOauth.length === 1) {
+      auto.textContent = `自动（使用 ${CREDENTIAL_LABELS[presentOauth[0]]}）`;
+    } else if (presentOauth.length > 1) {
+      auto.textContent = `自动（优先 ${presentOauth.map(t => CREDENTIAL_LABELS[t]).join('，其次 ')}）`;
+    }
+  }
+
   usable.forEach(credential => {
     const option = document.createElement('option');
     option.value = credential.id;
@@ -1187,10 +1200,17 @@ function renderActionCredentialOptions(action) {
   select.value = usable.some(item => item.id === previous) ? previous : '';
 
   if (hint) {
+    const missingOauth = OAUTH_TYPES.filter(type => !presentOauth.includes(type));
     if (credentialDraft.length === 0) {
       hint.textContent = '请先在「凭据」页添加至少一个凭据。';
     } else if (wantsOauth && usable.length === 0) {
       hint.textContent = 'OAuth 协议需要一个 Github 或 LinuxDO OAuth 凭据。';
+    } else if (wantsOauth && missingOauth.length) {
+      // Point out the alternative provider: Github credentials are the fragile
+      // ones, so knowing LinuxDO can be added here is worth surfacing.
+      hint.textContent =
+        `还可在「凭据」页添加 ${missingOauth.map(t => CREDENTIAL_LABELS[t]).join('、')} 作为备选，`
+        + '在当前凭据失效时切换使用。';
     } else {
       hint.textContent = '';
     }
