@@ -61,7 +61,7 @@ const DEFAULT_CREDENTIAL_LABELS = {
 // carrying only user_session and redirects to its login page instead.
 const OAUTH_COOKIE_NOTES = {
   github_oauth: '需要 github.com 的完整 Cookie（user_session、__Host-user_session_same_site、_gh_sess、logged_in），仅有 user_session 会被 Github 拒绝。',
-  linuxdo_oauth: '需要 linux.do 的完整 Cookie（_t、_forum_session）。'
+  linuxdo_oauth: '需要 connect.linux.do 的完整 Cookie（_t、_forum_session）——授权请求发往该 SSO 域名，复制 linux.do 论坛域名的 Cookie 无效。'
 };
 
 // Github fingerprints the client on each authorize request. A server-side call

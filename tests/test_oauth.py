@@ -243,8 +243,22 @@ class FailedLoginTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await make_client(session).login(GITHUB_OAUTH, "user_session=stale")
         self.assertFalse(result.success)
-        # A partial cookie is reported as incomplete; only a complete one that
-        # is still refused is described as expired.
+        # A flat 401 carries no redirect to reason from, so the message lists the
+        # plausible causes — including the incomplete cookie — rather than
+        # asserting one. A bounce to the login page is what reads as expiry.
+        self.assertIn("401", result.message)
+        self.assertIn("缺少", result.message)
+
+    async def test_a_login_page_redirect_reports_the_cookie(self) -> None:
+        session = FakeSession(
+            github_routes({
+                ("GET", GITHUB_AUTHORIZE): FakeResponse(
+                    302, "", headers={"location": "https://github.com/login?return_to=x"}
+                )
+            })
+        )
+        result = await make_client(session).login(GITHUB_OAUTH, "user_session=stale")
+        self.assertFalse(result.success)
         self.assertIn("未接受该会话 Cookie", result.message)
 
     async def test_consent_page_instead_of_a_redirect(self) -> None:
@@ -712,6 +726,88 @@ class RotationReportingTests(unittest.IsolatedAsyncioTestCase):
         await client.login(GITHUB_OAUTH, self.HELD)
         authorize = [item for item in trace if "授权" in item["step"] and item["success"]]
         self.assertTrue(any("轮换" in (item.get("message") or "") for item in authorize))
+
+
+class RefusedAuthorizeTests(unittest.IsolatedAsyncioTestCase):
+    """A flat refusal is a different failure from a bounce to the login page,
+    and conflating them sends the user to re-copy a cookie that is fine."""
+
+    COOKIE = "_t=abc; _forum_session=fs"
+
+    def _routes(self, authorize):
+        return {
+            ("GET", f"{BASE}/api/status"): FakeResponse(
+                200, '{"data":{"linuxdo_oauth":true,"linuxdo_client_id":"cid"}}'
+            ),
+            ("GET", f"{BASE}/api/oauth/state"): FakeResponse(200, '{"data":"st"}'),
+            ("GET", LINUXDO_AUTHORIZE): authorize,
+            ("GET", f"{BASE}/api/oauth/linuxdo"): FakeResponse(
+                200, "{}", cookies={"session": "fresh"}
+            ),
+        }
+
+    async def _login(self, authorize, cookie=None, trace=None):
+        session = FakeSession(self._routes(authorize))
+        recorder = (lambda **kw: trace.append(kw)) if trace is not None else None
+        client = OAuthLoginClient(session, BASE, "chrome131", None, on_attempt=recorder)
+        return await client.login(LINUXDO_OAUTH, cookie or self.COOKIE)
+
+    async def test_a_403_does_not_claim_the_cookie_expired(self) -> None:
+        result = await self._login(FakeResponse(403, '{"error":"forbidden"}'))
+        self.assertFalse(result.success)
+        self.assertNotIn("已失效或被拒绝", result.message)
+        self.assertIn("403", result.message)
+
+    async def test_a_403_lists_the_plausible_causes(self) -> None:
+        result = await self._login(FakeResponse(403, "nope"))
+        self.assertIn("尚未在浏览器中授权", result.message)
+        self.assertIn("风控", result.message)
+
+    async def test_a_403_quotes_the_site_message(self) -> None:
+        """With no Location header the body is the only evidence available."""
+        body = "<html><body><h1>Forbidden</h1><p>需要先授权该应用</p></body></html>"
+        result = await self._login(FakeResponse(403, body))
+        self.assertIn("需要先授权该应用", result.message)
+
+    async def test_html_noise_is_stripped_from_the_quote(self) -> None:
+        body = "<html><head><style>a{color:red}</style><script>var x=1;</script></head><body>拒绝</body></html>"
+        result = await self._login(FakeResponse(403, body))
+        self.assertIn("拒绝", result.message)
+        self.assertNotIn("color:red", result.message)
+        self.assertNotIn("var x", result.message)
+
+    async def test_a_403_records_the_body_in_the_trace(self) -> None:
+        trace: list[dict] = []
+        await self._login(FakeResponse(403, '{"error":"forbidden"}'), trace=trace)
+        failed = [item for item in trace if item.get("error")]
+        self.assertTrue(failed)
+        self.assertIn("forbidden", failed[-1]["response_text"])
+
+    async def test_a_missing_cookie_is_listed_first(self) -> None:
+        result = await self._login(FakeResponse(403, "nope"), cookie="_t=abc")
+        self.assertIn("缺少 _forum_session", result.message)
+
+    async def test_a_login_redirect_still_reads_as_expiry(self) -> None:
+        result = await self._login(
+            FakeResponse(302, "", headers={"location": "https://connect.linux.do/login"})
+        )
+        self.assertIn("已失效或被拒绝", result.message)
+
+    async def test_a_login_redirect_records_no_body(self) -> None:
+        """There the Location is the evidence; the body is a whole login page."""
+        trace: list[dict] = []
+        await self._login(
+            FakeResponse(302, "<html>login page</html>",
+                         headers={"location": "https://connect.linux.do/login"}),
+            trace=trace,
+        )
+        failed = [item for item in trace if item.get("error")]
+        self.assertFalse(failed[-1].get("response_text"))
+
+    async def test_the_message_names_the_sso_host(self) -> None:
+        """The authorize request goes to connect.linux.do, not the forum."""
+        result = await self._login(FakeResponse(403, "nope"))
+        self.assertIn("connect.linux.do", result.message)
 
 
 if __name__ == "__main__":

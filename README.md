@@ -31,7 +31,11 @@
 - **🔐 Github / LinuxDO OAuth 自动登录（含"登录即签到"站点）**
   - 填入第三方站点的**完整 Cookie** 后，插件自动完成 `/api/status` → `/api/oauth/state` → 第三方授权 → `/api/oauth/{provider}` 全流程。
     - Github 需要 `user_session`、`__Host-user_session_same_site`、`_gh_sess`、`logged_in`——**只填 `user_session` 会被 Github 重定向到登录页**。
-    - LinuxDO 需要 `_t`、`_forum_session`。
+    - LinuxDO 需要 **`connect.linux.do`** 的 `_t`、`_forum_session`——授权请求发往该 SSO 域名，
+      复制 `linux.do` 论坛域名的 Cookie 无效。
+    - 第三方直接返回 401/403（没有跳转）时，说明请求本身被拒绝而不一定是 Cookie 过期：
+      常见原因是该账号还没在浏览器里授权过这个站点的 OAuth 应用，或被风控/频率限制。
+      插件会列出这些可能并附上站点返回的原文，而不是一概判定为「凭据失效」。
     - `state` 接口自动适配：先试 `GET /api/oauth/state`（经典 one-api），再试 `POST`（较新分支）；
       两者都不存在时改用本地生成的 state。
     - 站点通常把 state 存在**服务端会话**里，插件会把该接口下发的会话 Cookie 一并带到回调，

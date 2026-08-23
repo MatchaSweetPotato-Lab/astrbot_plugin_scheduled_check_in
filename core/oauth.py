@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -282,6 +283,48 @@ def _missing_cookies(provider: OAuthProvider, cookie: str) -> list[str]:
     """Return the recommended cookies absent from what the user pasted."""
     present = _cookie_names(cookie)
     return [name for name in provider.all_cookies if name not in present]
+
+
+def _refused_request_message(
+    provider: OAuthProvider,
+    cookie: str,
+    status: int,
+    body: str,
+) -> str:
+    """Explain an authorize request refused outright, with no redirect.
+
+    Distinct from a bounce to the login page: the session may well be valid
+    while the request itself is refused, so this lists the plausible causes
+    instead of asserting the cookie is dead. Any message the provider supplied
+    comes first — it is better evidence than any guess made here.
+    """
+    detail = _abridge(_strip_html(body), 160)
+    missing = _missing_cookies(provider, cookie)
+
+    reasons = []
+    if missing:
+        reasons.append(f"Cookie 缺少 {', '.join(missing)}")
+    reasons.append("该账号尚未在浏览器中授权过此站点的 OAuth 应用")
+    reasons.append(f"{provider.authorize_host} 拒绝了服务端发起的请求（风控 / 频率限制）")
+    reasons.append("会话 Cookie 已失效")
+
+    message = (
+        f"{provider.label} 拒绝了授权请求 (HTTP {status})，未返回跳转。可能原因："
+        + "；".join(f"{index}. {reason}" for index, reason in enumerate(reasons, 1))
+        + f"。请先在浏览器完成一次 {provider.authorize_host} 的 OAuth 授权，"
+        f"并复制该域名的完整 Cookie（至少 {', '.join(provider.all_cookies)}）。"
+    )
+    if detail:
+        message += f" 站点返回：{detail}"
+    return message
+
+
+def _strip_html(text: str) -> str:
+    """Reduce an HTML error page to its readable text."""
+    without_scripts = re.sub(
+        r"<(script|style)\b.*?</\1>", " ", str(text or ""), flags=re.S | re.I
+    )
+    return " ".join(re.sub(r"<[^>]+>", " ", without_scripts).split())
 
 
 def _rejected_session_message(provider: OAuthProvider, cookie: str) -> str:
@@ -547,14 +590,20 @@ class OAuthLoginClient:
 
         status = response.status_code
         location = str(response.headers.get("location") or "")
+        body = getattr(response, "text", "") or ""
         step = f"{provider.label} 授权"
 
         def fail(detail: str) -> OAuthError:
-            # The body is never recorded here: the provider returns a full HTML
-            # consent or login page, and the redirect target is what matters.
-            self._record(step, "GET", provider.authorize_url, status=status,
-                         message=f"Location: {_safe_location(location)}" if location else "",
-                         error=detail)
+            # A redirect carries its reason in the Location header, and the body
+            # is a full consent or login page worth no space. A non-redirect
+            # rejection has no Location at all, so there the body is the only
+            # evidence — record an abridged copy rather than nothing.
+            self._record(
+                step, "GET", provider.authorize_url, status=status,
+                message=f"Location: {_safe_location(location)}" if location else "",
+                response_text="" if location else _abridge(body, 400),
+                error=detail,
+            )
             return OAuthError(detail)
 
         # Capture rotation even on failure paths: the provider may have moved the
@@ -574,8 +623,16 @@ class OAuthLoginClient:
         if redirect_error:
             raise fail(f"{provider.label} 拒绝授权: {redirect_error}")
 
-        if status in (401, 403) or (300 <= status < 400 and "login" in location.lower()):
+        if 300 <= status < 400 and "login" in location.lower():
+            # Bounced to the provider's own login page: the session was not
+            # accepted, so an expired or incomplete cookie is the likely cause.
             raise fail(_rejected_session_message(provider, third_party_cookie))
+        if status in (401, 403):
+            # No redirect at all. The session may be fine while the *request* is
+            # refused — a blocked client, a rate limit, or an application that
+            # has not been authorized for this account — so do not assert that
+            # the cookie is dead when the body may say otherwise.
+            raise fail(_refused_request_message(provider, third_party_cookie, status, body))
         raise fail(
             f"{provider.label} 未直接返回授权码 (HTTP {status})，"
             f"请先在浏览器登录该站点并完成一次 OAuth 授权"
