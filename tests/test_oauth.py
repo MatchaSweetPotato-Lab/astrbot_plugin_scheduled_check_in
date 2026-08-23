@@ -894,7 +894,9 @@ class CloudflareChallengeLoginTests(LinuxdoAuthorizeHelpers, unittest.IsolatedAs
         result = await self._login(FakeResponse(403, CLOUDFLARE_PAGE))
         self.assertFalse(result.success)
         self.assertIn("Cloudflare", result.message)
-        self.assertIn("不是凭据失效", result.message)
+        # Match the claim, not one phrasing of it — but still the *negated*
+        # claim, so a message that blamed the credential could not pass.
+        self.assertRegex(result.message, r"(不是|并非|而非)凭据失效")
         # None of the wrong remedies for an expired or incomplete cookie.
         self.assertNotIn("已失效或被拒绝", result.message)
         self.assertNotIn("尚未在浏览器中授权", result.message)
@@ -905,6 +907,17 @@ class CloudflareChallengeLoginTests(LinuxdoAuthorizeHelpers, unittest.IsolatedAs
         # The two things that silently invalidate a copied clearance cookie.
         self.assertIn("IP", result.message)
         self.assertIn("指纹", result.message)
+
+    async def test_states_that_solving_is_not_implemented(self) -> None:
+        """Solving needs a JavaScript runtime, i.e. a headless-browser dependency.
+
+        Users would otherwise keep retrying, or wait for a fix that is a
+        deliberate non-goal, so the message has to say it outright.
+        """
+        result = await self._login(FakeResponse(403, CLOUDFLARE_PAGE))
+        self.assertIn("JavaScript", result.message)
+        self.assertIn("无头浏览器", result.message)
+        self.assertIn("暂不实现", result.message)
 
     async def test_offers_the_durable_alternative(self) -> None:
         """A clearance cookie expires long before the next scheduled run."""

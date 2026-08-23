@@ -36,6 +36,8 @@
     - 第三方直接返回 401/403（没有跳转）时，说明请求本身被拒绝而不一定是 Cookie 过期：
       常见原因是该账号还没在浏览器里授权过这个站点的 OAuth 应用，或被风控/频率限制。
       插件会列出这些可能并附上站点返回的原文，而不是一概判定为「凭据失效」。
+    - 其中 **Cloudflare 人机验证页**会被单独识别并如实报告。自动解算需引入无头浏览器依赖，
+      **暂不实现**，提示中会直接给出可行的替代做法。
     - 授权请求的查询参数与站点自己的登录页**完全一致**（Github 带 `scope=user:email`，
       LinuxDO 带 `response_type=code`，两者都不带 `redirect_uri`）。回调地址由第三方
       注册的 OAuth 应用决定，自行拼一个不匹配的 `redirect_uri` 会被直接拒绝。
@@ -69,6 +71,8 @@
 - **🛡️ 精准 WAF 拦截与备用探测**
   - 能精准识别阿里云 ESA / Tengine 等 WAF 返回的 HTML 验证页（`acw_sc`），杜绝"200 OK 假成功"误报。
   - 管理接口被拦截时，会自动尝试探测 `/v1/models` 模型接口，明确区分"API Key 有效"与"WAF 拦截"。
+  - Cloudflare 人机验证页同样能被识别（`cf-mitigated` 响应头或验证页特征），但**只做如实报告、不做解算**——
+    它需要执行页内 JavaScript，也就需要无头浏览器依赖。
 
 - **🖥️ 浏览器指纹请求**
   - 网络请求使用 `curl_cffi>=0.14.0,<1.0.0`，可在 Web「全局设置」中选择当前库支持的指纹，默认使用 `chrome131`。
@@ -134,20 +138,25 @@
 > 站点可能在拒绝前就已更换会话，继续重放旧值只会保证下一次也失败。
 > 在编辑弹窗中未改动的 OAuth Cookie 保存时会被跳过，因此期间发生的轮换不会被覆盖回旧值。
 
-> **LinuxDO 可能被 Cloudflare 拦截。** `connect.linux.do` 由 Cloudflare 托管，可能对服务端请求返回
-> 人机验证页（`Just a moment... / Enable JavaScript and cookies to continue`，HTTP 403）。
-> 这**不是凭据失效**——验证页要求执行 JavaScript，任何服务端 HTTP 请求都无法完成。插件会明确识别
-> 这种响应并单独提示，不会误报成 Cookie 过期。可尝试：
+> **LinuxDO 可能被 Cloudflare 拦截，插件暂不解算。** `connect.linux.do` 由 Cloudflare 托管，
+> 可能对服务端请求返回人机验证页（`Just a moment... / Enable JavaScript and cookies to continue`，
+> HTTP 403）。这**不是凭据失效**，插件会单独识别这种响应，不会误报成 Cookie 过期。
 >
-> 1. 在浏览器通过验证后，把 `cf_clearance` 与 `_t`、`_forum_session` 一起复制进该凭据；
-> 2. `cf_clearance` **绑定出口 IP 与 User-Agent**：需与浏览器同一出口（通常要清空站点代理），
->    且「全局设置」的浏览器指纹要与该浏览器版本一致，否则复制过来也无效；
-> 3. 它的有效期通常只有几十分钟，**定时签到大概率会再次被拦**。需要长期稳定时，
->    建议该站点改用 `Github OAuth` 或普通 `Token` / `Cookie` 凭据。
+> **为什么不实现自动解算：** 验证页需要执行页内 JavaScript 才能换取通行 Cookie，
+> 这要求引入无头浏览器（Playwright / Puppeteer 之类）或外部解算服务作为依赖——
+> 为单个站点付出一整套浏览器运行时，与本插件零重依赖的定位不符，因此**暂不实现**。
 >
-> 插件不内置绕过人机验证的能力：授权请求已按真实浏览器的完整签名发出（TLS 指纹、
-> `Accept`、`Sec-Ch-Ua`、`Sec-Fetch-*` 均由指纹库提供，并带上与 `Sec-Fetch-Site: cross-site`
-> 一致的 `Referer`），能否通过取决于 Cloudflare 对该出口 IP 的判定——机房 IP 被拦的概率明显更高。
+> 授权请求本身已按真实浏览器的完整签名发出：TLS 指纹、`Accept`、`Sec-Ch-Ua`、`Sec-Fetch-*`
+> 全部由指纹库提供（不再手写覆盖），并带上与 `Sec-Fetch-Site: cross-site` 一致的 `Referer`。
+> 能否通过最终取决于 Cloudflare 对该出口 IP 的判定，**机房 IP 被拦的概率明显更高**。
+>
+> 遇到拦截时可按以下顺序处理：
+>
+> 1. **改用 `Github OAuth`**——不经 Cloudflare，是最省事的长期方案；
+> 2. **清空站点代理**，让请求与浏览器同一出口，以继承该 IP 的信誉；
+> 3. **应急复制 `cf_clearance`**：在浏览器通过验证后，与 `_t`、`_forum_session` 一起填入该凭据。
+>    注意它**绑定出口 IP 与 User-Agent**（指纹须与该浏览器一致，代理会使其失效），
+>    且通常仅数十分钟有效——够手动签到一次，不足以支撑每日定时签到。
 
 > **Github 凭据仍可能失效。** Github 会对请求环境做检测，服务端发起的授权请求与该 Cookie
 > 原本所属的浏览器特征不一致，可能触发风控使 Cookie 失效，**有时会连带注销你在浏览器里的

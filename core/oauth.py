@@ -378,20 +378,23 @@ def is_cloudflare_challenge(status: int, body: str, headers: Any = None) -> bool
 def _cloudflare_challenge_message(provider: OAuthProvider, status: int) -> str:
     """Explain a Cloudflare interstitial, and what actually gets past one.
 
-    The clearance cookie is bound to the IP address and User-Agent that solved
-    the challenge, which is the part users get wrong: copying it out of a browser
-    on another machine, or leaving a proxy in the way, invalidates it. Say so
-    rather than letting them retry the copy forever.
+    Two things users get wrong here. The clearance cookie is bound to the IP
+    address and User-Agent that solved the challenge, so copying it from a
+    browser on another machine — or leaving a proxy in the way — invalidates it.
+    And solving the challenge is not a matter of better headers: it needs a
+    JavaScript runtime. Say both, so nobody retries the copy forever waiting for
+    a fix that is not coming.
     """
     return (
-        f"{provider.authorize_host} 返回了 Cloudflare 人机验证页 (HTTP {status})，"
-        "这不是凭据失效——服务端请求无法执行验证页里的 JavaScript。"
-        f"可尝试：1. 在浏览器通过验证后，把 {provider.challenge_cookie} 一起复制进该凭据"
-        f"（与 {', '.join(provider.all_cookies)} 放在同一行）；"
-        "2. 该 Cookie 绑定 IP 与 User-Agent，需与浏览器同出口 IP（通常要去掉站点代理），"
-        "且「全局设置」的浏览器指纹要与该浏览器一致；"
-        "3. 它通常仅数十分钟有效，定时签到多半会再次被拦，"
-        f"更稳妥的做法是给该站点换用 Github OAuth 或普通 Token / Cookie 凭据。"
+        f"{provider.authorize_host} 由 Cloudflare 托管，本次返回了人机验证页 (HTTP {status})，"
+        "并非凭据失效。验证页要求执行 JavaScript，服务端请求无法完成，"
+        "解算需引入无头浏览器依赖，插件暂不实现。"
+        f"应急办法：在浏览器通过验证后，把 {provider.challenge_cookie} 与 "
+        f"{', '.join(provider.all_cookies)} 一起复制进该凭据；"
+        "该 Cookie 绑定出口 IP 与 User-Agent，需与浏览器同一出口（通常要清空站点代理），"
+        "且「全局设置」的浏览器指纹要与该浏览器一致。"
+        "它通常仅数十分钟有效，定时签到多半会再次被拦——"
+        "需要长期稳定请给该站点改用 Github OAuth 或普通 Token / Cookie 凭据。"
     )
 
 
