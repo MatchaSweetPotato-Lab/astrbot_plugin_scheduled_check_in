@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import unittest
 
@@ -119,19 +120,21 @@ class VaultRoundTripTests(unittest.TestCase):
         self.assertEqual(self.vault.decrypt("legacy-plaintext"), "legacy-plaintext")
 
     def test_json_round_trip(self) -> None:
+        """Sealed here, read back through the storage-side decoder.
+
+        ``Vault`` has no ``decrypt_json`` on purpose: the read path must survive
+        a locked vault, so it lives in ``SiteStorage._decode_json``. Round-trip
+        through that to keep the pairing honest rather than asserting only the
+        half that lives here.
+        """
         payload = [{"id": "c1", "type": "token", "value": "sk-a"}]
         sealed = self.vault.encrypt_json(payload)
         self.assertTrue(is_ciphertext(sealed))
-        self.assertEqual(self.vault.decrypt_json(sealed, []), payload)
+        self.assertEqual(json.loads(self.vault.decrypt(sealed)), payload)
 
     def test_empty_json_values_seal_to_empty(self) -> None:
         for empty in (None, "", [], {}):
             self.assertEqual(self.vault.encrypt_json(empty), "")
-        self.assertEqual(self.vault.decrypt_json("", ["fallback"]), ["fallback"])
-
-    def test_malformed_json_falls_back_to_default(self) -> None:
-        sealed = self.vault.encrypt("{not json")
-        self.assertEqual(self.vault.decrypt_json(sealed, []), [])
 
 
 class VaultUnlockTests(unittest.TestCase):

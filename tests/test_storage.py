@@ -505,6 +505,27 @@ class VaultStorageTests(unittest.TestCase):
         for column in ("credentials", "checkin_headers", "proxy"):
             self.assertTrue(read_raw(self.db_path, column).startswith(CIPHER_PREFIX), column)
 
+    def test_an_empty_protected_column_yields_the_default(self) -> None:
+        """A row written before the column existed reads as absent, not as an error."""
+        self.assertEqual(self.db._decode_json("", ["fallback"]), ["fallback"])
+
+    def test_a_malformed_payload_yields_the_default(self) -> None:
+        """Decryptable but not JSON: salvage the row rather than fail the list.
+
+        Losing one site's credentials is recoverable by re-entering them; an
+        exception here would take the whole dashboard down with it.
+        """
+        self.db.enable_encryption()
+        sealed = self.db.vault.encrypt("{not json")
+        self.assertEqual(self.db._decode_json(sealed, []), [])
+
+    def test_a_locked_vault_yields_the_default(self) -> None:
+        """This is why the read path lives here and not on Vault: no raise."""
+        self.db.enable_encryption()
+        sealed = self.db.vault.encrypt_json([{"id": "c1"}])
+        self.db.lock_encryption()
+        self.assertEqual(self.db._decode_json(sealed, []), [])
+
     def test_action_config_stays_readable_while_sealed(self) -> None:
         """Path and protocol are not secrets, so the list stays informative."""
         self.db.enable_encryption()

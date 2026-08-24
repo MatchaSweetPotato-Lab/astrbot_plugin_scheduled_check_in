@@ -436,24 +436,14 @@ class Vault:
     # JSON helpers
     # ------------------------------------------------------------------
     def encrypt_json(self, value: Any) -> str:
-        """Serialize a JSON-compatible value and encrypt the result."""
+        """Serialize a JSON-compatible value and encrypt the result.
+
+        There is deliberately no matching ``decrypt_json`` here. Reading these
+        columns has to stay possible while the vault is locked — the site list
+        renders with the protected fields blank — so the read path lives in
+        ``SiteStorage._decode_json``, which treats a locked vault as "return the
+        default" rather than an error.
+        """
         if value in (None, "", [], {}):
             return ""
         return self.encrypt(json.dumps(value, ensure_ascii=False))
-
-    def decrypt_json(self, stored: str, default: Any) -> Any:
-        """Decrypt and parse a JSON value, falling back on failure.
-
-        Returns ``default`` for empty input and raises ``VaultLockedError``
-        when the payload is ciphertext and the vault holds no key.
-        """
-        if not stored:
-            return default
-        text = self.decrypt(stored)
-        if not text:
-            return default
-        try:
-            return json.loads(text)
-        except (TypeError, ValueError):
-            logger.warning("Discarding malformed JSON payload from encrypted storage")
-            return default

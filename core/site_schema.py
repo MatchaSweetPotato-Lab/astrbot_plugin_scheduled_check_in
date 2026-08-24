@@ -355,11 +355,6 @@ def normalize_action(raw: Any, allow_oauth: bool) -> dict[str, Any]:
     }
 
 
-def default_action() -> dict[str, Any]:
-    """Return an empty action config."""
-    return normalize_action(None, allow_oauth=True)
-
-
 def normalize_site_type(raw: Any) -> str:
     """Map a framework type onto a supported value.
 

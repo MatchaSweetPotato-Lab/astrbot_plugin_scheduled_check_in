@@ -1008,12 +1008,6 @@ class DatabaseManager:
             if slot["type"] == SLOT_WEBAUTHN and slot["rp_id"].lower() == wanted
         ]
 
-    def count_slots(self) -> int:
-        """Return how many key slots exist."""
-        with self._lock, self._connection() as conn:
-            row = conn.execute("SELECT COUNT(*) AS total FROM vault_slots").fetchone()
-        return int(row["total"]) if row else 0
-
     def add_webauthn_slot(
         self,
         credential_id: str,
