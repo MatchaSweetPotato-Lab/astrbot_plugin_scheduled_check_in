@@ -182,15 +182,19 @@ class ChallengeAwareRequestTests(unittest.IsolatedAsyncioTestCase):
         config = {
             "id": "site-1",
             "name": "Example",
-            "type": "generic",
+            "type": "generic_rest",
             "base_url": "https://example.test",
-            "checkin_endpoint": "/api/user/sign_in",
-            "method": "GET",
-            "auth_type": "cookie",
-            "auth_value": "session=auth-value",
-            "custom_headers": {"cookie": "custom=header-value"},
             "proxy": "",
-            "solve_acw_sc_v2": True,
+            "credentials": [
+                {"id": "c1", "type": "cookie", "value": "session=auth-value"},
+            ],
+            "checkin": {
+                "path": "/api/user/sign_in",
+                "protocol": "get",
+                "headers": [{"key": "cookie", "value": "custom=header-value"}],
+                "solve_acw_sc_v2": True,
+            },
+            "balance": {},
             "enabled": True,
         }
 
@@ -200,7 +204,7 @@ class ChallengeAwareRequestTests(unittest.IsolatedAsyncioTestCase):
                 session,  # type: ignore[arg-type]
                 Path(temp_dir) / "cache.json",
             )
-            result = await adapter.test_connection()
+            result = await adapter.check_in()
 
         self.assertFalse(result.success)
         self.assertEqual(result.message, 'HTTP 401: {"success":false,"message":"unauthorized"}')
@@ -230,23 +234,42 @@ class ChallengeAwareRequestTests(unittest.IsolatedAsyncioTestCase):
         config = {
             "id": "site-2",
             "name": "Example",
-            "type": "generic",
+            "type": "generic_rest",
             "base_url": "https://example.test",
-            "checkin_endpoint": "/api/user/sign_in",
-            "method": "GET",
-            "auth_type": "bearer_token",
-            "auth_value": "invalid-token",
-            "custom_headers": "",
             "proxy": "",
-            "solve_acw_sc_v2": False,
+            "credentials": [{"id": "c1", "type": "token", "value": "invalid-token"}],
+            "checkin": {"path": "/api/user/sign_in", "protocol": "get"},
+            "balance": {},
             "enabled": True,
         }
         adapter = GenericRestAdapter(config, session)  # type: ignore[arg-type]
 
-        result = await adapter.test_connection()
+        result = await adapter.check_in()
 
         self.assertFalse(result.success)
         self.assertTrue(result.expired)
+
+    async def test_the_solver_flag_is_per_action(self) -> None:
+        """A challenge is only solved for the action that opted in."""
+        session = _FakeSession([_FakeResponse(200, make_challenge(), {"acw_tc": "tc"})])
+        config = {
+            "id": "site-3",
+            "name": "Example",
+            "type": "generic_rest",
+            "base_url": "https://example.test",
+            "credentials": [{"id": "c1", "type": "cookie", "value": "session=v"}],
+            "checkin": {"path": "/sign", "protocol": "get", "solve_acw_sc_v2": True},
+            "balance": {"path": "/me", "protocol": "get", "solve_acw_sc_v2": False},
+            "enabled": True,
+        }
+        adapter = GenericRestAdapter(config, session)  # type: ignore[arg-type]
+
+        quota, error = await adapter.query_balance()
+
+        # Only one request: the balance action never retries the challenge.
+        self.assertEqual(len(session.requests), 1)
+        self.assertEqual(quota, 0.0)
+        self.assertIn("WAF", error)
 
 
 if __name__ == "__main__":

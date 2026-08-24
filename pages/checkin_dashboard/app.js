@@ -13,8 +13,6 @@ let settings = {
   http_timeout_seconds: 15,
   http_impersonate: '',
   http_impersonate_options: [],
-  auto_cleanup_logs: true,
-  history_retention_days: 0,
   max_history_records: 0
 };
 let logItems = [];
@@ -24,11 +22,79 @@ let logsLoading = false;
 let logsTotal = 0;
 let logsStartDate = '';
 let logsEndDate = '';
-let activeAnalyticsSite = null;
-let analyticsMonth = '';
 let isEdit = false;
 let editIndex = -1;
 let activeConfirmResolver = null;
+let vaultState = { enabled: false, unlocked: false, locked: false };
+let keySlots = [];
+let activeAnalyticsSite = null;
+let analyticsMonth = '';
+// Set while the passkey hand-off dialog is open, to watch the other tab's work.
+let passkeyWatch = null;
+const PASSKEY_POLL_MS = 3000;
+const PLUGIN_ID = 'astrbot_plugin_scheduled_check_in';
+
+const SLOT_TYPE_LABELS = {
+  user_key: '用户密钥',
+  webauthn_prf: '通行密钥'
+};
+// Credentials being edited in the site modal, kept out of `sites` until saved.
+let credentialDraft = [];
+let credentialSeq = 0;
+
+const CREDENTIAL_LABELS = {
+  token: 'Authorization Token',
+  cookie: 'Cookie',
+  github_oauth: 'Github OAuth',
+  linuxdo_oauth: 'LinuxDO OAuth'
+};
+
+const OAUTH_TYPES = ['github_oauth', 'linuxdo_oauth'];
+
+// Suggested names used when a credential is created. Short on purpose, since
+// they show up in the collapsed card header and the action pickers.
+const DEFAULT_CREDENTIAL_LABELS = {
+  token: 'Token',
+  cookie: 'Cookie',
+  github_oauth: 'Github',
+  linuxdo_oauth: 'LinuxDO'
+};
+
+// The full cookie string is required: Github rejects an authorize request
+// carrying only user_session and redirects to its login page instead.
+const OAUTH_COOKIE_NOTES = {
+  github_oauth: '需要 github.com 的完整 Cookie（user_session、__Host-user_session_same_site、_gh_sess、logged_in），仅有 user_session 会被 Github 拒绝。',
+  linuxdo_oauth: '需要 connect.linux.do 的完整 Cookie（_t、_forum_session）——授权请求发往该 SSO 域名，复制 linux.do 论坛域名的 Cookie 无效。'
+};
+
+// Github fingerprints the client on each authorize request. A server-side call
+// looks unlike the browser the cookie was issued to, so the session can be
+// invalidated — sometimes logging the user out of github.com as well.
+const OAUTH_COOKIE_VOLATILITY = {
+  github_oauth: 'Github 会对请求环境做检测，服务端发起的授权可能触发风控并使该 Cookie 失效'
+    + '（有时会连带注销浏览器登录）。失效后需重新复制，必要时改用 LinuxDO OAuth 或 Token / Cookie 凭据。',
+  // Cloudflare fronts connect.linux.do and can serve a JS challenge that no
+  // server-side request can solve. Say it here, with why it is not implemented,
+  // rather than only after a check-in has already failed. Kept to roughly the
+  // length of the Github note above — the full detail is in the failure message.
+  linuxdo_oauth: 'connect.linux.do 由 Cloudflare 托管，可能以人机验证页拦截服务端请求；'
+    + '解算需引入无头浏览器依赖，插件暂不实现。应急可补一个浏览器通过验证后的 cf_clearance'
+    + '（绑定 IP 与浏览器指纹，仅数十分钟有效），长期建议改用 Github OAuth 或 Token / Cookie 凭据。'
+};
+
+// Endpoints each framework already knows, shown as placeholder hints.
+const FRAMEWORK_DEFAULTS = {
+  'new-api': {
+    checkin: '留空自动使用 /api/user/checkin 或 /api/user/pay/checkin',
+    balance: '留空自动使用 /api/user/self',
+    newApiUser: '跟随框架时会自动探测 new-api-user 并回写到此处'
+  },
+  generic_rest: {
+    checkin: '留空将直接 GET 访问 Base URL（该框架未适配签到接口）',
+    balance: '留空则不查询余额（该框架未适配余额接口）',
+    newApiUser: ''
+  }
+};
 
 // Helper: Toast Notifications
 function showToast(message, type = 'success', duration = 3500) {
@@ -80,12 +146,8 @@ function cancelConfirm() {
   closeModal('confirm-modal');
 }
 
-// Helper: Mask credentials
-function maskToken(val) {
-  if (!val) return '未配置';
-  const token = String(val);
-  if (token.length <= 10) return '******';
-  return token.substring(0, 4) + '***' + token.substring(token.length - 4);
+function isVaultLocked() {
+  return vaultState.locked === true;
 }
 
 function getSiteId(site) {
@@ -147,6 +209,9 @@ function openModal(id) {
 function closeModal(id) {
   const el = document.getElementById(id);
   if (el) el.classList.remove('active');
+  // Every way out of the passkey dialog — the close button, 了解, and an overlay
+  // click — lands here, so this is the one place the watch has to be stopped.
+  if (id === 'passkey-modal') stopPasskeyWatch();
 }
 
 function handleOverlayClick(event, id) {
@@ -213,7 +278,7 @@ function renderTableMessage(tbody, message) {
   tbody.replaceChildren();
   const row = document.createElement('tr');
   const cell = document.createElement('td');
-  cell.colSpan = 7;
+  cell.colSpan = 6;
   cell.className = 'empty-text';
   cell.textContent = message;
   row.appendChild(cell);
@@ -242,11 +307,21 @@ function renderSitesTable() {
   tbody.replaceChildren();
   sites.forEach((site, index) => {
     const row = document.createElement('tr');
+    const locked = site.locked === true;
+    if (locked) row.classList.add('row-locked');
 
     const nameCell = document.createElement('td');
     const name = document.createElement('strong');
     name.textContent = site.name;
     nameCell.appendChild(name);
+    if (locked) {
+      const lockTag = document.createElement('span');
+      lockTag.className = 'badge badge-warning';
+      lockTag.style.marginLeft = '8px';
+      lockTag.textContent = '锁定';
+      lockTag.title = '配置已加密，请先输入密钥解锁';
+      nameCell.appendChild(lockTag);
+    }
     row.appendChild(nameCell);
 
     const typeCell = document.createElement('td');
@@ -268,13 +343,6 @@ function renderSitesTable() {
     const statusCell = document.createElement('td');
     statusCell.appendChild(renderCheckInStatus(site));
     row.appendChild(statusCell);
-
-    const tokenCell = document.createElement('td');
-    const token = document.createElement('span');
-    token.className = 'token-mask';
-    token.textContent = maskToken(site.auth_value);
-    tokenCell.appendChild(token);
-    row.appendChild(tokenCell);
 
     const enabledCell = document.createElement('td');
     const switchLabel = document.createElement('label');
@@ -313,10 +381,19 @@ function renderSitesTable() {
         }
       }
     );
+    const testButton = createActionButton('测试', 'btn-primary-plain', () => testSingleSite(index));
+    const editButton = createActionButton('编辑', '', () => openEditSiteModal(index));
+    if (locked) {
+      // Editing or running a locked site would overwrite unreadable secrets.
+      [recheckButton, testButton, editButton].forEach(button => {
+        button.disabled = true;
+        button.title = '配置已加密，请先输入密钥解锁';
+      });
+    }
     actionButtons.push(
       recheckButton,
-      createActionButton('测试', 'btn-primary-plain', () => testSingleSite(index)),
-      createActionButton('编辑', '', () => openEditSiteModal(index)),
+      testButton,
+      editButton,
       createActionButton('删除', 'btn-danger-plain', () => deleteSite(index), false)
     );
     actionsCell.append(...actionButtons);
@@ -640,9 +717,13 @@ async function saveSites() {
   }
 }
 
-// Header Dynamic Key-Value Editor Helpers
-function addHeaderRow(key = '', value = '') {
-  const container = document.getElementById('headers-list-container');
+// Header Dynamic Key-Value Editor Helpers (one editor per action)
+function getHeadersContainer(action) {
+  return document.getElementById(`${action}-headers-container`);
+}
+
+function addHeaderRow(action, key = '', value = '') {
+  const container = getHeadersContainer(action);
   if (!container) return;
 
   const row = document.createElement('div');
@@ -650,10 +731,12 @@ function addHeaderRow(key = '', value = '') {
   const keyInput = document.createElement('input');
   keyInput.type = 'text';
   keyInput.className = 'form-control kv-key';
+  keyInput.placeholder = 'Header 名称';
   keyInput.value = key;
   const valueInput = document.createElement('input');
   valueInput.type = 'text';
   valueInput.className = 'form-control kv-value';
+  valueInput.placeholder = 'Header 值';
   valueInput.value = value;
   const removeButton = document.createElement('button');
   removeButton.type = 'button';
@@ -665,40 +748,642 @@ function addHeaderRow(key = '', value = '') {
   container.appendChild(row);
 }
 
-function clearHeaderRows() {
-  const container = document.getElementById('headers-list-container');
-  if (container) container.replaceChildren();
-}
-
-function setHeadersFromText(text) {
-  clearHeaderRows();
-  if (!text) return;
-  const lines = String(text).split('\n');
-  lines.forEach(line => {
-    line = line.trim();
-    if (!line) return;
-    const idx = line.indexOf(':');
-    if (idx > -1) {
-      const k = line.substring(0, idx).trim();
-      const v = line.substring(idx + 1).trim();
-      addHeaderRow(k, v);
-    }
+function setHeaderRows(action, pairs) {
+  const container = getHeadersContainer(action);
+  if (!container) return;
+  container.replaceChildren();
+  (Array.isArray(pairs) ? pairs : []).forEach(pair => {
+    if (pair && pair.key) addHeaderRow(action, pair.key, pair.value ?? '');
   });
 }
 
-function getHeaderPairsText() {
-  const container = document.getElementById('headers-list-container');
-  if (!container) return '';
-  const rows = container.querySelectorAll('.kv-row');
+function getHeaderPairs(action) {
+  const container = getHeadersContainer(action);
+  if (!container) return [];
   const pairs = [];
-  rows.forEach(row => {
+  container.querySelectorAll('.kv-row').forEach(row => {
     const key = row.querySelector('.kv-key')?.value.trim();
-    const val = row.querySelector('.kv-value')?.value.trim();
-    if (key) {
-      pairs.push(`${key}: ${val}`);
-    }
+    const value = row.querySelector('.kv-value')?.value.trim();
+    if (key) pairs.push({ key, value: value || '' });
   });
-  return pairs.join('\n');
+  return pairs;
+}
+
+// Site Modal Tabs
+function switchSiteTab(tab) {
+  document.querySelectorAll('#site-tab-bar .tab-btn').forEach(button => {
+    button.classList.toggle('active', button.dataset.tab === tab);
+  });
+  document.querySelectorAll('#site-modal .tab-panel').forEach(panel => {
+    panel.classList.toggle('active', panel.dataset.panel === tab);
+  });
+}
+
+// Credential Editor
+function nextCredentialId() {
+  credentialSeq += 1;
+  return `cred_${Date.now()}_${credentialSeq}`;
+}
+
+function addCredential(type) {
+  credentialDraft.push({
+    id: nextCredentialId(),
+    type,
+    // Pre-filled from the type so a card is never nameless; the user may edit
+    // or clear it, and an empty label falls back to the type in the pickers.
+    label: DEFAULT_CREDENTIAL_LABELS[type] || CREDENTIAL_LABELS[type] || '',
+    value: '',
+    auto_bearer: type === 'token' ? true : undefined,
+    has_session: false
+  });
+  renderCredentials();
+  renderActionCredentialOptions('checkin');
+  renderActionCredentialOptions('balance');
+}
+
+function removeCredential(credentialId) {
+  credentialDraft = credentialDraft.filter(item => item.id !== credentialId);
+  renderCredentials();
+  renderActionCredentialOptions('checkin');
+  renderActionCredentialOptions('balance');
+}
+
+function readCredentialDraftFromDom() {
+  const list = document.getElementById('credentials-list');
+  if (!list) return;
+  list.querySelectorAll('.cred-card').forEach(card => {
+    const credential = credentialDraft.find(item => item.id === card.dataset.credId);
+    if (!credential) return;
+    credential.label = card.querySelector('.cred-label')?.value.trim() || '';
+    credential.value = card.querySelector('.cred-value')?.value.trim() || '';
+    const autoBearer = card.querySelector('.cred-auto-bearer');
+    if (autoBearer) credential.auto_bearer = autoBearer.checked;
+  });
+}
+
+// Cookies each OAuth provider needs, mirroring core/oauth.py PROVIDERS.
+const OAUTH_REQUIRED_COOKIES = {
+  github_oauth: ['user_session', '__Host-user_session_same_site', '_gh_sess', 'logged_in'],
+  linuxdo_oauth: ['_t', '_forum_session']
+};
+
+const OAUTH_COOKIE_DOMAIN = {
+  github_oauth: 'github.com',
+  linuxdo_oauth: 'connect.linux.do'
+};
+
+/** Parse a raw Cookie header into an ordered name/value map. */
+function parseCookieString(raw) {
+  const jar = {};
+  String(raw || '').split(';').forEach(part => {
+    const index = part.indexOf('=');
+    if (index <= 0) return;
+    const name = part.slice(0, index).trim();
+    if (name) jar[name] = part.slice(index + 1).trim();
+  });
+  return jar;
+}
+
+function buildCookieString(jar) {
+  return Object.entries(jar)
+    .filter(([name, value]) => name && value)
+    .map(([name, value]) => `${name}=${value}`)
+    .join('; ');
+}
+
+/**
+ * Pull the Cookie header out of a pasted "Copy as cURL" command.
+ * Chrome emits -H 'Cookie: ...', PowerShell copies use double quotes, and
+ * newer Chrome uses -b 'Cookie'. All three are accepted.
+ */
+function extractCookieFromCurl(text) {
+  const raw = String(text || '');
+  if (!/\bcurl\b/i.test(raw)) return '';
+  const patterns = [
+    /-H\s+'cookie:\s*([^']*)'/i,
+    /-H\s+"cookie:\s*((?:[^"\\]|\\.)*)"/i,
+    /-b\s+'([^']*)'/i,
+    /-b\s+"((?:[^"\\]|\\.)*)"/i
+  ];
+  for (const pattern of patterns) {
+    const match = raw.match(pattern);
+    if (match) return match[1].replace(/\\"/g, '"').trim();
+  }
+  return '';
+}
+
+/** Describe which required cookies are absent from a cookie string. */
+function missingCookies(type, value) {
+  const required = OAUTH_REQUIRED_COOKIES[type] || [];
+  const jar = parseCookieString(value);
+  return required.filter(name => !jar[name]);
+}
+
+function credentialSummary(credential) {
+  if (OAUTH_TYPES.includes(credential.type)) {
+    if (!credential.value) return '未填写';
+    const missing = missingCookies(credential.type, credential.value);
+    return missing.length ? `缺少 ${missing.length} 项 Cookie` : 'Cookie 完整';
+  }
+  if (!credential.value) return '未填写';
+  const text = String(credential.value);
+  return text.length <= 10 ? '******' : `${text.slice(0, 4)}***${text.slice(-4)}`;
+}
+
+function buildCredentialCard(credential) {
+  const isOauth = OAUTH_TYPES.includes(credential.type);
+  const card = document.createElement('div');
+  card.className = 'cred-card collapsed';
+  card.dataset.credId = credential.id;
+
+  // ---------- header (always visible, toggles the body) ----------
+  const header = document.createElement('div');
+  header.className = 'cred-card-header';
+
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'cred-toggle';
+  toggle.setAttribute('aria-expanded', 'false');
+
+  const caret = document.createElement('span');
+  caret.className = 'cred-caret';
+  caret.textContent = '▸';
+  const tag = document.createElement('span');
+  tag.className = `cred-type-tag${isOauth ? ' oauth' : ''}`;
+  tag.textContent = CREDENTIAL_LABELS[credential.type] || credential.type;
+  const name = document.createElement('span');
+  name.className = 'cred-name';
+  name.textContent = credential.label || '未命名';
+  const summary = document.createElement('span');
+  summary.className = 'cred-summary';
+  summary.textContent = credentialSummary(credential);
+  toggle.append(caret, tag, name, summary);
+
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'btn-icon-danger';
+  remove.title = '删除此凭据';
+  remove.textContent = '×';
+  remove.addEventListener('click', event => {
+    event.stopPropagation();
+    readCredentialDraftFromDom();
+    removeCredential(credential.id);
+  });
+  header.append(toggle, remove);
+  card.appendChild(header);
+
+  const body = document.createElement('div');
+  body.className = 'cred-card-body';
+  toggle.addEventListener('click', () => {
+    const collapsed = card.classList.toggle('collapsed');
+    caret.textContent = collapsed ? '▸' : '▾';
+    toggle.setAttribute('aria-expanded', String(!collapsed));
+  });
+
+  // ---------- label ----------
+  const labelGroup = document.createElement('div');
+  labelGroup.className = 'form-group';
+  const labelText = document.createElement('label');
+  labelText.textContent = '备注名称 (可选)';
+  const labelInput = document.createElement('input');
+  labelInput.type = 'text';
+  labelInput.className = 'form-control cred-label';
+  labelInput.placeholder = '用于在签到/余额页中区分同类凭据';
+  labelInput.value = credential.label || '';
+  labelInput.addEventListener('input', () => {
+    credential.label = labelInput.value.trim();
+    name.textContent = credential.label || '未命名';
+    renderActionCredentialOptions('checkin');
+    renderActionCredentialOptions('balance');
+  });
+  labelGroup.append(labelText, labelInput);
+  body.appendChild(labelGroup);
+
+  // ---------- value ----------
+  if (isOauth) {
+    body.appendChild(buildOauthCookieEditor(credential, summary));
+  } else {
+    const valueGroup = document.createElement('div');
+    valueGroup.className = 'form-group';
+    const valueLabel = document.createElement('label');
+    valueLabel.textContent = `${CREDENTIAL_LABELS[credential.type]} *`;
+    const valueInput = document.createElement('textarea');
+    valueInput.className = 'form-control cred-value';
+    valueInput.rows = 3;
+    valueInput.placeholder = credential.type === 'token'
+      ? '粘贴 Access Token'
+      : '例如 session=xxxx; other=yyyy';
+    valueInput.value = credential.value || '';
+    valueInput.addEventListener('input', () => {
+      credential.value = valueInput.value.trim();
+      summary.textContent = credentialSummary(credential);
+    });
+    valueGroup.append(valueLabel, valueInput);
+    body.appendChild(valueGroup);
+  }
+
+  if (credential.type === 'token') {
+    const inlineGroup = document.createElement('div');
+    inlineGroup.className = 'form-group cred-inline-row';
+    const autoLabel = document.createElement('label');
+    autoLabel.className = 'checkbox-label';
+    autoLabel.title = '发送请求时自动加上 Bearer 前缀';
+    const autoInput = document.createElement('input');
+    autoInput.type = 'checkbox';
+    autoInput.className = 'cred-auto-bearer';
+    autoInput.checked = credential.auto_bearer !== false;
+    const autoText = document.createElement('span');
+    autoText.textContent = '自动补全 Bearer';
+    autoLabel.append(autoInput, autoText);
+    inlineGroup.appendChild(autoLabel);
+    body.appendChild(inlineGroup);
+  }
+
+  if (isOauth) {
+    const state = document.createElement('div');
+    const hasSession = credential.has_session === true || Boolean(credential.session_cookie);
+    state.className = `cred-session-state${hasSession ? ' has-session' : ''}`;
+    state.textContent = hasSession
+      ? `站点会话已保存${credential.session_updated_at ? ` (${credential.session_updated_at})` : ''}`
+      : '尚未登录，首次签到时会自动完成 OAuth';
+    body.appendChild(state);
+  }
+
+  card.appendChild(body);
+  return card;
+}
+
+/**
+ * Cookie editor with two interchangeable modes: one field per required cookie,
+ * or a single box accepting a full Cookie header or a pasted cURL command.
+ * Both write the same normalized string to `.cred-value`.
+ */
+function buildOauthCookieEditor(credential, summaryEl) {
+  const wrap = document.createElement('div');
+  wrap.className = 'form-group cred-cookie-editor';
+
+  const headerRow = document.createElement('div');
+  headerRow.className = 'kv-header';
+  const label = document.createElement('label');
+  label.style.margin = '0';
+  label.textContent = `${OAUTH_COOKIE_DOMAIN[credential.type] || '第三方'} Cookie *`;
+  const modes = document.createElement('div');
+  modes.className = 'cred-mode-switch';
+  headerRow.append(label, modes);
+  wrap.appendChild(headerRow);
+
+  // The canonical value lives here; both modes keep it in sync.
+  const hidden = document.createElement('textarea');
+  hidden.className = 'cred-value';
+  hidden.hidden = true;
+  hidden.value = credential.value || '';
+  wrap.appendChild(hidden);
+
+  const formPane = document.createElement('div');
+  formPane.className = 'cred-cookie-form';
+  const rawPane = document.createElement('div');
+  rawPane.className = 'cred-cookie-raw';
+  rawPane.style.display = 'none';
+
+  const required = OAUTH_REQUIRED_COOKIES[credential.type] || [];
+  const fields = {};
+
+  const status = document.createElement('div');
+  status.className = 'form-hint';
+
+  const commit = value => {
+    credential.value = value.trim();
+    hidden.value = credential.value;
+    if (summaryEl) summaryEl.textContent = credentialSummary(credential);
+    const missing = missingCookies(credential.type, credential.value);
+    const volatility = OAUTH_COOKIE_VOLATILITY[credential.type];
+    if (!credential.value) {
+      status.className = 'form-hint';
+      status.textContent = OAUTH_COOKIE_NOTES[credential.type] || '';
+    } else if (missing.length) {
+      status.className = 'form-hint cred-cookie-warn';
+      status.textContent = `缺少 ${missing.join('、')}，授权可能被拒绝`;
+    } else {
+      // Complete is not the same as durable, so say so exactly here — this is
+      // the moment the user would otherwise assume it is set up for good.
+      status.className = 'form-hint cred-cookie-ok';
+      status.textContent = `已填写全部 ${required.length} 项必需 Cookie`
+        + (volatility ? `。注意：${volatility}` : '');
+    }
+  };
+
+  // ---- structured mode ----
+  required.forEach(cookieName => {
+    const row = document.createElement('div');
+    row.className = 'kv-row';
+    const nameLabel = document.createElement('span');
+    nameLabel.className = 'cred-cookie-name';
+    nameLabel.textContent = cookieName;
+    nameLabel.title = cookieName;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'form-control';
+    input.placeholder = '值';
+    input.addEventListener('input', () => {
+      const jar = parseCookieString(hidden.value);
+      const typed = input.value.trim();
+      if (typed) jar[cookieName] = typed;
+      else delete jar[cookieName];
+      commit(buildCookieString(jar));
+    });
+    fields[cookieName] = input;
+    row.append(nameLabel, input);
+    formPane.appendChild(row);
+  });
+
+  const extraHint = document.createElement('div');
+  extraHint.className = 'form-hint';
+  extraHint.textContent = '其他 Cookie 会在切换到「完整粘贴」时保留。';
+  formPane.appendChild(extraHint);
+
+  // ---- raw mode ----
+  const rawInput = document.createElement('textarea');
+  rawInput.className = 'form-control';
+  rawInput.rows = 4;
+  rawInput.placeholder = '粘贴完整 Cookie，或直接粘贴 DevTools 的「Copy as cURL」命令';
+  rawInput.addEventListener('input', () => {
+    const fromCurl = extractCookieFromCurl(rawInput.value);
+    if (fromCurl) {
+      // A pasted cURL command is replaced by just its Cookie header.
+      rawInput.value = fromCurl;
+      showToast('已从 cURL 命令中提取 Cookie', 'success');
+    }
+    commit(rawInput.value);
+    syncFormFromValue();
+  });
+  rawPane.appendChild(rawInput);
+
+  function syncFormFromValue() {
+    const jar = parseCookieString(hidden.value);
+    required.forEach(cookieName => {
+      if (fields[cookieName]) fields[cookieName].value = jar[cookieName] || '';
+    });
+  }
+
+  const setMode = mode => {
+    const isRaw = mode === 'raw';
+    formPane.style.display = isRaw ? 'none' : 'block';
+    rawPane.style.display = isRaw ? 'block' : 'none';
+    modes.querySelectorAll('button').forEach(button => {
+      button.classList.toggle('active', button.dataset.mode === mode);
+    });
+    if (isRaw) rawInput.value = hidden.value;
+    else syncFormFromValue();
+  };
+
+  [['form', '分项填写'], ['raw', '完整粘贴']].forEach(([mode, text]) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn btn-sm';
+    button.dataset.mode = mode;
+    button.textContent = text;
+    button.addEventListener('click', () => setMode(mode));
+    modes.appendChild(button);
+  });
+
+  wrap.append(formPane, rawPane, status);
+  syncFormFromValue();
+  commit(hidden.value);
+  // Default to the raw box when a value already exists, since a pasted string
+  // may hold cookies beyond the required ones.
+  setMode(credential.value ? 'raw' : 'form');
+  return wrap;
+}
+
+function renderCredentials() {
+  const list = document.getElementById('credentials-list');
+  const count = document.getElementById('credentials-count');
+  if (count) count.textContent = String(credentialDraft.length);
+  if (!list) return;
+  list.replaceChildren();
+  if (credentialDraft.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-text';
+    empty.textContent = '暂无凭据，请从上方按钮添加';
+    list.appendChild(empty);
+    return;
+  }
+  credentialDraft.forEach(credential => list.appendChild(buildCredentialCard(credential)));
+}
+
+// Action credential pickers reflect the credentials currently drafted.
+function renderActionCredentialOptions(action) {
+  const select = document.getElementById(`${action}-credential`);
+  const hint = document.getElementById(`${action}-credential-hint`);
+  if (!select) return;
+
+  const protocol = document.getElementById(`${action}-protocol`)?.value || 'auto';
+  const wantsOauth = action === 'checkin' && protocol === 'oauth';
+  const previous = select.value;
+
+  select.replaceChildren();
+  const auto = document.createElement('option');
+  auto.value = '';
+  auto.textContent = wantsOauth ? '自动（优先 Github，其次 LinuxDO）' : '自动（优先 Token，其次 Cookie）';
+  select.appendChild(auto);
+
+  const usable = credentialDraft.filter(credential =>
+    wantsOauth ? OAUTH_TYPES.includes(credential.type) : true
+  );
+
+  // OAUTH_TYPES is in the same order the backend resolves them, so the label
+  // can name what will actually be picked instead of a generic priority that
+  // may not apply — with only LinuxDO configured, "优先 Github" is misleading.
+  const presentOauth = OAUTH_TYPES.filter(type => usable.some(item => item.type === type));
+  if (wantsOauth) {
+    if (presentOauth.length === 1) {
+      auto.textContent = `自动（使用 ${CREDENTIAL_LABELS[presentOauth[0]]}）`;
+    } else if (presentOauth.length > 1) {
+      auto.textContent = `自动（优先 ${presentOauth.map(t => CREDENTIAL_LABELS[t]).join('，其次 ')}）`;
+    }
+  }
+
+  usable.forEach(credential => {
+    const option = document.createElement('option');
+    option.value = credential.id;
+    const name = CREDENTIAL_LABELS[credential.type] || credential.type;
+    option.textContent = credential.label ? `${name} — ${credential.label}` : name;
+    select.appendChild(option);
+  });
+  select.value = usable.some(item => item.id === previous) ? previous : '';
+
+  if (hint) {
+    const missingOauth = OAUTH_TYPES.filter(type => !presentOauth.includes(type));
+    if (credentialDraft.length === 0) {
+      hint.textContent = '请先在「凭据」页添加至少一个凭据。';
+    } else if (wantsOauth && usable.length === 0) {
+      hint.textContent = 'OAuth 协议需要一个 Github 或 LinuxDO OAuth 凭据。';
+    } else if (wantsOauth && missingOauth.length) {
+      // Point out the alternative provider: Github credentials are the fragile
+      // ones, so knowing LinuxDO can be added here is worth surfacing.
+      hint.textContent =
+        `还可在「凭据」页添加 ${missingOauth.map(t => CREDENTIAL_LABELS[t]).join('、')} 作为备选，`
+        + '在当前凭据失效时切换使用。';
+    } else {
+      hint.textContent = '';
+    }
+  }
+
+  const protocolHint = document.getElementById(`${action}-protocol-hint`);
+  if (protocolHint) {
+    protocolHint.textContent = wantsOauth
+      ? '适用于二次开发后关闭了通用签到端点、只能靠重新登录自动签到的站点：每次签到都会重新走一次 OAuth 登录，而不是复用已保存的会话。'
+      : '';
+  }
+  if (action === 'checkin') renderFrameworkHints();
+}
+
+function renderFrameworkHints() {
+  const type = document.getElementById('site-type')?.value || 'new-api';
+  const defaults = FRAMEWORK_DEFAULTS[type] || FRAMEWORK_DEFAULTS['new-api'];
+  const checkinHint = document.getElementById('checkin-path-hint');
+  const balanceHint = document.getElementById('balance-path-hint');
+  const isOauth = document.getElementById('checkin-protocol')?.value === 'oauth';
+  if (checkinHint) {
+    checkinHint.textContent = isOauth
+      ? 'Path 会被忽略：登录本身即签到，不再请求任何签到端点。'
+      : defaults.checkin;
+  }
+  if (balanceHint) balanceHint.textContent = defaults.balance;
+  ['checkin', 'balance'].forEach(name => {
+    const headerHint = document.getElementById(`${name}-headers-hint`);
+    if (headerHint) headerHint.textContent = defaults.newApiUser;
+    // Only New-API exposes a new-api-user id to fetch.
+    const fetchButton = document.getElementById(`${name}-fetch-user`);
+    if (fetchButton) fetchButton.style.display = type === 'new-api' ? '' : 'none';
+  });
+}
+
+function fillActionForm(action, config) {
+  const source = config && typeof config === 'object' ? config : {};
+  const path = document.getElementById(`${action}-path`);
+  const protocol = document.getElementById(`${action}-protocol`);
+  const solve = document.getElementById(`${action}-solve-acw`);
+  if (path) path.value = source.path || '';
+  if (protocol) protocol.value = source.protocol || 'auto';
+  if (solve) solve.checked = source.solve_acw_sc_v2 === true;
+  setHeaderRows(action, source.headers);
+  renderActionCredentialOptions(action);
+  const credential = document.getElementById(`${action}-credential`);
+  if (credential) {
+    const wanted = source.credential_id || '';
+    credential.value = credentialDraft.some(item => item.id === wanted) ? wanted : '';
+  }
+}
+
+function readActionForm(action) {
+  return {
+    path: document.getElementById(`${action}-path`)?.value.trim() || '',
+    protocol: document.getElementById(`${action}-protocol`)?.value || 'auto',
+    credential_id: document.getElementById(`${action}-credential`)?.value || '',
+    headers: getHeaderPairs(action),
+    solve_acw_sc_v2: document.getElementById(`${action}-solve-acw`)?.checked === true
+  };
+}
+
+/**
+ * Fetch new-api-user from the station and write it into this action's headers.
+ *
+ * New-API scopes a Cookie session to a numeric account id through this header.
+ * One-API has no equivalent, so a failure there is expected and is reported as
+ * such rather than as a breakage.
+ */
+async function fetchNewApiUser(action) {
+  const button = document.getElementById(`${action}-fetch-user`);
+  const siteType = document.getElementById('site-type')?.value || 'new-api';
+  if (siteType !== 'new-api') {
+    showToast('仅 New-API 框架需要 new-api-user，请先将框架类型设为 New-API', 'warning');
+    return;
+  }
+  const baseUrl = document.getElementById('site-url')?.value.trim();
+  if (!baseUrl) {
+    showToast('请先填写 Base URL', 'warning');
+    switchSiteTab('basic');
+    return;
+  }
+
+  readCredentialDraftFromDom();
+  if (credentialDraft.length === 0) {
+    showToast('请先在「凭据」页添加一个 Token 或 Cookie 凭据', 'warning');
+    switchSiteTab('credentials');
+    return;
+  }
+
+  const original = button ? button.textContent : '';
+  if (button) {
+    button.disabled = true;
+    button.textContent = '获取中…';
+  }
+  try {
+    // Send the in-progress form rather than the saved site, so the value can be
+    // fetched before the site has ever been saved.
+    const data = await apiPost('/api/sites/probe-new-api-user', buildSitePayloadFromForm());
+    if (!data || data.status !== 'ok' || !data.user_id) {
+      showToast(data?.message || '获取 new-api-user 失败', 'error', 7000);
+      return;
+    }
+    setHeaderRows(action, upsertHeaderPair(getHeaderPairs(action), data.header, data.user_id));
+    showToast(data.message || `已填入 ${data.header}`, 'success');
+  } catch (e) {
+    showToast('获取 new-api-user 请求失败', 'error');
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = original;
+    }
+  }
+}
+
+/** Set a header pair by case-insensitive name, appending when absent. */
+function upsertHeaderPair(pairs, key, value) {
+  const wanted = String(key || '').toLowerCase();
+  const next = pairs.map(pair => ({ ...pair }));
+  const existing = next.find(pair => pair.key.toLowerCase() === wanted);
+  if (existing) {
+    existing.value = String(value);
+    return next;
+  }
+  next.push({ key, value: String(value) });
+  return next;
+}
+
+/** Build a site payload from the editor, for actions that run before saving. */
+function buildSitePayloadFromForm() {
+  const previous = isEdit && editIndex >= 0 ? sites[editIndex] : null;
+  return {
+    id: previous ? previous.id : '',
+    name: document.getElementById('site-name')?.value.trim() || '',
+    type: document.getElementById('site-type')?.value || 'new-api',
+    base_url: document.getElementById('site-url')?.value.trim() || '',
+    proxy: document.getElementById('site-proxy')?.value.trim() || '',
+    credentials: credentialDraft.map(credential => {
+      const entry = {
+        id: credential.id,
+        type: credential.type,
+        label: credential.label || ''
+      };
+      // Omitting the value means "unchanged"; storage restores the stored one.
+      // Only OAuth cookies rotate underneath us, so only they are eligible.
+      const untouchedOauthCookie = OAUTH_TYPES.includes(credential.type)
+        && credential.loadedValue
+        && credential.value === credential.loadedValue;
+      if (!untouchedOauthCookie) entry.value = credential.value || '';
+      if (credential.type === 'token') entry.auto_bearer = credential.auto_bearer !== false;
+      // Carry the stored session so the probe can reuse it instead of logging in.
+      if (OAUTH_TYPES.includes(credential.type) && credential.session_cookie) {
+        entry.session_cookie = credential.session_cookie;
+      }
+      return entry;
+    }),
+    checkin: readActionForm('checkin'),
+    balance: readActionForm('balance'),
+    enabled: document.getElementById('site-enabled')?.checked === true
+  };
 }
 
 // Site Form Actions
@@ -709,33 +1394,46 @@ function openAddSiteModal() {
   document.getElementById('site-name').value = '';
   document.getElementById('site-type').value = 'new-api';
   document.getElementById('site-url').value = '';
-  document.querySelector('input[name="auth_type"][value="bearer_token"]').checked = true;
-  document.getElementById('site-solve-acw-sc-v2').checked = false;
-  document.getElementById('site-auth-value').value = '';
-  document.getElementById('site-endpoint').value = '';
   document.getElementById('site-proxy').value = '';
-  clearHeaderRows();
   document.getElementById('site-enabled').checked = true;
+  credentialDraft = [];
+  renderCredentials();
+  fillActionForm('checkin', {});
+  fillActionForm('balance', {});
+  renderFrameworkHints();
+  switchSiteTab('basic');
   openModal('site-modal');
 }
 
 function openEditSiteModal(index) {
   const site = sites[index];
   if (!site) return;
+  if (site.locked) {
+    showToast('该站点配置已加密，请先输入密钥解锁', 'warning');
+    return;
+  }
   isEdit = true;
   editIndex = index;
   document.getElementById('site-modal-title').textContent = '编辑中转站';
-  document.getElementById('site-name').value = site.name;
-  document.getElementById('site-type').value = site.type;
-  document.getElementById('site-url').value = site.base_url;
-  const authType = site.auth_type === 'cookie' ? 'cookie' : 'bearer_token';
-  document.querySelector(`input[name="auth_type"][value="${authType}"]`).checked = true;
-  document.getElementById('site-solve-acw-sc-v2').checked = site.solve_acw_sc_v2 === true;
-  document.getElementById('site-auth-value').value = site.auth_value;
-  document.getElementById('site-endpoint').value = site.checkin_endpoint;
-  document.getElementById('site-proxy').value = site.proxy;
-  setHeadersFromText(site.custom_headers);
+  document.getElementById('site-name').value = site.name || '';
+  document.getElementById('site-type').value = site.type || 'new-api';
+  document.getElementById('site-url').value = site.base_url || '';
+  document.getElementById('site-proxy').value = site.proxy || '';
   document.getElementById('site-enabled').checked = site.enabled === true;
+
+  credentialDraft = (Array.isArray(site.credentials) ? site.credentials : []).map(credential => ({
+    ...credential,
+    id: credential.id || nextCredentialId(),
+    // Remember what was loaded. An OAuth cookie the user never touches is
+    // omitted on save, so a rotation that happened while this editor was open
+    // is not reverted by an unrelated edit.
+    loadedValue: credential.value || ''
+  }));
+  renderCredentials();
+  fillActionForm('checkin', site.checkin);
+  fillActionForm('balance', site.balance);
+  renderFrameworkHints();
+  switchSiteTab('basic');
   openModal('site-modal');
 }
 
@@ -743,32 +1441,68 @@ async function submitSiteForm() {
   const name = document.getElementById('site-name').value.trim();
   const type = document.getElementById('site-type').value;
   const base_url = document.getElementById('site-url').value.trim();
-  const auth_type = document.querySelector('input[name="auth_type"]:checked').value;
-  const solve_acw_sc_v2 = document.getElementById('site-solve-acw-sc-v2').checked;
-  const auth_value = document.getElementById('site-auth-value').value.trim();
-  const checkin_endpoint = document.getElementById('site-endpoint').value.trim();
   const proxy = document.getElementById('site-proxy').value.trim();
-  const custom_headers = getHeaderPairsText();
   const enabled = document.getElementById('site-enabled').checked;
 
-  if (!name || !base_url || !auth_value) {
-    showToast('请补全必要信息', 'warning');
+  if (!name || !base_url) {
+    showToast('请填写站点名称与 Base URL', 'warning');
+    switchSiteTab('basic');
     return;
   }
 
+  readCredentialDraftFromDom();
+  if (credentialDraft.length === 0) {
+    showToast('请至少添加一个凭据', 'warning');
+    switchSiteTab('credentials');
+    return;
+  }
+  const blank = credentialDraft.find(credential => !credential.value);
+  if (blank) {
+    const label = CREDENTIAL_LABELS[blank.type] || '凭据';
+    showToast(`凭据「${blank.label || label}」尚未填写内容`, 'warning');
+    switchSiteTab('credentials');
+    return;
+  }
+
+  const checkin = readActionForm('checkin');
+  if (checkin.protocol === 'oauth' && !credentialDraft.some(c => OAUTH_TYPES.includes(c.type))) {
+    showToast('签到协议为 OAuth，请先添加一个 OAuth 凭据', 'warning');
+    switchSiteTab('checkin');
+    return;
+  }
+
+  const previous = isEdit && editIndex >= 0 ? sites[editIndex] : null;
   const siteData = {
-    id: isEdit ? sites[editIndex].id : 'site_' + Date.now(),
+    id: previous ? previous.id : 'site_' + Date.now(),
     name,
     type,
     base_url,
-    auth_type,
-    solve_acw_sc_v2,
-    auth_value,
-    checkin_endpoint,
     proxy,
-    custom_headers,
+    credentials: credentialDraft.map(credential => {
+      const entry = {
+        id: credential.id,
+        type: credential.type,
+        label: credential.label || ''
+      };
+      // Omitting the value means "unchanged"; storage restores the stored one.
+      // Only OAuth cookies rotate underneath us, so only they are eligible.
+      const untouchedOauthCookie = OAUTH_TYPES.includes(credential.type)
+        && credential.loadedValue
+        && credential.value === credential.loadedValue;
+      if (!untouchedOauthCookie) entry.value = credential.value || '';
+      if (credential.type === 'token') entry.auto_bearer = credential.auto_bearer !== false;
+      return entry;
+    }),
+    checkin,
+    balance: readActionForm('balance'),
     enabled
   };
+  if (previous) {
+    // Preserve state the dashboard never edits.
+    ['last_checkin_date', 'last_checkin_time', 'last_checkin_success', 'last_quota'].forEach(key => {
+      if (previous[key] !== undefined) siteData[key] = previous[key];
+    });
+  }
 
   if (isEdit && editIndex >= 0) {
     sites[editIndex] = siteData;
@@ -779,6 +1513,7 @@ async function submitSiteForm() {
   renderSitesTable();
   await saveSites();
   closeModal('site-modal');
+  await loadSites();
 }
 
 function deleteSite(index) {
@@ -794,6 +1529,10 @@ function deleteSite(index) {
 async function recheckInSite(index) {
   const site = sites[index];
   if (!site) return false;
+  if (site.locked || isVaultLocked()) {
+    showToast('配置已加密未解锁，请先输入密钥', 'warning');
+    return false;
+  }
   const siteId = getSiteId(site);
 
   const confirmed = await showConfirm(`确定要重新签到“${site.name}”吗？这会再次请求签到接口。`);
@@ -818,6 +1557,10 @@ async function recheckInSite(index) {
 async function testSingleSite(index) {
   const site = sites[index];
   if (!site) return;
+  if (site.locked || isVaultLocked()) {
+    showToast('配置已加密未解锁，请先输入密钥', 'warning');
+    return;
+  }
   try {
     const data = await apiPost('/api/sites/test', site);
     if (data && data.success) {
@@ -825,6 +1568,7 @@ async function testSingleSite(index) {
     } else {
       showToast(`${site.name}: ${data.message || '测试失败'}`, 'error');
     }
+    await loadSites();
     loadLogs();
   } catch (e) {
     showToast('测试请求失败', 'error');
@@ -832,6 +1576,10 @@ async function testSingleSite(index) {
 }
 
 async function runCheckInAll() {
+  if (isVaultLocked()) {
+    showToast('配置已加密未解锁，请先输入密钥', 'warning');
+    return;
+  }
   const btn = document.getElementById('btn-run-all');
   if (btn) {
     btn.disabled = true;
@@ -852,6 +1600,587 @@ async function runCheckInAll() {
   }
 }
 
+// Vault (AES-256-GCM Encryption) Actions
+function applyVaultState(state) {
+  if (state && typeof state === 'object') {
+    vaultState = {
+      enabled: state.enabled === true,
+      unlocked: state.unlocked === true,
+      locked: state.locked === true
+    };
+  }
+  renderVaultUi();
+}
+
+function renderVaultUi() {
+  const banner = document.getElementById('lock-banner');
+  if (banner) banner.style.display = vaultState.locked ? 'flex' : 'none';
+
+  const badge = document.getElementById('vault-badge');
+  if (badge) {
+    badge.style.display = vaultState.enabled ? 'inline-block' : 'none';
+    badge.className = `badge ${vaultState.locked ? 'badge-warning' : 'badge-success'}`;
+    badge.textContent = vaultState.locked ? '已加密 · 锁定' : '已加密 · 已解锁';
+  }
+
+  const toggle = document.getElementById('setting-vault-enabled');
+  if (toggle) toggle.checked = vaultState.enabled;
+
+  const controls = document.getElementById('vault-controls');
+  if (controls) controls.style.display = vaultState.enabled ? 'flex' : 'none';
+
+  const hint = document.getElementById('vault-state-hint');
+  if (hint) {
+    if (!vaultState.enabled) {
+      hint.textContent = '加密凭据、请求头与代理。启用后生成一个仅显示一次的密钥。';
+    } else if (vaultState.locked) {
+      hint.textContent = '已锁定：敏感字段不可读，定时签到会跳过所有站点。';
+    } else {
+      hint.textContent = '已解锁：插件重载后需重新解锁。';
+    }
+  }
+
+  renderKeySlots();
+}
+
+async function loadVaultState() {
+  try {
+    const data = await apiGet('/api/vault');
+    applyVaultState(data);
+  } catch (e) {
+    console.error('loadVaultState error:', e);
+  }
+  await loadKeySlots();
+}
+
+// Key Slot Actions
+async function loadKeySlots() {
+  try {
+    const data = await apiGet('/api/vault/slots');
+    keySlots = Array.isArray(data?.slots) ? data.slots : [];
+  } catch (e) {
+    console.error('loadKeySlots error:', e);
+    keySlots = [];
+  }
+  renderKeySlots();
+}
+
+function renderKeySlots() {
+  const block = document.getElementById('slots-block');
+  if (block) block.style.display = vaultState.enabled ? 'block' : 'none';
+
+  const list = document.getElementById('slots-list');
+  if (!list) return;
+  list.replaceChildren();
+  if (keySlots.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-text';
+    empty.textContent = '暂无槽位';
+    list.appendChild(empty);
+    return;
+  }
+
+  keySlots.forEach(slot => {
+    const card = document.createElement('div');
+    card.className = 'cred-card';
+
+    const header = document.createElement('div');
+    header.className = 'cred-card-header';
+    const title = document.createElement('div');
+    title.className = 'cred-title';
+    const tag = document.createElement('span');
+    tag.className = `cred-type-tag${slot.type === 'webauthn_prf' ? ' oauth' : ''}`;
+    tag.textContent = SLOT_TYPE_LABELS[slot.type] || slot.type;
+    const name = document.createElement('span');
+    name.textContent = slot.label || '未命名';
+    title.append(tag, name);
+    header.appendChild(title);
+
+    if (slot.removable) {
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'btn-icon-danger';
+      remove.title = '删除此槽位';
+      remove.textContent = '×';
+      remove.addEventListener('click', () => removeKeySlot(slot));
+      header.appendChild(remove);
+    } else {
+      const badge = document.createElement('span');
+      badge.className = 'badge badge-info';
+      badge.textContent = '恢复槽位';
+      badge.title = '不可删除，确保丢失通行密钥后仍能解锁';
+      header.appendChild(badge);
+    }
+    card.appendChild(header);
+
+    const meta = document.createElement('div');
+    meta.className = 'cred-session-state';
+    const bits = [];
+    if (slot.rp_id) bits.push(`域名 ${slot.rp_id}`);
+    if (slot.created_at) bits.push(`创建于 ${slot.created_at}`);
+    bits.push(slot.last_used_at ? `最近使用 ${slot.last_used_at}` : '尚未使用');
+    meta.textContent = bits.join(' · ');
+    card.appendChild(meta);
+
+    list.appendChild(card);
+  });
+}
+
+function removeKeySlot(slot) {
+  const name = slot.label || '该槽位';
+  showConfirm(`确定要删除「${name}」吗？该设备将无法再解锁配置。`, async () => {
+    try {
+      const data = await apiPost('/api/vault/slots/remove', { slot_id: slot.id });
+      if (!data || data.status !== 'ok') {
+        showToast(data?.message || '删除槽位失败', 'error');
+        return;
+      }
+      applyVaultState(data.vault);
+      showToast(data.message || '槽位已删除', 'success');
+      await loadKeySlots();
+    } catch (e) {
+      showToast('删除槽位请求失败', 'error');
+    }
+  });
+}
+
+function getPasskeyPageUrl() {
+  // This iframe has an opaque origin, so location.origin reads "null" and
+  // parent.location is unreachable. The document can still read its own
+  // protocol and host, which are the dashboard's — that is enough to build an
+  // absolute URL the user can paste into a new tab.
+  const path = `/api/v1/plugins/extensions/${PLUGIN_ID}/passkey`;
+  const { protocol, host } = window.location;
+  if (host && protocol && protocol !== 'null:') {
+    return `${protocol}//${host}${path}`;
+  }
+  return path;
+}
+
+function openPasskeyModal() {
+  const box = document.getElementById('passkey-url');
+  if (box) box.textContent = getPasskeyPageUrl();
+  clearCopyStatus('passkey-url', 'passkey-url-status');
+  openModal('passkey-modal');
+  startPasskeyWatch();
+}
+
+/**
+ * Watch for what the standalone passkey tab does, while this dialog is open.
+ *
+ * The other tab cannot tell this one directly: the iframe has an opaque origin,
+ * which rules out BroadcastChannel, localStorage and cross-tab postMessage
+ * alike. Polling the vault state is the only channel left, and it is only worth
+ * running while the dialog that sent the user there is still open.
+ */
+function startPasskeyWatch() {
+  stopPasskeyWatch();
+  const lockedAtOpen = isVaultLocked();
+  passkeyWatch = {
+    lockedAtOpen,
+    // Locked: poll, for the case where both tabs are visible side by side and
+    // no visibility change ever fires. Coming back to a backgrounded tab is
+    // already handled globally, so this deliberately adds no second listener.
+    timer: lockedAtOpen ? window.setInterval(syncPasskeyProgress, PASSKEY_POLL_MS) : null,
+    // Unlocked: an unlocked vault is the precondition for registering a device,
+    // so the only thing the other tab can change is the slot list — worth
+    // re-reading once, on return, but not worth polling for.
+    onVisible: lockedAtOpen ? null : () => {
+      if (!document.hidden) loadKeySlots();
+    }
+  };
+  if (passkeyWatch.onVisible) {
+    document.addEventListener('visibilitychange', passkeyWatch.onVisible);
+  }
+}
+
+function stopPasskeyWatch() {
+  if (!passkeyWatch) return;
+  if (passkeyWatch.timer) window.clearInterval(passkeyWatch.timer);
+  if (passkeyWatch.onVisible) {
+    document.removeEventListener('visibilitychange', passkeyWatch.onVisible);
+  }
+  passkeyWatch = null;
+}
+
+/** Poll for an unlock performed in the other tab, and adopt it when it lands. */
+async function syncPasskeyProgress() {
+  if (!passkeyWatch?.lockedAtOpen) return;
+
+  let unlocked = false;
+  try {
+    const data = await apiGet('/api/vault');
+    unlocked = data?.locked !== true;
+  } catch (e) {
+    // A dropped request is not a state change. Stay quiet and keep watching:
+    // the user is mid-unlock in another tab and a toast here helps nobody.
+    return;
+  }
+  // The dialog may have been closed by hand while the request was in flight.
+  if (!passkeyWatch || !unlocked) return;
+  await refreshVaultState({ quiet: true });
+}
+
+/**
+ * Dismiss the hand-off dialog once the tab it points at has done its job.
+ *
+ * Returns whether an open dialog was actually closed, so the caller can skip
+ * its own "已同步" toast rather than raise two for one event.
+ */
+function closePasskeyHandoff() {
+  const open = document.getElementById('passkey-modal')?.classList.contains('active');
+  stopPasskeyWatch();
+  if (!open) return false;
+  closeModal('passkey-modal');
+  showToast('已在其他标签页解锁，配置已同步', 'success');
+  return true;
+}
+
+async function copyPasskeyUrl() {
+  await runCopy({
+    boxId: 'passkey-url',
+    statusId: 'passkey-url-status',
+    successText: '地址已复制，请在新标签页中打开',
+    failureTitle: '复制失败，请手动复制下面的地址',
+    noun: '地址'
+  });
+}
+
+/**
+ * Re-read the vault state without reloading the page.
+ *
+ * Unlocking and registering happen in a separate tab, so this dashboard has no
+ * way to learn about it. Rather than making the user reload the whole AstrBot
+ * page, pull the state and repaint everything that depends on it.
+ */
+async function refreshVaultState(options = {}) {
+  const { quiet = false } = options;
+  try {
+    const wasLocked = isVaultLocked();
+    await loadVaultState();
+    await loadSites();
+    const locked = isVaultLocked();
+    // Whichever path noticed the unlock — this dialog's own poll, the manual
+    // button, or returning to the tab — the hand-off dialog has nothing left to
+    // say once the other tab has done its job.
+    const handedOff = wasLocked && !locked && closePasskeyHandoff();
+    if (!quiet && !handedOff) {
+      showToast(locked ? '仍处于锁定状态' : '已同步：配置已解锁', locked ? 'warning' : 'success');
+    }
+    return true;
+  } catch (e) {
+    console.error('refreshVaultState error:', e);
+    if (!quiet) showToast('刷新状态失败', 'error');
+    return false;
+  }
+}
+
+/**
+ * Copy a one-shot value and report the outcome inline, next to the value.
+ *
+ * A corner toast is the wrong place for either outcome here: the vault key is
+ * shown exactly once, so a user who misses a failed copy — or who treats a
+ * successful copy as "saved" and closes the dialog before pasting anywhere —
+ * has to reset the vault. Both messages therefore land directly above the
+ * value and stay there until the dialog is reopened.
+ */
+async function runCopy({ boxId, statusId, successText, successNotice, failureTitle, noun }) {
+  const box = document.getElementById(boxId);
+  const value = box?.textContent || '';
+  if (!value) return false;
+
+  const copied = await copyText(value);
+  if (copied) {
+    if (box) box.classList.remove('copy-failed');
+    if (successNotice) {
+      renderCopyStatus(statusId, 'notice', '✓', successNotice.title, successNotice.detail);
+    } else {
+      clearCopyStatus(boxId, statusId);
+    }
+    showToast(successText, 'success');
+    return true;
+  }
+
+  // Select the text so the only remaining step is one keystroke.
+  const selected = selectElementText(box);
+  if (box) box.classList.add('copy-failed');
+  renderCopyStatus(
+    statusId,
+    'error',
+    '!',
+    failureTitle,
+    selected
+      ? `${noun}已选中，按 Ctrl/⌘+C 复制。`
+      : `请选中下面的${noun}并按 Ctrl/⌘+C 复制。`
+  );
+  return false;
+}
+
+/** Render an inline copy status block above a value box. */
+function renderCopyStatus(statusId, variant, iconText, title, detail) {
+  const status = document.getElementById(statusId);
+  if (!status) return;
+  status.replaceChildren();
+  status.className = `copy-status copy-status-${variant}`;
+
+  const icon = document.createElement('span');
+  icon.className = 'copy-status-icon';
+  icon.textContent = iconText;
+
+  const text = document.createElement('div');
+  const heading = document.createElement('strong');
+  heading.textContent = title;
+  const body = document.createElement('span');
+  body.textContent = detail;
+  text.append(heading, body);
+
+  status.append(icon, text);
+  status.style.display = 'flex';
+  status.scrollIntoView({ block: 'nearest' });
+}
+
+/** Reset the copy status state for one value box. */
+function clearCopyStatus(boxId, statusId) {
+  const box = document.getElementById(boxId);
+  const status = document.getElementById(statusId);
+  if (box) box.classList.remove('copy-failed');
+  if (status) {
+    status.className = 'copy-status';
+    status.style.display = 'none';
+    status.replaceChildren();
+  }
+}
+
+/**
+ * Select an element's text so the user only needs to press Ctrl+C.
+ *
+ * Returns whether the selection took, so the failure message can tell the
+ * truth instead of promising a selection that never happened. The check uses
+ * rangeCount/isCollapsed rather than the selection's string value: after the
+ * copy fallback moves focus, the stringified selection can lag by a frame and
+ * would make a successful selection look like a failure.
+ */
+function selectElementText(element) {
+  if (!element) return false;
+  try {
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    const selection = document.getSelection();
+    if (!selection) return false;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return selection.rangeCount > 0 && !selection.isCollapsed;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Copy text to the clipboard, falling back to the legacy command.
+ *
+ * navigator.clipboard is unusable in this page: the dashboard sandboxes plugin
+ * iframes without allow-same-origin, giving them an opaque origin that the
+ * clipboard-write permissions policy (default allowlist "self") can never
+ * match, so writeText always rejects with NotAllowedError. execCommand is
+ * governed by user-gesture rules instead and still works, so it is the one
+ * that actually succeeds here.
+ */
+async function copyText(text) {
+  const value = String(text || '');
+  if (!value) return false;
+
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch (e) {
+      // Expected inside the sandbox; fall through to execCommand.
+    }
+  }
+
+  let textarea = null;
+  try {
+    textarea = document.createElement('textarea');
+    textarea.value = value;
+    textarea.setAttribute('readonly', '');
+    // Keep it off-screen without using display:none, which would make it
+    // unselectable and defeat the copy.
+    textarea.style.position = 'fixed';
+    textarea.style.top = '0';
+    textarea.style.left = '0';
+    textarea.style.width = '1px';
+    textarea.style.height = '1px';
+    textarea.style.padding = '0';
+    textarea.style.border = 'none';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+
+    const selection = document.getSelection();
+    const previousRange = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+
+    textarea.focus();
+    textarea.select();
+    textarea.setSelectionRange(0, value.length);
+    const copied = document.execCommand('copy');
+
+    // Leave the selection in a clean state. Without this it still points into
+    // the textarea we are about to remove, and a later selectElementText()
+    // would silently produce an empty selection.
+    if (selection) {
+      selection.removeAllRanges();
+      if (previousRange) selection.addRange(previousRange);
+    }
+    textarea.blur();
+    return copied;
+  } catch (e) {
+    return false;
+  } finally {
+    if (textarea) textarea.remove();
+  }
+}
+
+function toggleVaultEncryption(input) {
+  const wantsEnabled = input.checked;
+  // The switch only reflects server state; revert it until the call succeeds.
+  input.checked = vaultState.enabled;
+  if (wantsEnabled === vaultState.enabled) return;
+  if (wantsEnabled) {
+    showConfirm(
+      '启用后将使用 AES-256-GCM 加密凭据、自定义请求头与代理地址。密钥只显示一次，丢失后只能重置。是否继续？',
+      enableVault
+    );
+  } else {
+    showConfirm('关闭加密会把所有敏感字段还原为明文保存。是否继续？', disableVault);
+  }
+}
+
+async function enableVault() {
+  try {
+    const data = await apiPost('/api/vault/enable', {});
+    if (!data || data.status !== 'ok' || !data.key) {
+      showToast(data?.message || '启用加密失败', 'error');
+      await loadVaultState();
+      return;
+    }
+    applyVaultState(data.vault);
+    await loadKeySlots();
+    const keyBox = document.getElementById('vault-key-text');
+    if (keyBox) keyBox.textContent = data.key;
+    clearCopyStatus('vault-key-text', 'vault-key-status');
+    openModal('vault-key-modal');
+    await loadSites();
+  } catch (e) {
+    showToast('启用加密请求失败', 'error');
+  }
+}
+
+async function disableVault() {
+  try {
+    const data = await apiPost('/api/vault/disable', {});
+    if (!data || data.status !== 'ok') {
+      showToast(data?.message || '关闭加密失败', 'error');
+      await loadVaultState();
+      return;
+    }
+    applyVaultState(data.vault);
+    await loadKeySlots();
+    showToast(data.message || '加密已关闭', 'success');
+    await loadSites();
+  } catch (e) {
+    showToast('关闭加密请求失败', 'error');
+  }
+}
+
+async function copyVaultKey() {
+  await runCopy({
+    boxId: 'vault-key-text',
+    statusId: 'vault-key-status',
+    successText: '密钥已复制到剪贴板',
+    // Copying is not saving: the clipboard can be overwritten at any moment,
+    // and this key is never shown again.
+    successNotice: {
+      title: '先粘贴保存，再关闭',
+      detail: '密钥不会再次显示，剪贴板随时可能被覆盖。'
+    },
+    failureTitle: '复制失败，请手动复制',
+    noun: '密钥'
+  });
+}
+
+function openUnlockModal() {
+  const input = document.getElementById('vault-unlock-key');
+  if (input) input.value = '';
+  openModal('vault-unlock-modal');
+  if (input) input.focus();
+}
+
+async function submitUnlockVault() {
+  const input = document.getElementById('vault-unlock-key');
+  const key = input ? input.value.trim() : '';
+  if (!key) {
+    showToast('请粘贴密钥', 'warning');
+    return;
+  }
+  try {
+    const data = await apiPost('/api/vault/unlock', { key });
+    if (!data || data.status !== 'ok') {
+      showToast(data?.message || '解锁失败', 'error');
+      return;
+    }
+    applyVaultState(data.vault);
+    if (input) input.value = '';
+    closeModal('vault-unlock-modal');
+    showToast('解锁成功', 'success');
+    await loadSites();
+  } catch (e) {
+    showToast('解锁请求失败', 'error');
+  }
+}
+
+function lockVault() {
+  showConfirm('锁定后需要重新输入密钥才能查看和使用敏感配置，定时签到将暂时跳过所有站点。是否继续？', async () => {
+    try {
+      const data = await apiPost('/api/vault/lock', {});
+      applyVaultState(data?.vault);
+      showToast(data?.message || '已锁定', 'success');
+      await loadSites();
+    } catch (e) {
+      showToast('锁定请求失败', 'error');
+    }
+  });
+}
+
+function openResetVaultModal() {
+  const input = document.getElementById('vault-reset-confirm');
+  if (input) input.value = '';
+  openModal('vault-reset-modal');
+  if (input) input.focus();
+}
+
+async function submitResetVault() {
+  const input = document.getElementById('vault-reset-confirm');
+  if ((input ? input.value.trim().toUpperCase() : '') !== 'RESET') {
+    showToast('请输入 RESET 以确认重置', 'warning');
+    return;
+  }
+  const confirmed = await showConfirm('最后确认：所有站点的凭据、自定义请求头与代理地址都会被清空，且无法恢复。');
+  if (!confirmed) return;
+  try {
+    const data = await apiPost('/api/vault/reset', { confirm: 'reset' });
+    if (!data || data.status !== 'ok') {
+      showToast(data?.message || '重置失败', 'error');
+      return;
+    }
+    applyVaultState(data.vault);
+    await loadKeySlots();
+    closeModal('vault-reset-modal');
+    showToast(data.message || '已重置加密', 'success');
+    await loadSites();
+  } catch (e) {
+    showToast('重置请求失败', 'error');
+  }
+}
+
 // Global Settings Actions
 async function loadSettings() {
   try {
@@ -859,6 +2188,7 @@ async function loadSettings() {
     if (data && typeof data === 'object') {
       settings = { ...settings, ...data };
       renderSettingsForm();
+      applyVaultState(data.vault);
       const badge = document.getElementById('target-time-badge');
       if (badge && data.today_target_time) {
         badge.textContent = data.today_target_time;
@@ -882,17 +2212,9 @@ function renderSettingsForm() {
   if (maxRecordsInput) {
     maxRecordsInput.value = settings.max_history_records ?? 0;
   }
-  const retentionDaysInput = document.getElementById('setting-history-retention-days');
-  if (retentionDaysInput) {
-    retentionDaysInput.value = settings.history_retention_days ?? 0;
-  }
-  const autoCleanupInput = document.getElementById('setting-auto-cleanup-logs');
-  if (autoCleanupInput) {
-    autoCleanupInput.checked = settings.auto_cleanup_logs !== false;
-  }
   renderImpersonateOptions();
   toggleRandomMode();
-  toggleLogCleanupSettings();
+  renderVaultUi();
 }
 
 function renderImpersonateOptions() {
@@ -931,22 +2253,6 @@ function toggleRandomMode() {
   document.getElementById('fixed-time-field').style.display = isRandom ? 'none' : 'block';
 }
 
-function toggleLogCleanupSettings() {
-  const cleanupInput = document.getElementById('setting-auto-cleanup-logs');
-  const retentionDaysInput = document.getElementById('setting-history-retention-days');
-  const maxRecordsInput = document.getElementById('setting-max-history-records');
-  const retentionDaysField = document.getElementById('history-retention-field');
-  const recordsField = document.getElementById('history-records-field');
-  if (!cleanupInput || !retentionDaysInput || !maxRecordsInput) return;
-
-  const enabled = cleanupInput.checked;
-  retentionDaysInput.disabled = !enabled;
-  maxRecordsInput.disabled = !enabled;
-  [retentionDaysField, recordsField].forEach(field => {
-    if (field) field.classList.toggle('is-disabled', !enabled);
-  });
-}
-
 function openSettingsModal() {
   openModal('settings-modal');
   loadSettings();
@@ -967,14 +2273,6 @@ async function saveSettings() {
   timeoutInputElement.value = String(http_timeout_seconds);
   const httpImpersonateSelect = document.getElementById('setting-http-impersonate');
   const http_impersonate = httpImpersonateSelect.value;
-  const autoCleanupInput = document.getElementById('setting-auto-cleanup-logs');
-  const auto_cleanup_logs = autoCleanupInput ? autoCleanupInput.checked : true;
-  const retentionDaysInput = document.getElementById('setting-history-retention-days');
-  const history_retention_days = Math.max(
-    0,
-    parseInt(retentionDaysInput ? retentionDaysInput.value : 0, 10) || 0
-  );
-  if (retentionDaysInput) retentionDaysInput.value = String(history_retention_days);
   const maxRecordsInput = document.getElementById('setting-max-history-records');
   const max_history_records = Math.max(0, parseInt(maxRecordsInput ? maxRecordsInput.value : 0, 10) || 0);
   if (maxRecordsInput) maxRecordsInput.value = String(max_history_records);
@@ -988,14 +2286,12 @@ async function saveSettings() {
     http_ssl_verify,
     http_timeout_seconds,
     http_impersonate,
-    auto_cleanup_logs,
-    history_retention_days,
     max_history_records
   };
 
   try {
     await apiPost('/api/settings', settings);
-    showToast('全局设置更新成功', 'success');
+    showToast('定时设置更新成功', 'success');
     closeModal('settings-modal');
     loadSettings();
   } catch (e) {
@@ -1050,29 +2346,126 @@ function getLogTitle(log) {
   return '自动定时签到';
 }
 
+/**
+ * Collapse a value to a single short line.
+ * Response bodies can be whole HTML pages or JSON documents, so the overview
+ * flattens every run of whitespace before truncating.
+ */
+function abridge(text, limit = 120) {
+  const flat = String(text ?? '').replace(/\s+/g, ' ').trim();
+  return flat.length > limit ? `${flat.slice(0, limit)}…` : flat;
+}
+
+/** Derive overview counters from a log's per-site results. */
+function summarizeLog(log) {
+  const details = Array.isArray(log?.details) ? log.details : [];
+  let okCount = 0;
+  let totalQuota = 0;
+  let hasQuota = false;
+  const parts = [];
+
+  details.forEach(item => {
+    if (item?.success) okCount += 1;
+    const quota = Number(item?.total_quota);
+    if (Number.isFinite(quota) && quota > 0) {
+      totalQuota += quota;
+      hasQuota = true;
+    }
+    const name = item?.site_name || item?.site_id || '未命名站点';
+    const message = abridge(item?.message, 40);
+    parts.push(message ? `${name}: ${message}` : name);
+  });
+
+  return {
+    okCount,
+    total: details.length,
+    totalQuota: hasQuota ? totalQuota : null,
+    // Built from structured fields rather than log.report, which embeds the
+    // raw station messages verbatim.
+    preview: parts.length ? abridge(parts.join(' · '), 160) : abridge(log?.report, 160)
+  };
+}
+
 function createLogTimelineItem(log) {
   const item = document.createElement('div');
   item.className = 'timeline-item';
+
+  const details = Array.isArray(log?.details) ? log.details : [];
+  const single = details.length === 1 ? details[0] : null;
 
   const header = document.createElement('div');
   header.className = 'timeline-header';
   const title = document.createElement('span');
   title.className = 'timeline-title';
-  title.textContent = getLogTitle(log);
+  // One entry is one site, so lead with its name; the run type is secondary.
+  title.textContent = single
+    ? `${single.site_name || single.site_id || '未命名站点'} · ${getLogTitle(log)}`
+    : getLogTitle(log);
   const time = document.createElement('span');
   time.className = 'timeline-time';
   time.textContent = log.timestamp || '';
   header.append(title, time);
 
-  const content = document.createElement('div');
-  content.className = 'timeline-content';
-  content.textContent = log.report || '';
+  const stats = summarizeLog(log);
+  const summary = document.createElement('div');
+  summary.className = 'timeline-summary';
+  if (single) {
+    const status = document.createElement('span');
+    if (single.success) {
+      status.className = 'badge badge-success';
+      status.textContent = '成功';
+    } else if (single.expired) {
+      status.className = 'badge badge-failure';
+      status.textContent = 'Token 失效';
+    } else {
+      status.className = 'badge badge-failure';
+      status.textContent = '失败';
+    }
+    summary.appendChild(status);
+    const gained = Number(single.gained_quota);
+    if (Number.isFinite(gained) && gained > 0) {
+      const gain = document.createElement('span');
+      gain.className = 'badge badge-success';
+      gain.textContent = `+${formatBalance(gained)}`;
+      summary.appendChild(gain);
+    }
+  } else if (stats.total > 0) {
+    const counts = document.createElement('span');
+    const allOk = stats.okCount === stats.total;
+    counts.className = `badge ${allOk ? 'badge-success' : 'badge-warning'}`;
+    counts.textContent = `成功 ${stats.okCount}/${stats.total}`;
+    summary.appendChild(counts);
+  } else {
+    const empty = document.createElement('span');
+    empty.className = 'badge badge-info';
+    empty.textContent = log.success ? '已完成' : '无站点结果';
+    summary.appendChild(empty);
+  }
+  if (stats.totalQuota !== null) {
+    const balance = document.createElement('span');
+    balance.className = 'badge badge-info';
+    balance.textContent = single
+      ? `余额 ${formatBalance(stats.totalQuota)}`
+      : `总余额 ${formatBalance(stats.totalQuota)}`;
+    summary.appendChild(balance);
+  }
+
+  const preview = document.createElement('div');
+  preview.className = 'timeline-preview';
+  // Abridged on purpose: a station message can be a whole HTML page or JSON
+  // document, which belongs in the detail view, not the overview.
+  preview.textContent = single
+    ? (abridge(single.message, 160) || '无更多信息')
+    : (stats.preview || '无更多信息');
+  preview.title = '点击「查看详情」查看完整报文';
+
   const actions = document.createElement('div');
   actions.className = 'timeline-actions';
   actions.appendChild(
     createActionButton('查看详情', 'btn-primary-plain', () => openLogDetail(log), false)
   );
-  item.append(header, content, actions);
+
+  item.append(header, summary, preview, actions);
   return item;
 }
 
@@ -1203,16 +2596,25 @@ function openLogDetail(log) {
   const body = document.getElementById('log-detail-body');
   if (!body) return;
 
-  if (title) title.textContent = `签到日志详情 · ${log.timestamp || ''}`;
+  const details = Array.isArray(log.details) ? log.details : [];
+  // One entry is normally one site, so name it in the title rather than making
+  // the user hunt for it. Pre-split entries fall back to a neutral heading.
+  const single = details.length === 1 ? details[0] : null;
+  const siteName = single ? (single.site_name || single.site_id || '未命名站点') : '';
+  if (title) {
+    title.textContent = siteName
+      ? `${siteName} · ${log.timestamp || ''}`
+      : `签到日志详情 · ${log.timestamp || ''}`;
+  }
   body.replaceChildren();
 
   const overview = document.createElement('div');
   overview.className = 'log-detail-overview';
-  const overviewFields = [
-    ['类型', getLogTitle(log)],
-    ['时间', log.timestamp || '未记录']
-  ];
-  overviewFields.forEach(([labelText, value]) => {
+  const fields = [['类型', getLogTitle(log)], ['时间', log.timestamp || '未记录']];
+  if (!single && details.length > 1) {
+    fields.push(['站点数', String(details.length)]);
+  }
+  fields.forEach(([labelText, value]) => {
     const field = document.createElement('div');
     const label = document.createElement('span');
     label.textContent = labelText;
@@ -1223,9 +2625,9 @@ function openLogDetail(log) {
   });
   body.appendChild(overview);
 
-  body.appendChild(createLogDetailBlock('汇总', log.report || '未记录汇总', 'log-detail-report'));
-
-  const details = Array.isArray(log.details) ? log.details : [];
+  // No aggregate report block: an entry covers one site's task, and its status,
+  // message and balance already appear in the section below. Older databases
+  // may still hold pre-split entries with several sites, so the loop stays.
   if (details.length > 0) {
     details.forEach((result, resultIndex) => {
       body.appendChild(createLogResultElement(result, resultIndex));
@@ -1352,7 +2754,12 @@ async function fetchLogsPage(isInitial = false) {
     if (isInitial) {
       container.replaceChildren();
       if (newItems.length === 0) {
-        renderLogMessage(container, '暂无签到历史记录');
+        renderLogMessage(
+          container,
+          logsStartDate || logsEndDate
+            ? '该时间范围内没有签到记录'
+            : '暂无签到历史记录'
+        );
         logsLoading = false;
         return;
       }
@@ -1390,8 +2797,8 @@ function handleLogsScroll() {
 }
 
 function openLogsDrawer() {
-  syncLogTimeFilterFields();
   openModal('logs-drawer');
+  syncLogTimeFilterFields();
   fetchLogsPage(true);
 }
 
@@ -1410,6 +2817,10 @@ function clearLogs() {
       logsNextBeforeId = null;
       logsHasMore = false;
       logsTotal = 0;
+      // Nothing is left to filter, so drop the range too.
+      logsStartDate = '';
+      logsEndDate = '';
+      syncLogTimeFilterFields();
       const container = document.getElementById('logs-body');
       renderLogMessage(container, '暂无签到历史记录');
       showToast('历史日志已成功清空', 'success');
@@ -1421,10 +2832,29 @@ function clearLogs() {
 
 // Initial Loading
 document.addEventListener('DOMContentLoaded', () => {
+  loadVaultState();
   loadSites();
   loadSettings();
   const logsBody = document.getElementById('logs-body');
   if (logsBody) {
     logsBody.addEventListener('scroll', handleLogsScroll);
   }
+  const unlockInput = document.getElementById('vault-unlock-key');
+  if (unlockInput) {
+    unlockInput.addEventListener('keydown', event => {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        submitUnlockVault();
+      }
+    });
+  }
+
+  // Unlocking happens in another tab, so re-sync on return. Only while locked,
+  // to avoid a request every time the user switches tabs, and quietly, since
+  // the user did not ask for this refresh.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && isVaultLocked()) {
+      refreshVaultState({ quiet: true });
+    }
+  });
 });

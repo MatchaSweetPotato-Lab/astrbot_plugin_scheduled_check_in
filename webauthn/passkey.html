@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>通行密钥管理 · 定时签到</title>
+  <style>
+    :root {
+      --primary: #3b82f6; --primary-hover: #2563eb;
+      --success: #10b981; --success-hover: #059669;
+      --danger: #ef4444; --warning: #f59e0b;
+      --bg: #f8fafc; --card-bg: #ffffff;
+      --text: #1e293b; --text-muted: #64748b; --border: #e2e8f0;
+      --radius: 12px;
+      --shadow: 0 4px 16px -2px rgba(0,0,0,.06), 0 2px 6px -1px rgba(0,0,0,.04);
+    }
+    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif, "PingFang SC", "Microsoft YaHei"; }
+    body { margin: 0; background: var(--bg); color: var(--text); line-height: 1.5; }
+    .container { max-width: 760px; margin: 32px auto; padding: 0 20px; }
+    .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); padding: 24px; margin-bottom: 20px; }
+    h1 { font-size: 22px; margin: 0 0 6px; }
+    h2 { font-size: 15px; margin: 0 0 12px; color: var(--text); }
+    .subtitle { color: var(--text-muted); font-size: 14px; margin: 0; }
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 9px 16px; font-size: 14px; font-weight: 500; border: 1px solid var(--border); border-radius: 8px; background: #fff; color: var(--text); cursor: pointer; transition: all .15s ease; }
+    .btn:hover:not(:disabled) { background: #f1f5f9; }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: var(--primary-hover); border-color: var(--primary-hover); }
+    .btn-success { background: var(--success); border-color: var(--success); color: #fff; }
+    .btn-success:hover:not(:disabled) { background: var(--success-hover); border-color: var(--success-hover); }
+    .btn-sm { padding: 5px 10px; font-size: 13px; }
+    .btn-danger-plain { color: var(--danger); border-color: #fecaca; background: #fff; }
+    .btn-danger-plain:hover:not(:disabled) { background: #fef2f2; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .banner { border-radius: var(--radius); padding: 14px 18px; margin-bottom: 20px; font-size: 14px; display: none; }
+    .banner-warn { background: #fffbeb; border: 1px solid #fcd34d; color: #78350f; }
+    .banner-error { background: #fef2f2; border: 1px solid #fca5a5; color: #7f1d1d; }
+    .banner-ok { background: #ecfdf5; border: 1px solid #6ee7b7; color: #065f46; }
+    .banner strong { display: block; margin-bottom: 4px; }
+    .badge { display: inline-block; padding: 2px 9px; border-radius: 10px; font-size: 12px; font-weight: 600; }
+    .badge-success { background: #d1fae5; color: #065f46; }
+    .badge-warning { background: #fef3c7; color: #92400e; }
+    .badge-info { background: #dbeafe; color: #1e40af; }
+    .badge-muted { background: #f1f5f9; color: var(--text-muted); }
+    .slot { border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 10px; display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+    .slot-main { min-width: 0; }
+    .slot-title { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .slot-meta { font-size: 12px; color: var(--text-muted); margin-top: 5px; word-break: break-all; }
+    .empty { color: var(--text-muted); font-size: 14px; text-align: center; padding: 20px 0; }
+    .field { margin-bottom: 14px; }
+    label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; }
+    input[type=text], input[type=password] { width: 100%; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 14px; line-height: 20px; background: #fff; color: var(--text); }
+    input[type=text]:focus, input[type=password]:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(59,130,246,.12); }
+    input[readonly] { background: #f8fafc; color: var(--text-muted); }
+    /* The key is one long base64 line, so keep it monospaced and give room for
+       the reveal button. */
+    .key-input-row { position: relative; display: flex; }
+    /* flex: 1 is required — as a flex item the input will not grow, and
+       width: 100% resolves against its content size, leaving it tiny. */
+    .key-input-row input { flex: 1; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; padding-right: 64px; }
+    .key-reveal { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); border: none; background: none; color: var(--text-muted); font-size: 12px; cursor: pointer; padding: 4px 8px; border-radius: 6px; }
+    .key-reveal:hover { background: #f1f5f9; color: var(--text); }
+    .hint { font-size: 12px; color: var(--text-muted); margin-top: 6px; }
+    .toast-wrap { position: fixed; top: 16px; right: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 99; }
+    .toast { padding: 11px 16px; border-radius: 8px; font-size: 14px; color: #fff; box-shadow: var(--shadow); max-width: 380px; cursor: pointer; }
+    .toast-success { background: var(--success); }
+    .toast-error { background: var(--danger); }
+    .toast-warning { background: var(--warning); }
+    code { background: #f1f5f9; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+    .divider { border-top: 1px solid var(--border); margin: 20px 0 0; padding-top: 20px; }
+    .spinner { width: 14px; height: 14px; border: 2px solid rgba(255,255,255,.4); border-top-color: #fff; border-radius: 50%; animation: spin .8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="toast-wrap" id="toasts"></div>
+
+  <div class="container">
+    <div class="card">
+      <h1>通行密钥管理</h1>
+      <p class="subtitle">
+        为「定时自动签到」的加密配置添加 Windows Hello、Touch ID、手机 Passkey 或 YubiKey 等解锁方式。
+        持有任意一种已注册的密钥即可解密数据。
+      </p>
+    </div>
+
+    <div class="banner banner-error" id="env-banner"></div>
+    <div class="banner banner-warn" id="state-banner"></div>
+    <div class="banner banner-ok" id="ok-banner"></div>
+
+    <div class="card">
+      <h2>当前状态</h2>
+      <div class="row" id="status-row">
+        <span class="badge badge-muted">读取中…</span>
+      </div>
+      <div class="hint" id="rp-hint"></div>
+
+      <div class="divider">
+        <div class="row">
+          <button class="btn btn-success" id="btn-unlock" onclick="unlockWithPasskey()">使用通行密钥解锁</button>
+          <button class="btn btn-primary" id="btn-register" onclick="registerPasskey()">注册当前设备</button>
+          <button class="btn" onclick="refresh()">刷新</button>
+        </div>
+        <div class="field" style="margin-top: 14px;">
+          <label for="label-input">备注名称（可选）</label>
+          <input type="text" id="label-input" placeholder="例如：办公室 Windows / 我的 iPhone / YubiKey 5C" />
+          <div class="hint">注册时会要求你完成一次生物识别或 PIN 验证。</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>用 Base64 密钥解锁</h2>
+      <!-- A real form on a top-level, same-origin page: this is what lets the
+           browser's password manager autofill and offer to save the key. The
+           dashboard iframe cannot do this — credential storage requires a
+           document same-origin with all its ancestors, and that iframe is
+           sandboxed into an opaque origin. -->
+      <form id="unlock-form" method="post" action="#" autocomplete="on">
+        <div class="field">
+          <label for="unlock-key">AES-256-GCM 密钥</label>
+          <div class="key-input-row">
+            <input type="password" id="unlock-key" name="password"
+                   autocomplete="current-password"
+                   placeholder="粘贴启用加密时保存的 Base64 密钥" />
+            <button type="button" class="key-reveal" id="key-reveal">显示</button>
+          </div>
+        </div>
+        <div class="row">
+          <button class="btn btn-primary" type="submit" id="btn-unlock-key">解锁</button>
+          <label class="hint" style="display: flex; align-items: center; gap: 6px;">
+            <input type="checkbox" id="unlock-remember" checked />
+            成功后询问浏览器是否保存密钥
+          </label>
+        </div>
+      </form>
+      <div class="hint" id="unlock-key-hint" style="margin-top: 10px;"></div>
+    </div>
+
+    <div class="card">
+      <h2>已注册的密钥槽位</h2>
+      <div id="slots"></div>
+      <div class="hint" style="margin-top: 14px;">
+        「用户密钥」是恢复入口，不可删除——即使丢失所有通行密钥，仍可用启用加密时保存的 Base64 密钥解锁。
+        删除某个通行密钥只阻止它<strong>将来</strong>解锁，无法追溯保护它此前已能读取的数据。
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // The plugin API lives under the AstrBot dashboard origin. This page is
+    // served from that same origin (unlike the sandboxed dashboard iframe),
+    // which is exactly why WebAuthn can run here at all.
+    const PLUGIN = 'astrbot_plugin_scheduled_check_in';
+    const API_BASE = `/api/v1/plugins/extensions/${PLUGIN}`;
+
+    let state = { slots: [], rp_id: '', vault: {} };
+    // The RP ID must match the page's own host. A reverse proxy makes the
+    // server's Host header the upstream one, so never trust it for this.
+    const RP_ID = window.location.hostname;
+    let busy = false;
+
+    // ---------- helpers ----------
+    // ---------- helpers ----------
+    /**
+     * Guess a device name from the user agent, used to pre-fill the label.
+     * Only a hint — the user can edit or clear it.
+     */
+    function guessDeviceName() {
+      const ua = navigator.userAgent;
+      const platform = /Windows/i.test(ua) ? 'Windows'
+        : /iPhone|iPad/i.test(ua) ? 'iPhone/iPad'
+        : /Android/i.test(ua) ? 'Android'
+        : /Mac OS X/i.test(ua) ? 'Mac'
+        : /Linux/i.test(ua) ? 'Linux'
+        : '';
+      const browser = /Edg\//i.test(ua) ? 'Edge'
+        : /OPR\//i.test(ua) ? 'Opera'
+        : /Firefox\//i.test(ua) ? 'Firefox'
+        : /Chrome\//i.test(ua) ? 'Chrome'
+        : /Safari\//i.test(ua) ? 'Safari'
+        : '';
+      return [platform, browser].filter(Boolean).join(' ') || '我的设备';
+    }
+
+    function toast(message, type = 'success', ms = 4000) {
+      const el = document.createElement('div');
+      el.className = `toast toast-${type}`;
+      el.textContent = String(message || '');
+      el.onclick = () => el.remove();
+      document.getElementById('toasts').appendChild(el);
+      setTimeout(() => el.remove(), ms);
+    }
+
+    function banner(id, html) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      if (html) {
+        el.innerHTML = html;
+        el.style.display = 'block';
+      } else {
+        el.style.display = 'none';
+      }
+    }
+
+    async function api(path, body) {
+      const options = {
+        method: body === undefined ? 'GET' : 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' }
+      };
+      if (body !== undefined) options.body = JSON.stringify(body);
+      const res = await fetch(`${API_BASE}${path}`, options);
+      let data = null;
+      try {
+        data = await res.json();
+      } catch (e) {
+        throw new Error(`服务端返回了非 JSON 响应 (HTTP ${res.status})`);
+      }
+      if (res.status === 401 || res.status === 403) {
+        throw new Error('未登录或会话已过期，请先登录 AstrBot 管理面板后重试');
+      }
+      if (data && data.status === 'error') {
+        throw new Error(data.message || `请求失败 (HTTP ${res.status})`);
+      }
+      if (!res.ok) {
+        throw new Error((data && data.message) || `请求失败 (HTTP ${res.status})`);
+      }
+      return data;
+    }
+
+    // base64 (standard or url-safe) -> Uint8Array
+    function b64ToBytes(value) {
+      const normalized = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+      const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+      const binary = atob(padded);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+      return bytes;
+    }
+
+    function bytesToB64(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+      return btoa(binary);
+    }
+
+    function bytesToB64Url(buffer) {
+      return bytesToB64(buffer).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    function setBusy(value, activeButtonId) {
+      busy = value;
+      ['btn-unlock', 'btn-register'].forEach(id => {
+        const button = document.getElementById(id);
+        if (button) button.disabled = value;
+      });
+      const active = activeButtonId && document.getElementById(activeButtonId);
+      if (active) {
+        if (value) {
+          active.dataset.label = active.textContent;
+          active.replaceChildren(Object.assign(document.createElement('span'), { className: 'spinner' }));
+        } else if (active.dataset.label) {
+          active.textContent = active.dataset.label;
+        }
+      }
+    }
+
+    // ---------- capability detection ----------
+    function checkEnvironment() {
+      if (!window.isSecureContext) {
+        banner('env-banner',
+          '<strong>当前地址不是安全上下文，无法使用通行密钥</strong>' +
+          'WebAuthn 仅在 HTTPS 或 <code>http://localhost</code> 下可用。' +
+          '请改用 <code>localhost</code> 访问，或为面板配置 HTTPS。' +
+          '纯 HTTP 的局域网 IP（如 <code>192.168.x.x</code>）既不是安全上下文，' +
+          'IP 也不能作为 WebAuthn 的 RP ID。');
+        return false;
+      }
+      if (!window.PublicKeyCredential || !navigator.credentials) {
+        banner('env-banner',
+          '<strong>当前浏览器不支持 WebAuthn</strong>请更换为较新版本的 Chrome、Edge 或 Safari。');
+        return false;
+      }
+      banner('env-banner', '');
+      return true;
+    }
+
+    // ---------- rendering ----------
+    const TYPE_LABELS = { user_key: '用户密钥', webauthn_prf: '通行密钥' };
+
+    function renderStatus() {
+      const vault = state.vault || {};
+      const row = document.getElementById('status-row');
+      const parts = [];
+      if (!vault.enabled) {
+        parts.push('<span class="badge badge-muted">未启用加密</span>');
+      } else if (vault.locked) {
+        parts.push('<span class="badge badge-warning">已加密 · 锁定</span>');
+      } else {
+        parts.push('<span class="badge badge-success">已加密 · 已解锁</span>');
+      }
+      parts.push(`<span class="badge badge-info">${state.slots.length} 个槽位</span>`);
+      row.innerHTML = parts.join(' ');
+
+      document.getElementById('rp-hint').innerHTML =
+        `当前域名（RP ID）：<code>${RP_ID}</code>。` +
+        '通行密钥与域名绑定，换用其他地址访问时需要为该地址单独注册。' +
+        // A mismatch means the reverse proxy is not forwarding the original
+        // host. Harmless here because the page's own value is used, but worth
+        // surfacing since it affects anything else that trusts the header.
+        (state.rp_id && state.rp_id.toLowerCase() !== RP_ID.toLowerCase()
+          ? `<br>服务端从请求头推断的域名是 <code>${state.rp_id}</code>，与本页不一致；`
+            + '已按本页域名注册。如需一致，请让反向代理转发 <code>X-Forwarded-Host</code>。'
+          : '');
+
+      const matching = (state.slots || []).filter(
+        slot => slot.type === 'webauthn_prf' && slot.rp_id.toLowerCase() === RP_ID.toLowerCase()
+      );
+      document.getElementById('btn-unlock').disabled = !vault.locked || matching.length === 0;
+      document.getElementById('btn-register').disabled = !vault.enabled || vault.locked !== false;
+      // The key form is only meaningful while locked, but stays enabled so a
+      // password manager can still autofill it before the state loads.
+      document.getElementById('btn-unlock-key').disabled = !vault.locked;
+
+      if (!vault.enabled) {
+        banner('state-banner',
+          '<strong>尚未启用配置加密</strong>请先在插件管理面板的「全局设置 → 配置加密」中启用，再回到本页注册通行密钥。');
+      } else if (vault.locked) {
+        banner('state-banner',
+          matching.length
+            ? '<strong>配置已锁定</strong>点击「使用通行密钥解锁」，或回到管理面板输入 Base64 密钥。'
+            : '<strong>配置已锁定，且当前地址没有可用的通行密钥</strong>' +
+              '请回到管理面板用 Base64 密钥解锁，解锁后即可在本页为当前地址注册通行密钥。');
+      } else {
+        banner('state-banner', '');
+      }
+    }
+
+    function renderSlots() {
+      const host = document.getElementById('slots');
+      host.replaceChildren();
+      if (!state.slots.length) {
+        host.innerHTML = '<div class="empty">暂无槽位。启用配置加密后会自动创建「用户密钥」槽位。</div>';
+        return;
+      }
+      state.slots.forEach(slot => {
+        const wrap = document.createElement('div');
+        wrap.className = 'slot';
+
+        const main = document.createElement('div');
+        main.className = 'slot-main';
+        const title = document.createElement('div');
+        title.className = 'slot-title';
+        const badge = slot.type === 'user_key' ? 'badge-info' : 'badge-success';
+        const mismatch = slot.type === 'webauthn_prf'
+          && slot.rp_id.toLowerCase() !== RP_ID.toLowerCase();
+        title.innerHTML =
+          `<span class="badge ${badge}">${TYPE_LABELS[slot.type] || slot.type}</span>` +
+          `<span>${slot.label || '未命名'}</span>` +
+          (mismatch ? '<span class="badge badge-warning">其他地址</span>' : '');
+        const meta = document.createElement('div');
+        meta.className = 'slot-meta';
+        const bits = [];
+        if (slot.rp_id) bits.push(`域名 ${slot.rp_id}`);
+        if (slot.created_at) bits.push(`创建于 ${slot.created_at}`);
+        bits.push(slot.last_used_at ? `最近使用 ${slot.last_used_at}` : '尚未使用');
+        meta.textContent = bits.join(' · ');
+        main.append(title, meta);
+
+        wrap.appendChild(main);
+        if (slot.removable) {
+          const remove = document.createElement('button');
+          remove.className = 'btn btn-sm btn-danger-plain';
+          remove.textContent = '删除';
+          remove.onclick = () => removeSlot(slot);
+          wrap.appendChild(remove);
+        } else {
+          const tag = document.createElement('span');
+          tag.className = 'badge badge-muted';
+          tag.textContent = '恢复槽位';
+          wrap.appendChild(tag);
+        }
+        host.appendChild(wrap);
+      });
+    }
+
+    async function refresh() {
+      try {
+        const data = await api(`/api/vault/slots?rp_id=${encodeURIComponent(RP_ID)}`);
+        state = { slots: data.slots || [], rp_id: data.rp_id || '', vault: data.vault || {} };
+        renderStatus();
+        renderSlots();
+      } catch (error) {
+        banner('env-banner', `<strong>读取状态失败</strong>${error.message}`);
+      }
+    }
+
+    // ---------- registration ----------
+    async function registerPasskey() {
+      if (busy || !checkEnvironment()) return;
+      setBusy(true, 'btn-register');
+      banner('ok-banner', '');
+      try {
+        const setup = await api('/api/vault/slots/webauthn/begin-register', { rp_id: RP_ID });
+        const saltBytes = b64ToBytes(setup.prf_salt);
+
+        const created = await navigator.credentials.create({
+          publicKey: {
+            rp: { id: RP_ID, name: setup.rp_name },
+            user: {
+              id: b64ToBytes(setup.user_id),
+              name: setup.user_name || 'astrbot',
+              displayName: 'AstrBot 定时签到'
+            },
+            challenge: b64ToBytes(setup.challenge),
+            pubKeyCredParams: [
+              { type: 'public-key', alg: -7 },
+              { type: 'public-key', alg: -257 }
+            ],
+            authenticatorSelection: {
+              userVerification: 'required',
+              residentKey: 'preferred'
+            },
+            excludeCredentials: (setup.exclude_credentials || []).map(id => ({
+              type: 'public-key',
+              id: b64ToBytes(id)
+            })),
+            timeout: 120000,
+            extensions: { prf: {} }
+          }
+        });
+        if (!created) throw new Error('注册被取消');
+
+        const extensions = created.getClientExtensionResults() || {};
+        if (extensions.prf && extensions.prf.enabled === false) {
+          throw new Error('该认证器不支持 PRF (hmac-secret) 扩展，无法用于派生解密密钥。请换用其他设备或安全密钥。');
+        }
+
+        const credentialId = created.id;
+        // The PRF output is fetched with a follow-up assertion on purpose:
+        // most authenticators report prf.enabled at create() time but do not
+        // return results until an actual get() evaluates the salt.
+        const prfOutput = await evaluatePrf(RP_ID, credentialId, saltBytes);
+
+        const transports = typeof created.response.getTransports === 'function'
+          ? created.response.getTransports()
+          : [];
+
+        const result = await api('/api/vault/slots/webauthn/finish-register', {
+          credential_id: credentialId,
+          prf_output: prfOutput,
+          prf_salt: setup.prf_salt,
+          label: document.getElementById('label-input').value.trim(),
+          rp_id: RP_ID,
+          transports
+        });
+        // Restore the suggested name rather than emptying the field, so a
+        // second device can be registered without retyping one.
+        document.getElementById('label-input').value = guessDeviceName();
+        toast(result.message || '通行密钥已注册', 'success');
+        banner('ok-banner', '<strong>注册成功</strong>下次锁定后即可用该设备解锁。');
+        await refresh();
+      } catch (error) {
+        reportCeremonyError(error, '注册');
+      } finally {
+        setBusy(false, 'btn-register');
+      }
+    }
+
+    /**
+     * Evaluate the PRF for one credential and return the base64 output.
+     * A get() call must use evalByCredential — passing `eval` throws.
+     */
+    async function evaluatePrf(rpId, credentialId, saltBytes) {
+      const evalByCredential = {};
+      evalByCredential[credentialId] = { first: saltBytes };
+
+      const assertion = await navigator.credentials.get({
+        publicKey: {
+          rpId,
+          challenge: crypto.getRandomValues(new Uint8Array(32)),
+          allowCredentials: [{ type: 'public-key', id: b64ToBytes(credentialId) }],
+          userVerification: 'required',
+          timeout: 120000,
+          extensions: { prf: { evalByCredential } }
+        }
+      });
+      if (!assertion) throw new Error('验证被取消');
+      const results = (assertion.getClientExtensionResults() || {}).prf;
+      if (!results || !results.results || !results.results.first) {
+        throw new Error('认证器未返回 PRF 结果，说明它不支持 PRF (hmac-secret) 扩展，无法用于加密解锁。');
+      }
+      return bytesToB64(results.results.first);
+    }
+
+    // ---------- unlocking ----------
+    async function unlockWithPasskey() {
+      if (busy || !checkEnvironment()) return;
+      setBusy(true, 'btn-unlock');
+      banner('ok-banner', '');
+      try {
+        const setup = await api('/api/vault/slots/webauthn/begin-unlock', { rp_id: RP_ID });
+        const allowed = setup.allow_credentials || [];
+        if (!allowed.length) throw new Error('当前地址没有已注册的通行密钥');
+
+        // Offer every credential registered for this host and let the
+        // authenticator decide; each carries its own salt.
+        const evalByCredential = {};
+        allowed.forEach(item => {
+          evalByCredential[item.id] = { first: b64ToBytes(item.prf_salt) };
+        });
+
+        const assertion = await navigator.credentials.get({
+          publicKey: {
+            rpId: RP_ID,
+            challenge: b64ToBytes(setup.challenge),
+            allowCredentials: allowed.map(item => ({
+              type: 'public-key',
+              id: b64ToBytes(item.id),
+              transports: Array.isArray(item.transports) && item.transports.length
+                ? item.transports
+                : undefined
+            })),
+            userVerification: 'required',
+            timeout: 120000,
+            extensions: { prf: { evalByCredential } }
+          }
+        });
+        if (!assertion) throw new Error('验证被取消');
+
+        const results = (assertion.getClientExtensionResults() || {}).prf;
+        if (!results || !results.results || !results.results.first) {
+          throw new Error('认证器未返回 PRF 结果，无法解锁。');
+        }
+
+        const result = await api('/api/vault/unlock/webauthn', {
+          credential_id: assertion.id,
+          prf_output: bytesToB64(results.results.first)
+        });
+        toast(result.message || '解锁成功', 'success');
+        banner('ok-banner', '<strong>已解锁</strong>可以回到插件管理面板继续操作了。');
+        await refresh();
+      } catch (error) {
+        reportCeremonyError(error, '解锁');
+      } finally {
+        setBusy(false, 'btn-unlock');
+      }
+    }
+
+    // ---------- removal ----------
+    async function removeSlot(slot) {
+      const name = slot.label || '该通行密钥';
+      if (!window.confirm(`确定要删除「${name}」吗？删除后该设备将无法再解锁配置。`)) return;
+      try {
+        const result = await api('/api/vault/slots/remove', { slot_id: slot.id });
+        toast(result.message || '槽位已删除', 'success');
+        await refresh();
+      } catch (error) {
+        toast(error.message, 'error', 6000);
+      }
+    }
+
+    /** Turn a WebAuthn DOMException into something actionable. */
+    function reportCeremonyError(error, action) {
+      const name = error && error.name;
+      let message = error && error.message ? error.message : String(error);
+      if (name === 'NotAllowedError') {
+        message = '操作被取消或已超时（未完成生物识别 / PIN 验证）。';
+      } else if (name === 'InvalidStateError') {
+        message = '该认证器已经为本站注册过通行密钥了。';
+      } else if (name === 'SecurityError') {
+        message = `域名与 RP ID 不匹配，无法在当前地址（${RP_ID}）完成${action}。`;
+      } else if (name === 'NotSupportedError') {
+        message = '当前浏览器或认证器不支持所需的 WebAuthn 参数。';
+      }
+      toast(`${action}失败：${message}`, 'error', 8000);
+    }
+
+    // ---------- unlock with the base64 key ----------
+    // PasswordCredential requires a non-empty id, so the manager entry gets a
+    // fixed label. No username field is shown: managers already scope entries
+    // by origin, and browsers handle password-only forms.
+    const VAULT_CREDENTIAL_ID = 'astrbot-vault';
+
+    /**
+     * Ask the browser to remember the key.
+     *
+     * Chromium exposes PasswordCredential, so store() raises the save prompt
+     * directly. Firefox and Safari have no such API and rely on form-submit
+     * heuristics instead, which a fetch-based submit does not trigger — there
+     * the manager may still autofill but will not offer to save. Reported
+     * honestly in the hint rather than silently doing nothing.
+     */
+    async function rememberKey(key) {
+      if (typeof window.PasswordCredential !== 'function'
+          || typeof navigator.credentials?.store !== 'function') {
+        return '浏览器未提供凭据存储接口，请手动保存到密码管理器';
+      }
+      try {
+        await navigator.credentials.store(
+          new PasswordCredential({
+            id: VAULT_CREDENTIAL_ID,
+            password: key,
+            name: VAULT_CREDENTIAL_ID
+          })
+        );
+        return '已请求浏览器保存密钥';
+      } catch (error) {
+        return `浏览器拒绝保存：${error.name}`;
+      }
+    }
+
+    async function submitKeyUnlock(event) {
+      if (event) event.preventDefault();
+      const keyInput = document.getElementById('unlock-key');
+      const hint = document.getElementById('unlock-key-hint');
+      const key = (keyInput.value || '').trim();
+      if (!key) {
+        hint.className = 'hint';
+        hint.textContent = '请先粘贴密钥';
+        return;
+      }
+
+      const button = document.getElementById('btn-unlock-key');
+      button.disabled = true;
+      try {
+        const result = await api('/api/vault/unlock', { key });
+        toast(result.message || '解锁成功', 'success');
+        banner('ok-banner', '<strong>已解锁</strong>可以回到插件管理面板继续操作了。');
+
+        let note = '解锁成功。';
+        if (document.getElementById('unlock-remember').checked) {
+          note += ' ' + await rememberKey(key);
+        }
+        hint.className = 'hint';
+        hint.textContent = note;
+        keyInput.value = '';
+        // refresh() -> renderStatus() owns the button state from here, so it
+        // stays disabled now that the vault is unlocked.
+        await refresh();
+      } catch (error) {
+        hint.className = 'hint';
+        hint.textContent = `解锁失败：${error.message}`;
+        toast(`解锁失败：${error.message}`, 'error', 6000);
+        button.disabled = false;
+      }
+    }
+
+    // ---------- init ----------
+    // Key the saved credential to this host, so a manager can hold one key per
+    // deployment rather than overwriting a single shared entry.
+    document.getElementById('unlock-form').addEventListener('submit', submitKeyUnlock);
+
+    const keyReveal = document.getElementById('key-reveal');
+    keyReveal.addEventListener('click', () => {
+      const input = document.getElementById('unlock-key');
+      const hidden = input.type === 'password';
+      input.type = hidden ? 'text' : 'password';
+      keyReveal.textContent = hidden ? '隐藏' : '显示';
+      input.focus();
+    });
+
+    // Pre-fill a guessed device name so the field is never empty on registration.
+    // The user can edit or clear it; an empty label is accepted.
+    document.getElementById('label-input').value = guessDeviceName();
+    checkEnvironment();
+    refresh();
+  </script>
+</body>
+</html>
