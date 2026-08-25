@@ -180,16 +180,28 @@ class ScheduledCheckInPlugin(Star):
             logger.error(f"Error reading settings from database: {e}", exc_info=True)
             return dict(DEFAULT_SETTINGS)
 
-    def save_settings(self, settings_data: dict[str, Any]) -> None:
+    def save_settings(
+        self,
+        settings_data: dict[str, Any],
+        *,
+        rearm_lock_alert: bool = False,
+    ) -> bool:
         """Write settings to SQLite database.
 
         Args:
             settings_data: Settings dictionary.
+            rearm_lock_alert: Atomically clear the persisted one-shot alert
+                flag when the alert target changes.
+
+        Returns:
+            ``True`` when the write succeeds, otherwise ``False``.
         """
         try:
-            self.db.save_settings(settings_data)
+            self.db.save_settings(settings_data, rearm_lock_alert=rearm_lock_alert)
+            return True
         except Exception as e:
             logger.error(f"Error saving settings to database: {e}", exc_info=True)
+            return False
 
     def record_history(self, results: list[Any], log_type: str = "scheduled") -> None:
         """Record check-in results into the history table, one entry per site.
@@ -716,8 +728,9 @@ class ScheduledCheckInPlugin(Star):
         if not isinstance(data, dict):
             return error_response("全局设置必须是对象")
         settings = self.get_settings()
-        previous_notify_session = str(settings.get("lock_notify_session") or "")
+        previous_notify_session = str(settings.get("lock_notify_session") or "").strip()
         settings.update(data)
+        notify_session_changed = False
         if "max_history_records" in data:
             try:
                 settings["max_history_records"] = max(0, int(data["max_history_records"]))
@@ -726,14 +739,16 @@ class ScheduledCheckInPlugin(Star):
         if "lock_notify_session" in data:
             notify_session = str(data["lock_notify_session"] or "").strip()
             settings["lock_notify_session"] = notify_session
-            if notify_session != previous_notify_session:
-                # Re-arm the alert so a corrected session is used right away,
-                # instead of staying silent until the vault is cycled.
-                self._set_lock_alert_sent(False)
+            notify_session_changed = notify_session != previous_notify_session
         settings["http_impersonate"] = normalize_impersonate(
             settings.get("http_impersonate")
         )
-        self.save_settings(settings)
+        if not self.save_settings(settings, rearm_lock_alert=notify_session_changed):
+            return error_response("全局设置保存失败")
+        if notify_session_changed:
+            # The transaction above has already reset the durable flag. Now
+            # invalidate the process-local delivery state as well.
+            self.lock_notifier.rearm_after_target_change()
         self.scheduler.reset_today_target_time()
         return json_response({"status": "ok", "message": "全局设置已更新"})
 

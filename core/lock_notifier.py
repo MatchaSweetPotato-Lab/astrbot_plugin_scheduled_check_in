@@ -50,7 +50,8 @@ class LockNotifier:
             is_locked: Returns whether the vault is encrypted but keyless.
             get_target: Returns the configured session, empty when disabled.
             was_sent: Returns the persisted "already alerted" flag.
-            mark_sent: Persists the "already alerted" flag.
+            mark_sent: Persists the "already alerted" flag and reports whether
+                the write succeeded.
             send: Delivers ``(target, text)`` and reports whether it landed.
         """
         self._is_locked = is_locked
@@ -67,6 +68,18 @@ class LockNotifier:
         # Last delivery problem, so a misconfigured target is reported once
         # instead of on every poll.
         self._last_failure: str = ""
+
+    def rearm_after_target_change(self) -> None:
+        """Forget the current delivery after storage committed a new target.
+
+        The caller must persist the new target and clear the durable sent flag
+        before invoking this method. Keeping that ordering outside the
+        notifier lets the host commit both settings atomically.
+        """
+        self._sent_in_memory = False
+        self._persistence_pending = False
+        self._last_failure = ""
+        self._last_persistence_failure = ""
 
     async def poll(self) -> None:
         """Reconcile the alert with the current vault state.

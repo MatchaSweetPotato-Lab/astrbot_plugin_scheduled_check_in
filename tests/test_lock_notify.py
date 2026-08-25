@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import tests  # noqa: F401
 from core.lock_notifier import LOCK_ALERT_TEXT, LockNotifier
@@ -166,6 +167,24 @@ class LockNotifierTests(unittest.IsolatedAsyncioTestCase):
         await notifier.poll()
         self.assertEqual(len(host.pushes), 1)
 
+    async def test_target_change_rearms_current_process(self) -> None:
+        """A committed target change allows a new target to alert immediately."""
+        host = _FakeHost(target="test:FriendMessage:old")
+        notifier = host.build()
+
+        await notifier.poll()
+        host.target = "test:FriendMessage:new"
+        host.sent_flag = False  # The host transaction cleared the durable flag.
+        notifier.rearm_after_target_change()
+
+        await notifier.poll()
+
+        self.assertEqual(
+            [session for session, _ in host.pushes],
+            ["test:FriendMessage:old", "test:FriendMessage:new"],
+        )
+        self.assertTrue(host.sent_flag)
+
 
 class LockNotifyStorageTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -201,6 +220,49 @@ class LockNotifyStorageTests(unittest.TestCase):
         settings[LOCK_NOTIFY_SENT_KEY] = False
         self.db.save_settings(settings)
 
+        self.assertTrue(self.db.get_lock_notify_sent())
+
+    def test_target_change_resets_sent_flag_in_same_transaction(self) -> None:
+        """A committed target change re-arms the durable alert state."""
+        self.db.set_lock_notify_sent(True)
+
+        self.db.save_settings(
+            {"lock_notify_session": "test:FriendMessage:new"},
+            rearm_lock_alert=True,
+        )
+
+        self.assertEqual(
+            self.db.get_settings()["lock_notify_session"],
+            "test:FriendMessage:new",
+        )
+        self.assertFalse(self.db.get_lock_notify_sent())
+
+    def test_target_change_rolls_back_with_sent_flag_on_failure(self) -> None:
+        """A failed target write cannot leave the old target re-armed."""
+        self.db.save_settings({"lock_notify_session": "test:FriendMessage:old"})
+        self.db.set_lock_notify_sent(True)
+        original_save_records = self.db._save_settings_records
+
+        def fail_when_rearming(conn: object, settings_data: dict[str, object]) -> None:
+            if settings_data == {LOCK_NOTIFY_SENT_KEY: False}:
+                raise RuntimeError("simulated flag write failure")
+            original_save_records(conn, settings_data)
+
+        with mock.patch.object(
+            self.db,
+            "_save_settings_records",
+            side_effect=fail_when_rearming,
+        ):
+            with self.assertRaises(RuntimeError):
+                self.db.save_settings(
+                    {"lock_notify_session": "test:FriendMessage:new"},
+                    rearm_lock_alert=True,
+                )
+
+        self.assertEqual(
+            self.db.get_settings()["lock_notify_session"],
+            "test:FriendMessage:old",
+        )
         self.assertTrue(self.db.get_lock_notify_sent())
 
 

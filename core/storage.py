@@ -1398,17 +1398,26 @@ class DatabaseManager:
         settings["http_impersonate"] = normalize_impersonate(settings.get("http_impersonate"))
         return settings
 
-    def save_settings(self, settings_data: dict[str, Any]) -> None:
+    def save_settings(
+        self,
+        settings_data: dict[str, Any],
+        *,
+        rearm_lock_alert: bool = False,
+    ) -> None:
         """Save settings dictionary to SQLite.
 
         Args:
             settings_data: Settings dictionary. Vault bookkeeping keys are ignored.
+            rearm_lock_alert: Also clear the persisted one-shot alert flag in
+                the same transaction when the alert target changes.
         """
         payload = {key: value for key, value in settings_data.items() if key not in _INTERNAL_KEYS}
         with self._lock, self._connection() as conn:
             conn.execute("BEGIN TRANSACTION")
             try:
                 self._save_settings_records(conn, payload)
+                if rearm_lock_alert:
+                    self._save_settings_records(conn, {LOCK_NOTIFY_SENT_KEY: False})
                 conn.commit()
                 # Drop the cleanup cache so the next write re-reads the new values.
                 self._cleanup_settings_cache = None
