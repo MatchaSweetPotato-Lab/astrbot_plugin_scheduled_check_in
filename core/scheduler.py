@@ -287,6 +287,10 @@ class CheckInScheduler:
         """Internal background loop running check-ins at configured daily time window."""
         while self._running:
             try:
+                # Piggy-backs on the loop that already runs every 30 seconds, so
+                # a vault locked outside of a check-in window is still reported.
+                await self._poll_lock_alert()
+
                 info = self.get_next_target_info()
                 if info.get("enabled") and not info.get("is_tomorrow"):
                     now = datetime.now()
@@ -307,6 +311,20 @@ class CheckInScheduler:
             except Exception as e:
                 logger.error(f"Error in CheckInScheduler loop: {e}", exc_info=True)
                 await asyncio.sleep(60)
+
+    async def _poll_lock_alert(self) -> None:
+        """Ask the plugin to push its locked-vault alert if one is due.
+
+        Optional and self-contained: a plugin without the hook, or a push that
+        fails, must never stop the check-in loop it shares.
+        """
+        poller = getattr(self.plugin, "poll_lock_alert", None)
+        if not callable(poller):
+            return
+        try:
+            await poller()
+        except Exception as exc:
+            logger.warning(f"Locked-vault alert check failed: {exc}", exc_info=True)
 
     def _is_locked(self) -> bool:
         """Return whether the plugin's configuration is encrypted but unlocked."""

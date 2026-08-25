@@ -8,7 +8,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Any
 
-from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, MessageEventResult, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.api.web import error_response, file_response, json_response, request
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
@@ -20,6 +20,7 @@ from .core.http_client import (
     get_impersonate_options,
     normalize_impersonate,
 )
+from .core.lock_notifier import LockNotifier
 from .core.scheduler import LOCKED_MESSAGE, CheckInScheduler
 from .core.site_schema import NEW_API_USER_HEADER, SITE_TYPE_NEW_API, normalize_site_type
 from .core.storage import SLOT_WEBAUTHN, DEFAULT_SETTINGS, DatabaseManager
@@ -74,6 +75,13 @@ class ScheduledCheckInPlugin(Star):
         self.passkey_page_file: Path = Path(__file__).parent / "webauthn" / "passkey.html"
 
         self.scheduler = CheckInScheduler(self)
+        self.lock_notifier = LockNotifier(
+            is_locked=self.is_config_locked,
+            get_target=self._get_lock_notify_session,
+            was_sent=self._lock_alert_sent,
+            mark_sent=self._set_lock_alert_sent,
+            send=self._push_session_message,
+        )
         self._register_routes()
 
     async def initialize(self) -> None:
@@ -172,16 +180,28 @@ class ScheduledCheckInPlugin(Star):
             logger.error(f"Error reading settings from database: {e}", exc_info=True)
             return dict(DEFAULT_SETTINGS)
 
-    def save_settings(self, settings_data: dict[str, Any]) -> None:
+    def save_settings(
+        self,
+        settings_data: dict[str, Any],
+        *,
+        rearm_lock_alert: bool = False,
+    ) -> bool:
         """Write settings to SQLite database.
 
         Args:
             settings_data: Settings dictionary.
+            rearm_lock_alert: Atomically clear the persisted one-shot alert
+                flag when the alert target changes.
+
+        Returns:
+            ``True`` when the write succeeds, otherwise ``False``.
         """
         try:
-            self.db.save_settings(settings_data)
+            self.db.save_settings(settings_data, rearm_lock_alert=rearm_lock_alert)
+            return True
         except Exception as e:
             logger.error(f"Error saving settings to database: {e}", exc_info=True)
+            return False
 
     def record_history(self, results: list[Any], log_type: str = "scheduled") -> None:
         """Record check-in results into the history table, one entry per site.
@@ -708,16 +728,27 @@ class ScheduledCheckInPlugin(Star):
         if not isinstance(data, dict):
             return error_response("全局设置必须是对象")
         settings = self.get_settings()
+        previous_notify_session = str(settings.get("lock_notify_session") or "").strip()
         settings.update(data)
+        notify_session_changed = False
         if "max_history_records" in data:
             try:
                 settings["max_history_records"] = max(0, int(data["max_history_records"]))
             except (ValueError, TypeError):
                 settings["max_history_records"] = 0
+        if "lock_notify_session" in data:
+            notify_session = str(data["lock_notify_session"] or "").strip()
+            settings["lock_notify_session"] = notify_session
+            notify_session_changed = notify_session != previous_notify_session
         settings["http_impersonate"] = normalize_impersonate(
             settings.get("http_impersonate")
         )
-        self.save_settings(settings)
+        if not self.save_settings(settings, rearm_lock_alert=notify_session_changed):
+            return error_response("全局设置保存失败")
+        if notify_session_changed:
+            # The transaction above has already reset the durable flag. Now
+            # invalidate the process-local delivery state as well.
+            self.lock_notifier.rearm_after_target_change()
         self.scheduler.reset_today_target_time()
         return json_response({"status": "ok", "message": "全局设置已更新"})
 
@@ -1201,6 +1232,71 @@ class ScheduledCheckInPlugin(Star):
             text: Markdown report text.
         """
         logger.info(f"CheckIn Notification:\n{text}")
+
+    # ------------------------------------------------------------------
+    # Locked-Vault Alert
+    # ------------------------------------------------------------------
+    def _get_lock_notify_session(self) -> str:
+        """Read the session that should receive the locked-vault alert."""
+        return str(self.get_settings().get("lock_notify_session") or "").strip()
+
+    def _lock_alert_sent(self) -> bool:
+        """Return whether the locked-vault alert already went out.
+
+        Returns:
+            ``True`` when it has been sent, and also when the flag cannot be
+            read: treating an unreadable flag as "already sent" keeps a broken
+            database from turning the alert into a message every 30 seconds.
+        """
+        try:
+            return bool(self.db.get_lock_notify_sent())
+        except Exception as e:
+            logger.error(f"Error reading locked-vault alert flag: {e}", exc_info=True)
+            return True
+
+    def _set_lock_alert_sent(self, sent: bool) -> bool:
+        """Persist whether the locked-vault alert has been delivered.
+
+        Returns:
+            ``True`` when the state was written successfully. The notifier
+            uses ``False`` to retry the write without sending the alert again.
+        """
+        try:
+            self.db.set_lock_notify_sent(sent)
+            return True
+        except Exception as e:
+            logger.error(f"Error saving locked-vault alert flag: {e}", exc_info=True)
+            return False
+
+    async def _push_session_message(self, session: str, text: str) -> bool:
+        """Send one plain-text message to a unified_msg_origin session.
+
+        Args:
+            session: Target ``unified_msg_origin``, as typed by the operator.
+            text: Message body.
+
+        Returns:
+            Whether a platform accepted the message. A malformed session or an
+            adapter error is reported as ``False`` so the caller can retry.
+        """
+        try:
+            return bool(
+                await self.context.send_message(session, MessageChain().message(text))
+            )
+        except ValueError as e:
+            logger.warning(f"Invalid notification session {session!r}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Error sending message to {session!r}: {e}", exc_info=True)
+            return False
+
+    async def poll_lock_alert(self) -> None:
+        """Push the locked-vault alert if the vault just closed.
+
+        Called by the scheduler loop; see :class:`~.core.lock_notifier.LockNotifier`
+        for the once-per-lock guarantee.
+        """
+        await self.lock_notifier.poll()
 
     @filter.command("清空签到日志")
     async def cmd_clear_logs(

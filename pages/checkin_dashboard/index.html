@@ -324,6 +324,16 @@
               任意一个槽位都可解密。「用户密钥」为恢复入口，不可删除。
             </div>
           </div>
+
+          <div class="form-group" id="lock-notify-block" style="margin-top: 20px; display: none;">
+            <label for="setting-lock-notify-session">锁定提醒推送会话（UMO）</label>
+            <input type="text" id="setting-lock-notify-session" class="form-control" placeholder="例如：aiocqhttp:FriendMessage:10001" />
+            <div class="form-hint">
+              凭据被锁定时向该会话推送一次提醒，解锁后自动重置。留空则不推送。
+              格式为 unified_msg_origin：<code>平台ID:消息类型:会话ID</code>，
+              消息类型可为 <code>FriendMessage</code> 或 <code>GroupMessage</code>。
+            </div>
+          </div>
         </div>
         <div class="modal-footer">
           <button class="btn" onclick="closeModal('settings-modal')">取消</button>

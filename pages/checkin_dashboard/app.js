@@ -13,7 +13,8 @@ let settings = {
   http_timeout_seconds: 15,
   http_impersonate: '',
   http_impersonate_options: [],
-  max_history_records: 0
+  max_history_records: 0,
+  lock_notify_session: ''
 };
 let logItems = [];
 let logsNextBeforeId = null;
@@ -29,9 +30,13 @@ let vaultState = { enabled: false, unlocked: false, locked: false };
 let keySlots = [];
 let activeAnalyticsSite = null;
 let analyticsMonth = '';
-// Set while the passkey hand-off dialog is open, to watch the other tab's work.
-let passkeyWatch = null;
-const PASSKEY_POLL_MS = 3000;
+// Set while a dialog asking for the vault key is open, to watch for an unlock
+// performed elsewhere (the standalone passkey page, or another dashboard tab).
+let vaultWatch = null;
+const VAULT_POLL_MS = 3000;
+// Dialogs whose only purpose is getting the vault unlocked. The unlock dialog
+// can open the hand-off dialog over itself, so both may be on screen at once.
+const VAULT_DIALOG_IDS = ['vault-unlock-modal', 'passkey-modal'];
 const PLUGIN_ID = 'astrbot_plugin_scheduled_check_in';
 
 const SLOT_TYPE_LABELS = {
@@ -209,9 +214,11 @@ function openModal(id) {
 function closeModal(id) {
   const el = document.getElementById(id);
   if (el) el.classList.remove('active');
-  // Every way out of the passkey dialog — the close button, 了解, and an overlay
-  // click — lands here, so this is the one place the watch has to be stopped.
-  if (id === 'passkey-modal') stopPasskeyWatch();
+  // Every way out of a vault dialog — its close button, 取消 / 了解, and an
+  // overlay click — lands here. Stop the watch only once the last one is gone:
+  // closing the hand-off dialog while the unlock dialog is still open must not
+  // end the wait it is still there for.
+  if (VAULT_DIALOG_IDS.includes(id) && !anyVaultDialogOpen()) stopVaultWatch();
 }
 
 function handleOverlayClick(event, id) {
@@ -1629,6 +1636,11 @@ function renderVaultUi() {
   const controls = document.getElementById('vault-controls');
   if (controls) controls.style.display = vaultState.enabled ? 'flex' : 'none';
 
+  // The alert can only ever fire for an encrypted vault, so it only appears
+  // once encryption is on.
+  const notifyBlock = document.getElementById('lock-notify-block');
+  if (notifyBlock) notifyBlock.style.display = vaultState.enabled ? 'block' : 'none';
+
   const hint = document.getElementById('vault-state-hint');
   if (hint) {
     if (!vaultState.enabled) {
@@ -1762,26 +1774,39 @@ function openPasskeyModal() {
   if (box) box.textContent = getPasskeyPageUrl();
   clearCopyStatus('passkey-url', 'passkey-url-status');
   openModal('passkey-modal');
-  startPasskeyWatch();
+  startVaultWatch();
+}
+
+function isModalOpen(id) {
+  return document.getElementById(id)?.classList.contains('active') === true;
+}
+
+function anyVaultDialogOpen() {
+  return VAULT_DIALOG_IDS.some(isModalOpen);
 }
 
 /**
- * Watch for what the standalone passkey tab does, while this dialog is open.
+ * Watch for an unlock performed outside this page, while a vault dialog is open.
  *
  * The other tab cannot tell this one directly: the iframe has an opaque origin,
  * which rules out BroadcastChannel, localStorage and cross-tab postMessage
  * alike. Polling the vault state is the only channel left, and it is only worth
- * running while the dialog that sent the user there is still open.
+ * running while a dialog that asks for the key is still on screen.
+ *
+ * Idempotent: the unlock dialog opens the hand-off dialog on top of itself, and
+ * the second call must not restart the watch or recapture `lockedAtOpen` — by
+ * then the vault may already be unlocked, which would flip the watch into its
+ * "nothing to wait for" mode and never close either dialog.
  */
-function startPasskeyWatch() {
-  stopPasskeyWatch();
+function startVaultWatch() {
+  if (vaultWatch) return;
   const lockedAtOpen = isVaultLocked();
-  passkeyWatch = {
+  vaultWatch = {
     lockedAtOpen,
     // Locked: poll, for the case where both tabs are visible side by side and
     // no visibility change ever fires. Coming back to a backgrounded tab is
     // already handled globally, so this deliberately adds no second listener.
-    timer: lockedAtOpen ? window.setInterval(syncPasskeyProgress, PASSKEY_POLL_MS) : null,
+    timer: lockedAtOpen ? window.setInterval(syncVaultProgress, VAULT_POLL_MS) : null,
     // Unlocked: an unlocked vault is the precondition for registering a device,
     // so the only thing the other tab can change is the slot list — worth
     // re-reading once, on return, but not worth polling for.
@@ -1789,23 +1814,23 @@ function startPasskeyWatch() {
       if (!document.hidden) loadKeySlots();
     }
   };
-  if (passkeyWatch.onVisible) {
-    document.addEventListener('visibilitychange', passkeyWatch.onVisible);
+  if (vaultWatch.onVisible) {
+    document.addEventListener('visibilitychange', vaultWatch.onVisible);
   }
 }
 
-function stopPasskeyWatch() {
-  if (!passkeyWatch) return;
-  if (passkeyWatch.timer) window.clearInterval(passkeyWatch.timer);
-  if (passkeyWatch.onVisible) {
-    document.removeEventListener('visibilitychange', passkeyWatch.onVisible);
+function stopVaultWatch() {
+  if (!vaultWatch) return;
+  if (vaultWatch.timer) window.clearInterval(vaultWatch.timer);
+  if (vaultWatch.onVisible) {
+    document.removeEventListener('visibilitychange', vaultWatch.onVisible);
   }
-  passkeyWatch = null;
+  vaultWatch = null;
 }
 
 /** Poll for an unlock performed in the other tab, and adopt it when it lands. */
-async function syncPasskeyProgress() {
-  if (!passkeyWatch?.lockedAtOpen) return;
+async function syncVaultProgress() {
+  if (!vaultWatch?.lockedAtOpen) return;
 
   let unlocked = false;
   try {
@@ -1817,23 +1842,26 @@ async function syncPasskeyProgress() {
     return;
   }
   // The dialog may have been closed by hand while the request was in flight.
-  if (!passkeyWatch || !unlocked) return;
+  if (!vaultWatch || !unlocked) return;
   await refreshVaultState({ quiet: true });
 }
 
 /**
- * Dismiss the hand-off dialog once the tab it points at has done its job.
+ * Close every dialog that existed only to get the vault unlocked.
  *
- * Returns whether an open dialog was actually closed, so the caller can skip
- * its own "已同步" toast rather than raise two for one event.
+ * Both of them qualify, and both can be on screen at once: the unlock dialog
+ * offers a button that opens the hand-off dialog over it. Closing only the top
+ * one leaves the other sitting there asking for a key that is no longer needed.
+ *
+ * Returns how many were actually closed, so the caller can decide what to say
+ * rather than having a message imposed here — an unlock performed in this tab
+ * and one performed in another warrant different wording.
  */
-function closePasskeyHandoff() {
-  const open = document.getElementById('passkey-modal')?.classList.contains('active');
-  stopPasskeyWatch();
-  if (!open) return false;
-  closeModal('passkey-modal');
-  showToast('已在其他标签页解锁，配置已同步', 'success');
-  return true;
+function closeVaultDialogs() {
+  const open = VAULT_DIALOG_IDS.filter(isModalOpen);
+  open.forEach(closeModal);
+  stopVaultWatch();
+  return open.length;
 }
 
 async function copyPasskeyUrl() {
@@ -1860,11 +1888,15 @@ async function refreshVaultState(options = {}) {
     await loadVaultState();
     await loadSites();
     const locked = isVaultLocked();
-    // Whichever path noticed the unlock — this dialog's own poll, the manual
-    // button, or returning to the tab — the hand-off dialog has nothing left to
-    // say once the other tab has done its job.
-    const handedOff = wasLocked && !locked && closePasskeyHandoff();
-    if (!quiet && !handedOff) {
+    // Whichever path noticed the unlock — a dialog's own poll, the manual
+    // button, or returning to the tab — every dialog that was asking for the key
+    // has nothing left to ask for once it has been supplied elsewhere.
+    let dismissed = 0;
+    if (wasLocked && !locked) {
+      dismissed = closeVaultDialogs();
+      if (dismissed) showToast('已在其他标签页解锁，配置已同步', 'success');
+    }
+    if (!quiet && !dismissed) {
       showToast(locked ? '仍处于锁定状态' : '已同步：配置已解锁', locked ? 'warning' : 'success');
     }
     return true;
@@ -2112,6 +2144,10 @@ function openUnlockModal() {
   if (input) input.value = '';
   openModal('vault-unlock-modal');
   if (input) input.focus();
+  // The user may unlock on the standalone page instead of typing here, so watch
+  // for that from the moment this opens rather than only from the hand-off
+  // dialog — this one is what stays on screen underneath it.
+  startVaultWatch();
 }
 
 async function submitUnlockVault() {
@@ -2129,7 +2165,9 @@ async function submitUnlockVault() {
     }
     applyVaultState(data.vault);
     if (input) input.value = '';
-    closeModal('vault-unlock-modal');
+    // The hand-off dialog may be stacked over this one, offering an unlock that
+    // has just happened here instead.
+    closeVaultDialogs();
     showToast('解锁成功', 'success');
     await loadSites();
   } catch (e) {
@@ -2212,6 +2250,10 @@ function renderSettingsForm() {
   if (maxRecordsInput) {
     maxRecordsInput.value = settings.max_history_records ?? 0;
   }
+  const lockNotifyInput = document.getElementById('setting-lock-notify-session');
+  if (lockNotifyInput) {
+    lockNotifyInput.value = settings.lock_notify_session ?? '';
+  }
   renderImpersonateOptions();
   toggleRandomMode();
   renderVaultUi();
@@ -2276,6 +2318,9 @@ async function saveSettings() {
   const maxRecordsInput = document.getElementById('setting-max-history-records');
   const max_history_records = Math.max(0, parseInt(maxRecordsInput ? maxRecordsInput.value : 0, 10) || 0);
   if (maxRecordsInput) maxRecordsInput.value = String(max_history_records);
+  const lockNotifyInput = document.getElementById('setting-lock-notify-session');
+  const lock_notify_session = lockNotifyInput ? lockNotifyInput.value.trim() : '';
+  if (lockNotifyInput) lockNotifyInput.value = lock_notify_session;
 
   settings = {
     enabled,
@@ -2286,7 +2331,8 @@ async function saveSettings() {
     http_ssl_verify,
     http_timeout_seconds,
     http_impersonate,
-    max_history_records
+    max_history_records,
+    lock_notify_session
   };
 
   try {
