@@ -8,7 +8,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Any
 
-from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, MessageEventResult, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.api.web import error_response, file_response, json_response, request
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
@@ -20,6 +20,7 @@ from .core.http_client import (
     get_impersonate_options,
     normalize_impersonate,
 )
+from .core.lock_notifier import LockNotifier
 from .core.scheduler import LOCKED_MESSAGE, CheckInScheduler
 from .core.site_schema import NEW_API_USER_HEADER, SITE_TYPE_NEW_API, normalize_site_type
 from .core.storage import SLOT_WEBAUTHN, DEFAULT_SETTINGS, DatabaseManager
@@ -74,6 +75,13 @@ class ScheduledCheckInPlugin(Star):
         self.passkey_page_file: Path = Path(__file__).parent / "webauthn" / "passkey.html"
 
         self.scheduler = CheckInScheduler(self)
+        self.lock_notifier = LockNotifier(
+            is_locked=self.is_config_locked,
+            get_target=self._get_lock_notify_session,
+            was_sent=self._lock_alert_sent,
+            mark_sent=self._set_lock_alert_sent,
+            send=self._push_session_message,
+        )
         self._register_routes()
 
     async def initialize(self) -> None:
@@ -708,12 +716,20 @@ class ScheduledCheckInPlugin(Star):
         if not isinstance(data, dict):
             return error_response("全局设置必须是对象")
         settings = self.get_settings()
+        previous_notify_session = str(settings.get("lock_notify_session") or "")
         settings.update(data)
         if "max_history_records" in data:
             try:
                 settings["max_history_records"] = max(0, int(data["max_history_records"]))
             except (ValueError, TypeError):
                 settings["max_history_records"] = 0
+        if "lock_notify_session" in data:
+            notify_session = str(data["lock_notify_session"] or "").strip()
+            settings["lock_notify_session"] = notify_session
+            if notify_session != previous_notify_session:
+                # Re-arm the alert so a corrected session is used right away,
+                # instead of staying silent until the vault is cycled.
+                self._set_lock_alert_sent(False)
         settings["http_impersonate"] = normalize_impersonate(
             settings.get("http_impersonate")
         )
@@ -1201,6 +1217,64 @@ class ScheduledCheckInPlugin(Star):
             text: Markdown report text.
         """
         logger.info(f"CheckIn Notification:\n{text}")
+
+    # ------------------------------------------------------------------
+    # Locked-Vault Alert
+    # ------------------------------------------------------------------
+    def _get_lock_notify_session(self) -> str:
+        """Read the session that should receive the locked-vault alert."""
+        return str(self.get_settings().get("lock_notify_session") or "").strip()
+
+    def _lock_alert_sent(self) -> bool:
+        """Return whether the locked-vault alert already went out.
+
+        Returns:
+            ``True`` when it has been sent, and also when the flag cannot be
+            read: treating an unreadable flag as "already sent" keeps a broken
+            database from turning the alert into a message every 30 seconds.
+        """
+        try:
+            return bool(self.db.get_lock_notify_sent())
+        except Exception as e:
+            logger.error(f"Error reading locked-vault alert flag: {e}", exc_info=True)
+            return True
+
+    def _set_lock_alert_sent(self, sent: bool) -> None:
+        """Persist whether the locked-vault alert has been delivered."""
+        try:
+            self.db.set_lock_notify_sent(sent)
+        except Exception as e:
+            logger.error(f"Error saving locked-vault alert flag: {e}", exc_info=True)
+
+    async def _push_session_message(self, session: str, text: str) -> bool:
+        """Send one plain-text message to a unified_msg_origin session.
+
+        Args:
+            session: Target ``unified_msg_origin``, as typed by the operator.
+            text: Message body.
+
+        Returns:
+            Whether a platform accepted the message. A malformed session or an
+            adapter error is reported as ``False`` so the caller can retry.
+        """
+        try:
+            return bool(
+                await self.context.send_message(session, MessageChain().message(text))
+            )
+        except ValueError as e:
+            logger.warning(f"Invalid notification session {session!r}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Error sending message to {session!r}: {e}", exc_info=True)
+            return False
+
+    async def poll_lock_alert(self) -> None:
+        """Push the locked-vault alert if the vault just closed.
+
+        Called by the scheduler loop; see :class:`~.core.lock_notifier.LockNotifier`
+        for the once-per-lock guarantee.
+        """
+        await self.lock_notifier.poll()
 
     @filter.command("清空签到日志")
     async def cmd_clear_logs(

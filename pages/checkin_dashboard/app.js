@@ -13,7 +13,8 @@ let settings = {
   http_timeout_seconds: 15,
   http_impersonate: '',
   http_impersonate_options: [],
-  max_history_records: 0
+  max_history_records: 0,
+  lock_notify_session: ''
 };
 let logItems = [];
 let logsNextBeforeId = null;
@@ -1635,6 +1636,11 @@ function renderVaultUi() {
   const controls = document.getElementById('vault-controls');
   if (controls) controls.style.display = vaultState.enabled ? 'flex' : 'none';
 
+  // The alert can only ever fire for an encrypted vault, so it only appears
+  // once encryption is on.
+  const notifyBlock = document.getElementById('lock-notify-block');
+  if (notifyBlock) notifyBlock.style.display = vaultState.enabled ? 'block' : 'none';
+
   const hint = document.getElementById('vault-state-hint');
   if (hint) {
     if (!vaultState.enabled) {
@@ -2244,6 +2250,10 @@ function renderSettingsForm() {
   if (maxRecordsInput) {
     maxRecordsInput.value = settings.max_history_records ?? 0;
   }
+  const lockNotifyInput = document.getElementById('setting-lock-notify-session');
+  if (lockNotifyInput) {
+    lockNotifyInput.value = settings.lock_notify_session ?? '';
+  }
   renderImpersonateOptions();
   toggleRandomMode();
   renderVaultUi();
@@ -2308,6 +2318,9 @@ async function saveSettings() {
   const maxRecordsInput = document.getElementById('setting-max-history-records');
   const max_history_records = Math.max(0, parseInt(maxRecordsInput ? maxRecordsInput.value : 0, 10) || 0);
   if (maxRecordsInput) maxRecordsInput.value = String(max_history_records);
+  const lockNotifyInput = document.getElementById('setting-lock-notify-session');
+  const lock_notify_session = lockNotifyInput ? lockNotifyInput.value.trim() : '';
+  if (lockNotifyInput) lockNotifyInput.value = lock_notify_session;
 
   settings = {
     enabled,
@@ -2318,7 +2331,8 @@ async function saveSettings() {
     http_ssl_verify,
     http_timeout_seconds,
     http_impersonate,
-    max_history_records
+    max_history_records,
+    lock_notify_session
   };
 
   try {

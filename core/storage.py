@@ -55,6 +55,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "auto_cleanup_logs": True,
     "history_retention_days": 0,
     "max_history_records": 0,
+    # Session (unified_msg_origin) that receives the one-shot alert sent when
+    # the vault is locked. Empty disables the alert entirely.
+    "lock_notify_session": "",
 }
 
 # Vault bookkeeping lives in the settings table but is managed separately from
@@ -62,6 +65,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 VAULT_ENABLED_KEY = "vault_enabled"
 VAULT_VERIFIER_KEY = "vault_verifier"
 _VAULT_KEYS = (VAULT_ENABLED_KEY, VAULT_VERIFIER_KEY)
+
+# Records that the locked-vault alert has already gone out for the current lock,
+# so a restart cannot turn "notify once" into "notify on every startup".
+LOCK_NOTIFY_SENT_KEY = "lock_notify_sent"
+
+# Settings rows the plugin manages itself. They live in the same table but are
+# kept out of the user-facing dictionary the dashboard reads and writes back.
+_INTERNAL_KEYS = (*_VAULT_KEYS, LOCK_NOTIFY_SENT_KEY)
 
 # Key slot types. The user-key slot is created with encryption and can never be
 # removed, so losing every passkey can never lock the data away for good.
@@ -885,6 +896,24 @@ class DatabaseManager:
         """Return the stored verifier blob used to validate a supplied key."""
         return str(self._read_setting(VAULT_VERIFIER_KEY, "") or "")
 
+    def get_lock_notify_sent(self) -> bool:
+        """Return whether the locked-vault alert already went out for this lock.
+
+        Persisted rather than kept in memory so that restarting AstrBot with an
+        encrypted, still-locked vault does not re-send the same alert.
+        """
+        return bool(self._read_setting(LOCK_NOTIFY_SENT_KEY, False))
+
+    def set_lock_notify_sent(self, sent: bool) -> None:
+        """Record whether the locked-vault alert has been delivered.
+
+        Args:
+            sent: ``True`` right after a successful send, ``False`` once the
+                vault is open again so the next lock can alert once more.
+        """
+        with self._lock, self._connection() as conn:
+            self._save_settings_records(conn, {LOCK_NOTIFY_SENT_KEY: bool(sent)})
+
     # ------------------------------------------------------------------
     # Key Slots
     # ------------------------------------------------------------------
@@ -1362,7 +1391,7 @@ class DatabaseManager:
         with self._lock, self._connection() as conn:
             cursor = conn.execute("SELECT key, value FROM settings")
             for row in cursor.fetchall():
-                if row["key"] in _VAULT_KEYS:
+                if row["key"] in _INTERNAL_KEYS:
                     continue
                 settings[row["key"]] = _load_json(row["value"], row["value"])
 
@@ -1375,7 +1404,7 @@ class DatabaseManager:
         Args:
             settings_data: Settings dictionary. Vault bookkeeping keys are ignored.
         """
-        payload = {key: value for key, value in settings_data.items() if key not in _VAULT_KEYS}
+        payload = {key: value for key, value in settings_data.items() if key not in _INTERNAL_KEYS}
         with self._lock, self._connection() as conn:
             conn.execute("BEGIN TRANSACTION")
             try:
