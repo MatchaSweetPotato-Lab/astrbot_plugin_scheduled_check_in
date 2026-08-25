@@ -22,6 +22,9 @@ class _FakeHost:
         self.pushes: list[tuple[str, str]] = []
         # Delivery outcomes to hand back, one per push; the last value repeats.
         self.results: list[bool | Exception] = [True]
+        # Persistence outcomes to hand back, one per state write; the last
+        # value repeats.
+        self.mark_results: list[bool | Exception] = [True]
 
     def build(self) -> LockNotifier:
         return LockNotifier(
@@ -32,8 +35,17 @@ class _FakeHost:
             send=self._send,
         )
 
-    def _mark_sent(self, sent: bool) -> None:
-        self.sent_flag = sent
+    def _mark_sent(self, sent: bool) -> bool:
+        outcome = (
+            self.mark_results[0]
+            if len(self.mark_results) == 1
+            else self.mark_results.pop(0)
+        )
+        if isinstance(outcome, Exception):
+            raise outcome
+        if outcome:
+            self.sent_flag = sent
+        return outcome
 
     async def _send(self, session: str, text: str) -> bool:
         self.pushes.append((session, text))
@@ -136,6 +148,23 @@ class LockNotifierTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(host.pushes), 2)
         self.assertTrue(host.sent_flag)
+
+    async def test_persistence_failure_does_not_repeat_delivery(self) -> None:
+        """A delivered alert is not sent twice while its flag write retries."""
+        host = _FakeHost()
+        host.mark_results = [False, True]
+        notifier = host.build()
+
+        await notifier.poll()
+        self.assertEqual(len(host.pushes), 1)
+        self.assertFalse(host.sent_flag)
+
+        await notifier.poll()
+        self.assertEqual(len(host.pushes), 1)
+        self.assertTrue(host.sent_flag)
+
+        await notifier.poll()
+        self.assertEqual(len(host.pushes), 1)
 
 
 class LockNotifyStorageTests(unittest.TestCase):

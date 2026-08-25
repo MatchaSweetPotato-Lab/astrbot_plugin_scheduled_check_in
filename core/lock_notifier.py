@@ -41,7 +41,7 @@ class LockNotifier:
         is_locked: Callable[[], bool],
         get_target: Callable[[], str],
         was_sent: Callable[[], bool],
-        mark_sent: Callable[[bool], None],
+        mark_sent: Callable[[bool], bool],
         send: Callable[[str, str], Awaitable[bool]],
     ) -> None:
         """Wire the notifier to its host plugin.
@@ -58,6 +58,12 @@ class LockNotifier:
         self._was_sent = was_sent
         self._mark_sent = mark_sent
         self._send = send
+        # Delivery is authoritative for the current process even if the
+        # durable flag cannot be written. A failed write is retried without
+        # sending the alert again.
+        self._sent_in_memory: bool | None = None
+        self._persistence_pending = False
+        self._last_persistence_failure: str = ""
         # Last delivery problem, so a misconfigured target is reported once
         # instead of on every poll.
         self._last_failure: str = ""
@@ -73,13 +79,18 @@ class LockNotifier:
             self._rearm()
             return
 
+        if self._sent_in_memory is not None:
+            self._retry_persistence()
+            if self._sent_in_memory:
+                return
+
         target = str(self._get_target() or "").strip()
         if not target:
             # Feature is off. Deliberately silent: the vault being locked is
             # already visible in the dashboard and the history log.
             return
 
-        if self._was_sent():
+        if self._sent_in_memory is None and self._was_sent():
             return
 
         await self._deliver(target)
@@ -87,9 +98,16 @@ class LockNotifier:
     def _rearm(self) -> None:
         """Clear the sent flag so the next lock alerts again."""
         self._last_failure = ""
-        if not self._was_sent():
+        if self._sent_in_memory is False:
+            self._retry_persistence()
             return
-        self._mark_sent(False)
+
+        if self._sent_in_memory is None and not self._was_sent():
+            self._sent_in_memory = False
+            return
+
+        self._sent_in_memory = False
+        self._persistence_pending = not self._persist_sent(False)
         logger.info("Vault is unlocked; the locked-vault alert is armed again.")
 
     async def _deliver(self, target: str) -> None:
@@ -106,9 +124,40 @@ class LockNotifier:
 
         # Recorded only after a confirmed send, so an unreachable target keeps
         # being retried instead of silently burning the single allowance.
-        self._mark_sent(True)
+        self._sent_in_memory = True
+        self._persistence_pending = not self._persist_sent(True)
         self._last_failure = ""
         logger.info(f"Sent the locked-vault alert to {target}.")
+
+    def _retry_persistence(self) -> None:
+        """Retry a durable state write without retrying an accepted message."""
+        if self._sent_in_memory is None or not self._persistence_pending:
+            return
+        self._persistence_pending = not self._persist_sent(self._sent_in_memory)
+
+    def _persist_sent(self, sent: bool) -> bool:
+        """Persist the in-memory delivery state and report whether it stuck."""
+        try:
+            persisted = bool(self._mark_sent(sent))
+        except Exception as exc:
+            reason = f"保存发送状态失败: {exc}"
+            self._note_persistence_failure(reason)
+            return False
+
+        if not persisted:
+            self._note_persistence_failure(f"无法保存发送状态 sent={sent}")
+            return False
+
+        self._last_persistence_failure = ""
+        return True
+
+    def _note_persistence_failure(self, reason: str) -> None:
+        """Log a persistence problem once per distinct cause."""
+        if reason == self._last_persistence_failure:
+            logger.debug(f"Locked-vault alert state still not persisted: {reason}")
+            return
+        self._last_persistence_failure = reason
+        logger.warning(f"Could not persist the locked-vault alert state: {reason}")
 
     def _note_failure(self, reason: str) -> None:
         """Log a delivery failure once per distinct cause."""

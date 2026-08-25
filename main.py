@@ -1239,12 +1239,19 @@ class ScheduledCheckInPlugin(Star):
             logger.error(f"Error reading locked-vault alert flag: {e}", exc_info=True)
             return True
 
-    def _set_lock_alert_sent(self, sent: bool) -> None:
-        """Persist whether the locked-vault alert has been delivered."""
+    def _set_lock_alert_sent(self, sent: bool) -> bool:
+        """Persist whether the locked-vault alert has been delivered.
+
+        Returns:
+            ``True`` when the state was written successfully. The notifier
+            uses ``False`` to retry the write without sending the alert again.
+        """
         try:
             self.db.set_lock_notify_sent(sent)
+            return True
         except Exception as e:
             logger.error(f"Error saving locked-vault alert flag: {e}", exc_info=True)
+            return False
 
     async def _push_session_message(self, session: str, text: str) -> bool:
         """Send one plain-text message to a unified_msg_origin session.
