@@ -13,13 +13,18 @@ from core.scheduler import LOCKED_MESSAGE, CheckInScheduler
 
 
 class _FakePlugin:
-    def __init__(self, sites: list[dict[str, Any]]) -> None:
+    def __init__(self, sites: list[dict[str, Any]], settings: dict[str, Any] | None = None) -> None:
         self.sites = copy.deepcopy(sites)
+        self.settings = copy.deepcopy(settings) if settings is not None else {}
         self.saved_sites: list[dict[str, Any]] | None = None
         self.history: list[tuple[list[CheckInResult], str]] = []
+        self.notifications: list[tuple[str, str | None]] = []
 
     def get_sites(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self.sites)
+
+    def get_settings(self) -> dict[str, Any]:
+        return copy.deepcopy(self.settings)
 
     def save_sites(self, sites: list[dict[str, Any]]) -> None:
         self.saved_sites = copy.deepcopy(sites)
@@ -27,6 +32,9 @@ class _FakePlugin:
 
     def record_history(self, results: list[CheckInResult], log_type: str) -> None:
         self.history.append((results, log_type))
+
+    async def send_notification(self, text: str, session: str | None = None) -> None:
+        self.notifications.append((text, session))
 
 
 class _PluginWithDirectUpdate:
@@ -320,9 +328,11 @@ class HistoryEntryTests(unittest.TestCase):
     def test_report_line_marks_each_outcome(self) -> None:
         ok, expired, failed = self._results()
         self.assertIn("[成功]", CheckInScheduler.format_result_line(ok))
+        self.assertIn("+$1.00", CheckInScheduler.format_result_line(ok))
         self.assertIn("(余额: $12.50)", CheckInScheduler.format_result_line(ok))
         self.assertIn("[Token失效]", CheckInScheduler.format_result_line(expired))
         self.assertIn("[失败]", CheckInScheduler.format_result_line(failed))
+        self.assertIn("请求超时", CheckInScheduler.format_result_line(failed))
 
     def test_report_line_omits_a_zero_balance(self) -> None:
         line = CheckInScheduler.format_result_line(self._results()[2])
@@ -341,6 +351,76 @@ class HistoryEntryTests(unittest.TestCase):
         report = CheckInScheduler.format_report(results)
         for result in results:
             self.assertIn(CheckInScheduler.format_result_line(result), report)
+
+    def test_format_report_failure_only_all_success(self) -> None:
+        success_results = [
+            CheckInResult("s1", "站点 A", True, "ok", total_quota=10.0, gained_quota=0.5),
+            CheckInResult("s2", "站点 B", True, "ok", total_quota=5.0),
+        ]
+        report = CheckInScheduler.format_report(success_results, report_level="failure_only")
+        self.assertEqual(report, "")
+
+    def test_format_report_failure_only_with_failures(self) -> None:
+        results = self._results()
+        report = CheckInScheduler.format_report(results, report_level="failure_only")
+        self.assertIn("异常提醒", report)
+        self.assertIn("站点 B", report)
+        self.assertIn("站点 C", report)
+        self.assertNotIn("站点 A", report)
+        self.assertIn("2 个签到失败", report)
+
+
+class SchedulerNotificationDispatchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scheduled_dispatch_all_level(self) -> None:
+        plugin = _FakePlugin(
+            [],
+            settings={"lock_notify_session": "test:FriendMessage:123", "report_level": "all"},
+        )
+        scheduler = CheckInScheduler(plugin)
+        sample_results = [
+            CheckInResult("s1", "站点 A", True, "ok", total_quota=10.0, gained_quota=0.5)
+        ]
+        async def _fake_run_check_in_all(manual: bool = False) -> list[CheckInResult]:
+            return sample_results
+
+        scheduler.run_check_in_all = _fake_run_check_in_all  # type: ignore[method-assign]
+
+        # Simulate scheduled trigger logic
+        results = await scheduler.run_check_in_all()
+        settings = plugin.get_settings()
+        report_level = settings.get("report_level", "all")
+        report_session = str(settings.get("lock_notify_session") or "").strip()
+        report_text = scheduler.format_report(results, report_level=report_level)
+        if report_text:
+            await plugin.send_notification(report_text, session=report_session)
+
+        self.assertEqual(len(plugin.notifications), 1)
+        self.assertEqual(plugin.notifications[0][1], "test:FriendMessage:123")
+        self.assertIn("站点 A", plugin.notifications[0][0])
+
+    async def test_scheduled_dispatch_failure_only_skips_success(self) -> None:
+        plugin = _FakePlugin(
+            [],
+            settings={"lock_notify_session": "test:FriendMessage:123", "report_level": "failure_only"},
+        )
+        scheduler = CheckInScheduler(plugin)
+        sample_results = [
+            CheckInResult("s1", "站点 A", True, "ok", total_quota=10.0, gained_quota=0.5)
+        ]
+        async def _fake_run_check_in_all(manual: bool = False) -> list[CheckInResult]:
+            return sample_results
+
+        scheduler.run_check_in_all = _fake_run_check_in_all  # type: ignore[method-assign]
+
+        results = await scheduler.run_check_in_all()
+        settings = plugin.get_settings()
+        report_level = settings.get("report_level", "all")
+        report_session = str(settings.get("lock_notify_session") or "").strip()
+        report_text = scheduler.format_report(results, report_level=report_level)
+        if report_text:
+            await plugin.send_notification(report_text, session=report_session)
+
+        self.assertEqual(len(plugin.notifications), 0)
 
 
 if __name__ == "__main__":

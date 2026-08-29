@@ -202,6 +202,11 @@ class LockNotifyStorageTests(unittest.TestCase):
     def test_target_setting_defaults_to_disabled(self) -> None:
         self.assertEqual(self.db.get_settings()["lock_notify_session"], "")
 
+    def test_report_settings_defaults(self) -> None:
+        settings = self.db.get_settings()
+        self.assertEqual(settings["lock_notify_session"], "")
+        self.assertEqual(settings["report_level"], "all")
+
     def test_sent_flag_round_trips_across_instances(self) -> None:
         """The flag must survive a restart, or "once" becomes "once per boot"."""
         self.assertFalse(self.db.get_lock_notify_sent())

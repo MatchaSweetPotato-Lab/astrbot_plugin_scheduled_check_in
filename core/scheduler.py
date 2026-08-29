@@ -302,8 +302,14 @@ class CheckInScheduler:
                         self._last_run_date = current_date
                         logger.info(f"Triggering scheduled daily check-in at target time ({target_time})...")
                         results = await self.run_check_in_all()
-                        report_text = self.format_report(results)
-                        await self.plugin.send_notification(report_text)
+                        settings = self.plugin.get_settings()
+                        report_level = settings.get("report_level", "all")
+                        report_session = str(settings.get("lock_notify_session") or "").strip()
+                        report_text = self.format_report(results, report_level=report_level)
+                        if report_text:
+                            await self.plugin.send_notification(report_text, session=report_session)
+                        else:
+                            logger.info("Scheduled check-in completed; report skipped based on reporting level.")
 
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
@@ -536,32 +542,65 @@ class CheckInScheduler:
             result: The result to describe.
 
         Returns:
-            One formatted line, e.g. ``[成功] 站点 | 消息 (余额: $1.00)``.
+            One formatted line:
+            - Success: [成功] 站点名称 | 余额变化（如有） (余额: $X.XX)
+            - Failure: [失败]/[Token失效] 站点名称 | 失败原因
         """
         if result.success:
             status_str = "[成功]"
-        elif result.expired:
+            parts: list[str] = []
+            if result.gained_quota > 0:
+                parts.append(f"+${result.gained_quota:.2f}")
+            elif result.message and "今日已完成签到" in result.message:
+                parts.append(result.message)
+
+            if result.total_quota > 0:
+                parts.append(f"(余额: ${result.total_quota:.2f})")
+
+            if parts:
+                detail_str = " ".join(parts)
+            else:
+                detail_str = result.message or "签到成功"
+
+            return f"{status_str} {result.site_name} | {detail_str}"
+
+        if result.expired:
             status_str = "[Token失效]"
         else:
             status_str = "[失败]"
 
-        line = f"{status_str} {result.site_name} | {result.message}"
-        if result.total_quota > 0:
-            line += f" (余额: ${result.total_quota:.2f})"
-        return line
+        return f"{status_str} {result.site_name} | {result.message or '未知失败原因'}"
 
     @staticmethod
-    def format_report(results: list[CheckInResult]) -> str:
+    def format_report(results: list[CheckInResult], report_level: str = "all") -> str:
         """Format check-in results into a clean markdown report card.
 
         Args:
             results: List of CheckInResult objects.
+            report_level: Reporting verbosity level ("all" or "failure_only").
 
         Returns:
-            Formatted markdown string.
+            Formatted markdown string, or empty string if report_level is
+            "failure_only" and all sites succeeded.
         """
         if not results:
             return "未配置有效的中转站签到目标。"
+
+        if report_level == "failure_only":
+            failed_results = [r for r in results if not r.success]
+            if not failed_results:
+                return ""
+            lines = [
+                "⚠️ API 中转站自动签到异常提醒",
+                "━━━━━━━━━━━━━━━━━━━━",
+            ]
+            for r in failed_results:
+                lines.append(CheckInScheduler.format_result_line(r))
+            lines.append("━━━━━━━━━━━━━━━━━━━━")
+            lines.append(
+                f"统计: 共检测 {len(results)} 个站点，其中 {len(failed_results)} 个签到失败，请及时处理！"
+            )
+            return "\n".join(lines)
 
         lines = ["每日 API 中转站自动签到简报", "━━━━━━━━━━━━━━━━━━━━"]
         success_count = 0
@@ -575,7 +614,11 @@ class CheckInScheduler:
             lines.append(CheckInScheduler.format_result_line(r))
 
         lines.append("━━━━━━━━━━━━━━━━━━━━")
-        summary_line = f"完成统计: {success_count}/{len(results)}"
+        failed_count = len(results) - success_count
+        if failed_count > 0:
+            summary_line = f"完成统计: {success_count}/{len(results)} 成功 | 失败: {failed_count}"
+        else:
+            summary_line = f"完成统计: {success_count}/{len(results)}"
         if total_quota_sum > 0:
             summary_line += f" | 总余额估算: ${total_quota_sum:.2f}"
         lines.append(summary_line)

@@ -14,7 +14,8 @@ let settings = {
   http_impersonate: '',
   http_impersonate_options: [],
   max_history_records: 0,
-  lock_notify_session: ''
+  lock_notify_session: '',
+  report_level: 'all'
 };
 let logItems = [];
 let logsNextBeforeId = null;
@@ -782,6 +783,16 @@ function switchSiteTab(tab) {
     button.classList.toggle('active', button.dataset.tab === tab);
   });
   document.querySelectorAll('#site-modal .tab-panel').forEach(panel => {
+    panel.classList.toggle('active', panel.dataset.panel === tab);
+  });
+}
+
+// Settings Modal Tabs
+function switchSettingsTab(tab) {
+  document.querySelectorAll('#settings-tab-bar .tab-btn').forEach(button => {
+    button.classList.toggle('active', button.dataset.tab === tab);
+  });
+  document.querySelectorAll('#settings-modal .tab-panel').forEach(panel => {
     panel.classList.toggle('active', panel.dataset.panel === tab);
   });
 }
@@ -1636,11 +1647,6 @@ function renderVaultUi() {
   const controls = document.getElementById('vault-controls');
   if (controls) controls.style.display = vaultState.enabled ? 'flex' : 'none';
 
-  // The alert can only ever fire for an encrypted vault, so it only appears
-  // once encryption is on.
-  const notifyBlock = document.getElementById('lock-notify-block');
-  if (notifyBlock) notifyBlock.style.display = vaultState.enabled ? 'block' : 'none';
-
   const hint = document.getElementById('vault-state-hint');
   if (hint) {
     if (!vaultState.enabled) {
@@ -2254,6 +2260,10 @@ function renderSettingsForm() {
   if (lockNotifyInput) {
     lockNotifyInput.value = settings.lock_notify_session ?? '';
   }
+  const reportLevelSelect = document.getElementById('setting-report-level');
+  if (reportLevelSelect) {
+    reportLevelSelect.value = settings.report_level || 'all';
+  }
   renderImpersonateOptions();
   toggleRandomMode();
   renderVaultUi();
@@ -2296,6 +2306,7 @@ function toggleRandomMode() {
 }
 
 function openSettingsModal() {
+  switchSettingsTab('schedule');
   openModal('settings-modal');
   loadSettings();
 }
@@ -2321,6 +2332,8 @@ async function saveSettings() {
   const lockNotifyInput = document.getElementById('setting-lock-notify-session');
   const lock_notify_session = lockNotifyInput ? lockNotifyInput.value.trim() : '';
   if (lockNotifyInput) lockNotifyInput.value = lock_notify_session;
+  const reportLevelSelect = document.getElementById('setting-report-level');
+  const report_level = reportLevelSelect ? reportLevelSelect.value : 'all';
 
   settings = {
     enabled,
@@ -2332,7 +2345,8 @@ async function saveSettings() {
     http_timeout_seconds,
     http_impersonate,
     max_history_records,
-    lock_notify_session
+    lock_notify_session,
+    report_level
   };
 
   try {
