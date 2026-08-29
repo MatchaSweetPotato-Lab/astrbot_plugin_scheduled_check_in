@@ -186,18 +186,20 @@ class ScheduledCheckInPlugin(Star):
         *,
         rearm_lock_alert: bool = False,
     ) -> bool:
-        """Write settings to SQLite database.
+        """Write settings to SQLite database and optionally rearm lock alerts.
 
         Args:
             settings_data: Settings dictionary.
             rearm_lock_alert: Atomically clear the persisted one-shot alert
-                flag when the alert target changes.
+                flag and process-local delivery state when the alert target changes.
 
         Returns:
             ``True`` when the write succeeds, otherwise ``False``.
         """
         try:
             self.db.save_settings(settings_data, rearm_lock_alert=rearm_lock_alert)
+            if rearm_lock_alert and hasattr(self, "lock_notifier"):
+                self.lock_notifier.rearm_after_target_change()
             return True
         except Exception as e:
             logger.error(f"Error saving settings to database: {e}", exc_info=True)
@@ -745,10 +747,6 @@ class ScheduledCheckInPlugin(Star):
         )
         if not self.save_settings(settings, rearm_lock_alert=notify_session_changed):
             return error_response("全局设置保存失败")
-        if notify_session_changed:
-            # The transaction above has already reset the durable flag. Now
-            # invalidate the process-local delivery state as well.
-            self.lock_notifier.rearm_after_target_change()
         self.scheduler.reset_today_target_time()
         return json_response({"status": "ok", "message": "全局设置已更新"})
 
@@ -1225,13 +1223,22 @@ class ScheduledCheckInPlugin(Star):
     # ------------------------------------------------------------------
     # Notification & Chat Commands
     # ------------------------------------------------------------------
-    async def send_notification(self, text: str) -> None:
-        """Log or dispatch notification text.
+    async def send_notification(self, text: str, session: str | None = None) -> None:
+        """Log and dispatch notification text.
 
         Args:
             text: Markdown report text.
+            session: Optional target unified_msg_origin session. If not provided,
+                reads lock_notify_session from settings.
         """
         logger.info(f"CheckIn Notification:\n{text}")
+        target_session = (session or str(self.get_settings().get("lock_notify_session") or "")).strip()
+        if target_session:
+            sent = await self._push_session_message(target_session, text)
+            if sent:
+                logger.info(f"Check-in notification successfully delivered to {target_session!r}.")
+            else:
+                logger.warning(f"Failed to deliver check-in notification to {target_session!r}.")
 
     # ------------------------------------------------------------------
     # Locked-Vault Alert
@@ -1306,6 +1313,47 @@ class ScheduledCheckInPlugin(Star):
         """清空历史签到日志记录"""
         self.clear_history_logs()
         yield event.plain_result("历史签到日志已成功清空！")
+
+    @filter.command("设置签到汇报")
+    async def cmd_set_report_session(
+        self,
+        event: AstrMessageEvent,
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        """将当前会话设置为自动签到结果与锁定提醒的唯一发送目标"""
+        session = str(event.unified_msg_origin).strip()
+        if not session:
+            yield event.plain_result("无法获取当前会话标识 (UMO)，设置失败。")
+            return
+
+        settings = self.get_settings()
+        previous_session = str(settings.get("lock_notify_session") or "").strip()
+        settings["lock_notify_session"] = session
+        session_changed = session != previous_session
+
+        self.save_settings(settings, rearm_lock_alert=session_changed)
+
+        level_desc = "仅失败项汇报" if settings.get("report_level") == "failure_only" else "完整汇报"
+        yield event.plain_result(
+            f"✅ 已成功将当前会话设置为通知推送地点！\n"
+            f"📌 会话标识 (UMO): {session}\n"
+            f"⚙️ 汇报等级: {level_desc}（可在 Web 仪表盘中调整）\n"
+            f"💡 提示: 签到结果汇报与配置锁定告警将统一推送至此会话。"
+        )
+
+    @filter.command("取消签到汇报")
+    async def cmd_cancel_report_session(
+        self,
+        event: AstrMessageEvent,
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        """取消自动签到结果与锁定提醒的会话推送"""
+        settings = self.get_settings()
+        if not settings.get("lock_notify_session"):
+            yield event.plain_result("当前未设置通知推送会话。")
+            return
+
+        settings["lock_notify_session"] = ""
+        self.save_settings(settings, rearm_lock_alert=True)
+        yield event.plain_result("✅ 已取消通知推送，后续定时签到结果与锁定告警将不再推送至任何会话。")
 
     @filter.command("签到")
     async def cmd_checkin(

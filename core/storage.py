@@ -55,9 +55,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "auto_cleanup_logs": True,
     "history_retention_days": 0,
     "max_history_records": 0,
-    # Session (unified_msg_origin) that receives the one-shot alert sent when
-    # the vault is locked. Empty disables the alert entirely.
+    # Session (unified_msg_origin) that receives scheduled check-in result reports
+    # and locked-vault alerts. Empty disables push notifications.
     "lock_notify_session": "",
+    # Reporting verbosity level: "all" (full briefing) or "failure_only" (alerts on failures only).
+    "report_level": "all",
 }
 
 # Vault bookkeeping lives in the settings table but is managed separately from
