@@ -207,7 +207,7 @@ class ChallengeAwareRequestTests(unittest.IsolatedAsyncioTestCase):
             result = await adapter.check_in()
 
         self.assertFalse(result.success)
-        self.assertEqual(result.message, 'HTTP 401: {"success":false,"message":"unauthorized"}')
+        self.assertEqual(result.message, "unauthorized")
         self.assertEqual(len(session.requests), 2)
         self.assertTrue(
             all(request["impersonate"] == "chrome131" for request in session.requests)

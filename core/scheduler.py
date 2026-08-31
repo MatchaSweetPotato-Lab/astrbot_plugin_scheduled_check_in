@@ -532,6 +532,51 @@ class CheckInScheduler:
         ]
 
     @staticmethod
+    def _clean_result_message(message: str, success: bool = True) -> str:
+        """Strip raw JSON, HTML, or verbose HTTP dumps from result messages."""
+        raw = (message or "").strip()
+        if not raw:
+            return "签到成功" if success else "未知失败原因"
+
+        # Check if the message is or embeds a JSON object
+        if raw.startswith(("HTTP ", "{", "[")) or '{"' in raw or '":' in raw:
+            # Try extracting human-readable message if embedded in JSON
+            try:
+                json_str = raw
+                if "{" in raw and "}" in raw:
+                    json_str = raw[raw.find("{") : raw.rfind("}") + 1]
+                parsed = json.loads(json_str)
+                if isinstance(parsed, dict):
+                    human = parsed.get("message") or parsed.get("msg") or parsed.get("detail")
+                    if not human and isinstance(parsed.get("error"), dict):
+                        human = parsed["error"].get("message") or parsed["error"].get("detail")
+                    elif not human and parsed.get("error"):
+                        human = str(parsed["error"])
+                    if human:
+                        msg_str = str(human).strip()
+                        if len(msg_str) > 80:
+                            return f"{msg_str[:77]}..."
+                        return msg_str
+            except Exception:
+                pass
+
+            # If it's a success and no human message was extracted, don't dump raw JSON/HTTP
+            if success:
+                return "签到成功"
+            # For failures, show at most a concise status
+            if raw.startswith("HTTP "):
+                return raw.split(":", 1)[0].strip()
+            return "请求异常或返回非预期的响应格式"
+
+        if raw.startswith(("<", "http://", "https://")):
+            return "签到成功" if success else "服务器返回异常网页内容"
+
+        if len(raw) > 80:
+            return "签到成功" if success else f"{raw[:77]}..."
+
+        return raw
+
+    @staticmethod
     def format_result_line(result: CheckInResult) -> str:
         """Format one result as a single report line.
 
@@ -551,8 +596,10 @@ class CheckInScheduler:
             parts: list[str] = []
             if result.gained_quota > 0:
                 parts.append(f"+${result.gained_quota:.2f}")
-            elif result.message and "今日已完成签到" in result.message:
-                parts.append(result.message)
+            else:
+                clean_msg = CheckInScheduler._clean_result_message(result.message, success=True)
+                if clean_msg and clean_msg != "签到成功" and not clean_msg.startswith("额度增加"):
+                    parts.append(clean_msg)
 
             if result.total_quota > 0:
                 parts.append(f"(余额: ${result.total_quota:.2f})")
@@ -560,7 +607,7 @@ class CheckInScheduler:
             if parts:
                 detail_str = " ".join(parts)
             else:
-                detail_str = result.message or "签到成功"
+                detail_str = "签到成功"
 
             return f"{status_str} {result.site_name} | {detail_str}"
 
@@ -569,7 +616,8 @@ class CheckInScheduler:
         else:
             status_str = "[失败]"
 
-        return f"{status_str} {result.site_name} | {result.message or '未知失败原因'}"
+        error_msg = CheckInScheduler._clean_result_message(result.message, success=False)
+        return f"{status_str} {result.site_name} | {error_msg}"
 
     @staticmethod
     def format_report(results: list[CheckInResult], report_level: str = "all") -> str:

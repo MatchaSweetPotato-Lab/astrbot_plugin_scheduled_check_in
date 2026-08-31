@@ -1251,7 +1251,9 @@ class GenericRestAdapter(BaseCheckInAdapter):
         except Exception as exc:
             return self._result(False, f"请求失败: {exc}")
 
-        success, message = _interpret_generic_response(response, self._waf_message)
+        success, message = _interpret_generic_response(
+            response, self._waf_message, default_success="连接成功"
+        )
         if balance_error and success:
             message = f"{message}（余额查询: {balance_error}）"
         return self._result(
@@ -1262,32 +1264,51 @@ class GenericRestAdapter(BaseCheckInAdapter):
         )
 
 
-def _interpret_generic_response(response: _TextResponse, waf_message: Any) -> tuple[bool, str]:
-    """Judge a free-form REST response, honouring an explicit ``success`` field."""
+def _interpret_generic_response(
+    response: _TextResponse,
+    waf_message: Any,
+    default_success: str = "签到成功",
+) -> tuple[bool, str]:
+    """Judge a free-form REST response, honouring an explicit ``success`` or ``ok`` field."""
     if is_acw_sc_v2_challenge(response.text):
         return False, waf_message(response)
 
     text_clean = response.text.strip()
-    message = f"HTTP {response.status}: {text_clean}" if text_clean else f"HTTP {response.status}"
     success = 200 <= response.status < 300
 
     try:
         payload = json.loads(response.text)
     except (TypeError, ValueError):
-        return success, message
+        payload = None
 
-    if not isinstance(payload, dict) or "success" not in payload:
-        return success, message
+    if isinstance(payload, dict):
+        for ok_key in ("success", "ok"):
+            if ok_key in payload:
+                val = payload[ok_key]
+                if isinstance(val, bool):
+                    success = success and val if val is not None else success
+                elif isinstance(val, str) and val.strip().lower() in {"true", "false"}:
+                    success = success and (val.strip().lower() == "true")
 
-    value = payload["success"]
-    reported: bool | None = None
-    if isinstance(value, bool):
-        reported = value
-    elif isinstance(value, str) and value.strip().lower() in {"true", "false"}:
-        reported = value.strip().lower() == "true"
-    if reported is not None:
-        # A body claiming success can never rescue a failed HTTP status.
-        success = success and reported
+        human_msg = BaseCheckInAdapter._response_message(payload, "")
+        if human_msg:
+            message = human_msg
+        elif success:
+            message = default_success
+        else:
+            message = f"HTTP {response.status}"
+    else:
+        if success:
+            if text_clean and len(text_clean) <= 60 and not text_clean.startswith(("{", "[", "<")):
+                message = text_clean
+            else:
+                message = default_success
+        else:
+            if text_clean and len(text_clean) <= 100 and not text_clean.startswith("<"):
+                message = f"HTTP {response.status}: {text_clean}"
+            else:
+                message = f"HTTP {response.status}"
+
     return success, message
 
 
