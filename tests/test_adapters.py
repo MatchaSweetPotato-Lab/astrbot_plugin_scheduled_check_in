@@ -618,6 +618,7 @@ class GenericRestTests(unittest.IsolatedAsyncioTestCase):
         site = make_site(type="generic_rest", checkin={"path": "/sign", "protocol": "post"})
         result = await create_adapter(site, session).test_connection()
         self.assertTrue(result.success)
+        self.assertEqual(result.message, "连接成功")
         self.assertEqual(session.urls(), [BASE])
 
 

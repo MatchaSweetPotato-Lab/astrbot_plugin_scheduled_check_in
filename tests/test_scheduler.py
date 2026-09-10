@@ -338,6 +338,38 @@ class HistoryEntryTests(unittest.TestCase):
         line = CheckInScheduler.format_result_line(self._results()[2])
         self.assertNotIn("余额", line)
 
+    def test_report_line_cleans_raw_json_dumps(self) -> None:
+        raw_json = 'HTTP 200: {"added":140,"balance":3520,"daily_checkin":{"enabled":true}}'
+        res = CheckInResult("s_raw", "wisart", True, raw_json, total_quota=0.0, gained_quota=0.0)
+        line = CheckInScheduler.format_result_line(res)
+        self.assertEqual(line, "[成功] wisart | 签到成功")
+        self.assertNotIn("HTTP 200", line)
+        self.assertNotIn("daily_checkin", line)
+
+    def test_clean_result_message_json_extracted_truncation(self) -> None:
+        long_err = "A" * 100
+        raw = json.dumps({"error": {"message": long_err}})
+        cleaned = CheckInScheduler._clean_result_message(raw, success=False)
+        self.assertTrue(cleaned.endswith("..."))
+        self.assertEqual(len(cleaned), 80)
+        self.assertEqual(cleaned, "A" * 77 + "...")
+
+    def test_clean_result_message_plain_long_error_truncation(self) -> None:
+        long_err = "Error: " + "X" * 100
+        cleaned = CheckInScheduler._clean_result_message(long_err, success=False)
+        self.assertTrue(cleaned.endswith("..."))
+        self.assertEqual(len(cleaned), 80)
+
+    def test_clean_result_message_html_failure(self) -> None:
+        html = "<html><head><title>502 Bad Gateway</title></head><body><h1>502</h1></body></html>"
+        cleaned = CheckInScheduler._clean_result_message(html, success=False)
+        self.assertEqual(cleaned, "服务器返回异常网页内容")
+
+    def test_clean_result_message_html_success(self) -> None:
+        html = "<html><body>Welcome</body></html>"
+        cleaned = CheckInScheduler._clean_result_message(html, success=True)
+        self.assertEqual(cleaned, "签到成功")
+
     def test_the_broadcast_report_still_combines_every_site(self) -> None:
         """Splitting storage must not change the chat briefing."""
         report = CheckInScheduler.format_report(self._results())
