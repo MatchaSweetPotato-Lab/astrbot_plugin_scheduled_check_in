@@ -1305,6 +1305,7 @@ class ScheduledCheckInPlugin(Star):
         """
         await self.lock_notifier.poll()
 
+    @filter.permission_type(filter.PermissionType.ADMIN, raise_error=False)
     @filter.command("清空签到日志")
     async def cmd_clear_logs(
         self,
@@ -1314,6 +1315,7 @@ class ScheduledCheckInPlugin(Star):
         self.clear_history_logs()
         yield event.plain_result("历史签到日志已成功清空！")
 
+    @filter.permission_type(filter.PermissionType.ADMIN, raise_error=False)
     @filter.command("设置签到汇报")
     async def cmd_set_report_session(
         self,
@@ -1340,6 +1342,7 @@ class ScheduledCheckInPlugin(Star):
             f"💡 提示: 签到结果汇报与配置锁定告警将统一推送至此会话。"
         )
 
+    @filter.permission_type(filter.PermissionType.ADMIN, raise_error=False)
     @filter.command("取消签到汇报")
     async def cmd_cancel_report_session(
         self,
@@ -1355,6 +1358,7 @@ class ScheduledCheckInPlugin(Star):
         self.save_settings(settings, rearm_lock_alert=True)
         yield event.plain_result("✅ 已取消通知推送，后续定时签到结果与锁定告警将不再推送至任何会话。")
 
+    @filter.permission_type(filter.PermissionType.ADMIN, raise_error=False)
     @filter.command("签到")
     async def cmd_checkin(
         self,
@@ -1365,6 +1369,8 @@ class ScheduledCheckInPlugin(Star):
         results = await self.scheduler.run_check_in_all(manual=True)
         report = CheckInScheduler.format_report(results)
         yield event.plain_result(report)
+
+    @filter.permission_type(filter.PermissionType.ADMIN, raise_error=False)
     @filter.command("签到状态")
     async def cmd_status(
         self,
