@@ -8,6 +8,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import tests  # noqa: F401
@@ -59,9 +60,8 @@ def make_site(**overrides) -> dict:
             "protocol": "post",
             "credential_id": "c1",
             "headers": [{"key": "X-A", "value": "1"}],
-            "solve_acw_sc_v2": True,
         },
-        "balance": {"path": "", "protocol": "auto", "credential_id": "", "headers": [], "solve_acw_sc_v2": False},
+        "balance": {"path": "", "protocol": "auto", "credential_id": "", "headers": []},
         "enabled": True,
     }
     site.update(overrides)
@@ -113,7 +113,6 @@ class DatabaseManagerTests(unittest.TestCase):
         self.assertEqual(site["checkin"]["protocol"], "post")
         self.assertEqual(site["checkin"]["credential_id"], "c1")
         self.assertEqual(site["checkin"]["headers"], [{"key": "X-A", "value": "1"}])
-        self.assertTrue(site["checkin"]["solve_acw_sc_v2"])
         self.assertEqual(site["balance"]["protocol"], "auto")
         self.assertFalse(site["locked"])
 
@@ -136,6 +135,22 @@ class DatabaseManagerTests(unittest.TestCase):
         self.assertEqual(site["checkin"]["path"], "/sign")
         self.assertEqual(site["checkin"]["protocol"], "post")
         self.assertEqual(site["checkin"]["headers"], [{"key": "X-A", "value": "1"}])
+
+    def test_per_site_request_flags_are_no_longer_stored(self) -> None:
+        """ML-DSA and acw_sc__v2 solving are global settings now."""
+        site = make_site()
+        site["checkin"].update(tls_mldsa=True, solve_acw_sc_v2=True)
+        site["credentials"][1]["tls_mldsa"] = True
+        self.db.save_sites([site])
+        stored = json.loads(read_raw(self.db_path, "checkin_config"))
+        self.assertNotIn("tls_mldsa", stored)
+        self.assertNotIn("solve_acw_sc_v2", stored)
+        self.assertNotIn("tls_mldsa", self.db.get_sites()[0]["credentials"][1])
+
+    def test_global_request_settings_have_defaults(self) -> None:
+        settings = self.db.get_settings()
+        self.assertIs(settings["http_tls_mldsa"], False)
+        self.assertIs(settings["acw_sc_v2_auto_solve"], True)
 
     def test_display_order_is_preserved(self) -> None:
         self.db.save_sites([
@@ -206,6 +221,37 @@ class DatabaseManagerTests(unittest.TestCase):
         self.db.save_sites([make_site()])
         self.assertFalse(self.db.update_credential_session("site_1", "nope", "s"))
         self.assertFalse(self.db.update_credential_session("nope", "gh", "s"))
+
+    def test_update_credential_session_stores_the_tokens(self) -> None:
+        self.db.save_sites([make_site()])
+        self.db.update_credential_session("site_1", "gh", "new_api_refresh=r", "at", 1900000000)
+        credential = self.db.get_sites()[0]["credentials"][1]
+        self.assertEqual(credential["session_cookie"], "new_api_refresh=r")
+        self.assertEqual((credential["access_token"], credential["access_expires_at"]), ("at", 1900000000))
+
+    def test_an_empty_token_clears_the_stored_one(self) -> None:
+        self.db.save_sites([make_site()])
+        self.db.update_credential_session("site_1", "gh", "r", "at", 1900000000)
+        self.db.update_credential_session("site_1", "gh", "session=legacy", "", 0)
+        credential = self.db.get_sites()[0]["credentials"][1]
+        self.assertEqual((credential["access_token"], credential["access_expires_at"]), ("", 0))
+
+    def test_display_view_withholds_the_tokens(self) -> None:
+        self.db.save_sites([make_site()])
+        self.db.update_credential_session("site_1", "gh", "new_api_refresh=r", "at", 1900000000)
+        oauth = self.db.get_sites_for_display()[0]["credentials"][1]
+        self.assertEqual((oauth["session_cookie"], oauth["access_token"]), ("", ""))
+        self.assertTrue(oauth["has_refresh_token"])
+        self.assertTrue(oauth["has_access_token"])
+        self.assertEqual(oauth["access_expires_at"], 1900000000)
+
+    def test_dashboard_round_trip_keeps_the_tokens(self) -> None:
+        self.db.save_sites([make_site()])
+        self.db.update_credential_session("site_1", "gh", "new_api_refresh=r", "at", 1900000000)
+        self.db.save_sites(self.db.get_sites_for_display())
+        credential = self.db.get_sites()[0]["credentials"][1]
+        self.assertEqual(credential["session_cookie"], "new_api_refresh=r")
+        self.assertEqual((credential["access_token"], credential["access_expires_at"]), ("at", 1900000000))
 
     def test_update_action_headers(self) -> None:
         self.db.save_sites([make_site()])
@@ -382,12 +428,11 @@ class LegacyMigrationTests(unittest.TestCase):
         self.assertEqual(site["checkin"]["path"], "/api/user/checkin")
         self.assertEqual(site["balance"]["path"], "")
 
-        # custom_headers and the solver flag apply to both actions
+        # custom_headers apply to both actions; the solver flag is global now
         expected_headers = [{"key": "User-Agent", "value": "legacy"}]
         self.assertEqual(site["checkin"]["headers"], expected_headers)
         self.assertEqual(site["balance"]["headers"], expected_headers)
-        self.assertTrue(site["checkin"]["solve_acw_sc_v2"])
-        self.assertTrue(site["balance"]["solve_acw_sc_v2"])
+        self.assertNotIn("solve_acw_sc_v2", site["checkin"])
 
         settings = mgr.get_settings()
         self.assertEqual(settings["random_enabled"], False)
@@ -471,7 +516,6 @@ class LegacyMigrationTests(unittest.TestCase):
         self.assertEqual(site["credentials"][0]["value"], "sk-old")
         self.assertEqual(site["checkin"]["path"], "/api/user/checkin")
         self.assertEqual(site["checkin"]["headers"], [{"key": "X-Old", "value": "1"}])
-        self.assertTrue(site["checkin"]["solve_acw_sc_v2"])
         self.assertEqual(site["proxy"], "http://127.0.0.1:7890")
         self.assertEqual(site["last_quota"], 7.5)
         self.assertEqual(site["created_at"], "2026-07-01 00:00:00")
@@ -702,7 +746,6 @@ class VaultStorageTests(unittest.TestCase):
         self.assertEqual(first["checkin"]["path"], "/api/user/checkin")
         self.assertEqual(first["checkin"]["protocol"], "post")
         self.assertEqual(first["checkin"]["credential_id"], "c1")
-        self.assertTrue(first["checkin"]["solve_acw_sc_v2"])
 
         # Check-in history state survives.
         self.assertEqual(first["last_checkin_date"], "2026-08-19")
@@ -1066,6 +1109,84 @@ class CredentialRotationTests(unittest.TestCase):
         self.assertEqual(self._credential()["value"], "user_session=TYPED")
 
 
+class StoredOAuthSecretsTests(unittest.TestCase):
+    """A site the dashboard posts back regains the secrets it was never given.
+
+    Connection tests and probes build their adapter from that payload, and an
+    adapter without the stored session could only log in again.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db = DatabaseManager(Path(self.temp_dir.name) / "data.db")
+        self.db.save_sites([make_site()])
+        self.db.update_credential_session("site_1", "gh", "new_api_refresh=r1", "at-1", 1900000000)
+        self.db.update_credential_value("site_1", "gh", "user_session=ROTATED")
+        self.stored = self.db.get_sites()[0]["credentials"][1]
+
+    def tearDown(self) -> None:
+        try:
+            self.temp_dir.cleanup()
+        except OSError:
+            pass
+
+    def _merged_oauth(self, posted: dict) -> dict:
+        return self.db.merge_stored_oauth_secrets(posted)["credentials"][1]
+
+    def test_the_display_view_regains_the_session_and_token(self) -> None:
+        """What testSingleSite posts: the display view, secrets blanked."""
+        merged = self._merged_oauth(self.db.get_sites_for_display()[0])
+        self.assertEqual((merged["session_cookie"], merged["access_token"]), ("new_api_refresh=r1", "at-1"))
+
+    def test_the_editor_form_regains_every_withheld_field(self) -> None:
+        """What buildSitePayloadFromForm posts: an untouched OAuth cookie is
+        left out, and nothing is known about the station session at all."""
+        posted = self.db.get_sites_for_display()[0]
+        posted["credentials"][1] = {"id": "gh", "type": "github_oauth", "label": "", "tls_mldsa": False}
+        merged = self._merged_oauth(posted)
+        for field in (
+            "session_cookie", "session_updated_at", "access_token", "access_expires_at",
+            "value", "value_updated_at",
+        ):
+            self.assertEqual(merged[field], self.stored[field], field)
+        self.assertEqual(merged["value"], "user_session=ROTATED")
+
+    def test_what_the_caller_sent_is_kept(self) -> None:
+        posted = self.db.get_sites_for_display()[0]
+        posted["credentials"][1].update(
+            value="user_session=TYPED", session_cookie="session=mine", access_token="at-mine"
+        )
+        merged = self._merged_oauth(posted)
+        self.assertEqual(
+            (merged["value"], merged["session_cookie"], merged["access_token"]),
+            ("user_session=TYPED", "session=mine", "at-mine"),
+        )
+
+    def test_only_the_same_credential_is_filled_in(self) -> None:
+        """Matched by id and type, so no other login borrows this session."""
+        posted = self.db.get_sites_for_display()[0]
+        posted["credentials"][1]["type"] = "linuxdo_oauth"
+        posted["credentials"].append({"id": "gh_2", "type": "github_oauth", "value": "user_session=n"})
+        merged = self.db.merge_stored_oauth_secrets(posted)["credentials"][1:]
+        self.assertEqual([(c["session_cookie"], c["access_token"]) for c in merged], [("", ""), ("", "")])
+
+    def test_an_unsaved_site_comes_back_as_posted(self) -> None:
+        for site_id in ("", "site_unsaved"):
+            posted = make_site(id=site_id)
+            self.assertIs(self.db.merge_stored_oauth_secrets(posted), posted)
+
+    def test_the_posted_site_is_left_unmodified(self) -> None:
+        posted = self.db.get_sites_for_display()[0]
+        snapshot = json.loads(json.dumps(posted))
+        self.db.merge_stored_oauth_secrets(posted)
+        self.assertEqual(posted, snapshot)
+
+    def test_sealed_secrets_are_restored_while_unlocked(self) -> None:
+        self.db.enable_encryption()
+        merged = self._merged_oauth(self.db.get_sites_for_display()[0])
+        self.assertEqual((merged["session_cookie"], merged["access_token"]), ("new_api_refresh=r1", "at-1"))
+
+
 class LegacyVaultUpgradeTests(unittest.TestCase):
     """A vault created before key slots must keep working untouched."""
 
@@ -1307,7 +1428,9 @@ class HistoryCleanupTests(unittest.TestCase):
     def test_retention_days_prunes_by_age(self) -> None:
         self._set(history_retention_days=30)
         self._log("old", "2020-01-01 00:00:00")
-        self._log("new", "2026-08-20 08:00:00")
+        # Relative to now, like the cutoff: a fixed date would age out of the window.
+        recent = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        self._log("new", recent)
         self.assertEqual(self.db.count_history_logs(), 1)
         self.assertEqual(self.db.read_history_logs()[0]["report"], "new")
 

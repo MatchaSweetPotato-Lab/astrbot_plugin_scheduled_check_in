@@ -16,8 +16,9 @@ from core.adapters import (
     create_adapter,
     persist_writeback,
 )
+from core.http_client import RequestOptions
 from core.site_schema import ACTION_BALANCE, ACTION_CHECKIN, NEW_API_USER_HEADER, find_header
-from tests.fakes import FakeResponse, FakeSession
+from tests.fakes import FakeResponse, FakeSession, carries_mldsa
 
 BASE = "https://relay.example.com"
 
@@ -334,6 +335,15 @@ class NewApiCheckInTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertTrue(result.expired)
 
+    async def test_a_missing_new_api_user_is_not_an_expired_credential(self) -> None:
+        """What vsllm.cc answers a good token without the header, on every route."""
+        session = FakeSession({}, default=FakeResponse(
+            401, '{"success":false,"message":"无权进行此操作，未提供 New-Api-User"}'))
+        result = await create_adapter(make_site(), session).check_in()
+        self.assertFalse(result.success)
+        self.assertFalse(result.expired)
+        self.assertIn("New-Api-User", result.message)
+
     async def test_custom_path_is_the_only_candidate(self) -> None:
         session = FakeSession(
             {
@@ -525,14 +535,25 @@ class ProbeNewApiUserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(user_id, "")
         self.assertTrue(detail)
 
+    async def test_a_station_demanding_the_header_first_is_explained(self) -> None:
+        """vsllm.cc asks for New-Api-User on /api/user/self too, with a token
+        (2026-09-27): the id cannot be probed, and the token is fine."""
+        session = FakeSession({("GET", f"{BASE}/api/user/self"): FakeResponse(
+            401, '{"message":"Unauthorized, New-Api-User header not provided","success":false}')})
+        user_id, detail = await create_adapter(make_site(), session).probe_new_api_user_id()
+        self.assertEqual(user_id, "")
+        self.assertIn("手动填写", detail)
+        self.assertIn("New-Api-User header not provided", detail)
+        self.assertNotIn("已过期", detail)
+
     async def test_a_missing_credential_is_reported(self) -> None:
         session = FakeSession({})
         user_id, detail = await create_adapter(make_site(credentials=[]), session).probe_new_api_user_id()
         self.assertEqual(user_id, "")
         self.assertIn("凭据", detail)
 
-    async def test_an_oauth_credential_needs_no_header(self) -> None:
-        """Its session already identifies the user, so the header is redundant."""
+    async def test_an_oauth_credential_needs_no_manual_fetch(self) -> None:
+        """/api/user/self refuses the cookie without the header, so the id comes from the login."""
         site = make_site(credentials=[{"id": "gh", "type": "github_oauth", "value": "user_session=x",
                                       "session_cookie": "session=live"}])
         user_id, detail = await create_adapter(site, FakeSession({})).probe_new_api_user_id()
@@ -980,6 +1001,272 @@ class LoginAsCheckInTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.count_to(BASE), 0)
 
 
+class _StrictNewApiSession(FakeSession):
+    """Answers ``/api/user/self`` the way released New-API does for a session
+    cookie: 401 unless ``New-Api-User`` names the logged-in account."""
+
+    USER_ID = "2259"
+
+    def __init__(self, routes: dict, quotas: list[int]) -> None:
+        super().__init__(routes)
+        self.quotas = list(quotas)
+
+    async def request(self, method, url, **kwargs):
+        if not url.endswith("/api/user/self"):
+            return await super().request(method, url, **kwargs)
+        self.calls.append({"method": method, "url": url, **kwargs})
+        sent = [v for k, v in (kwargs.get("headers") or {}).items() if k.lower() == NEW_API_USER_HEADER]
+        if sent != [self.USER_ID]:
+            return FakeResponse(401, '{"success":false,"message":"无权进行此操作，未提供 New-Api-User"}')
+        return FakeResponse(200, self_payload(self.quotas.pop(0), int(self.USER_ID)))
+
+
+class OAuthNewApiUserTests(unittest.IsolatedAsyncioTestCase):
+    """An OAuth session cookie reads the balance only with New-Api-User beside it,
+    and the id can only be learned from the login response."""
+
+    @staticmethod
+    def _session(quotas: list[int]) -> _StrictNewApiSession:
+        routes = LoginAsCheckInTests._routes(None)
+        routes[("GET", f"{BASE}/api/oauth/github")] = FakeResponse(
+            200, '{"success":true,"data":{"id":2259,"username":"u"}}', cookies={"session": "fresh"}
+        )
+        return _StrictNewApiSession(routes, quotas)
+
+    async def test_a_login_check_in_reports_the_balance(self) -> None:
+        """The reported bug: the check-in succeeded but the balance stayed unknown."""
+        session = self._session([500000, 500000])
+        result = await create_adapter(LoginAsCheckInTests._site(), session).check_in()
+        self.assertTrue(result.success)
+        self.assertEqual(result.total_quota, 1.0)
+        self.assertEqual(session.count_to("/api/oauth/github"), 1)
+
+    async def test_the_id_is_written_back_for_later_runs(self) -> None:
+        adapter = create_adapter(LoginAsCheckInTests._site(), self._session([0, 0]))
+        await adapter.check_in()
+        self.assertEqual(find_header(adapter.writeback.balance_headers, NEW_API_USER_HEADER), "2259")
+
+    async def test_a_stored_id_reads_the_balance_without_logging_in(self) -> None:
+        session = self._session([1500000])
+        site = LoginAsCheckInTests._site(balance={"headers": [{"key": NEW_API_USER_HEADER, "value": "2259"}]})
+        quota, error = await create_adapter(site, session).query_balance()
+        self.assertEqual((quota, error), (3.0, ""))
+        self.assertEqual(session.count_to("/api/oauth/github"), 0)
+
+    async def test_the_later_run_measures_the_login_bonus(self) -> None:
+        """With the id stored, the opening read precedes the login, so the gain shows."""
+        session = self._session([500000, 1500000])
+        site = LoginAsCheckInTests._site(balance={"headers": [{"key": NEW_API_USER_HEADER, "value": "2259"}]})
+        result = await create_adapter(site, session).check_in()
+        self.assertEqual((result.total_quota, result.gained_quota), (3.0, 2.0))
+
+    async def test_a_stale_id_is_replaced_by_the_login(self) -> None:
+        """A header from another account would only ever fail as a mismatch."""
+        session = self._session([0, 0])
+        site = LoginAsCheckInTests._site(balance={"headers": [{"key": "New-Api-User", "value": "1"}]})
+        adapter = create_adapter(site, session)
+        result = await adapter.check_in()
+        self.assertEqual(result.error_detail, "")
+        self.assertEqual(find_header(adapter.writeback.balance_headers, NEW_API_USER_HEADER), "2259")
+        self.assertEqual(len(adapter.writeback.balance_headers), 1)
+
+    async def test_a_first_run_without_a_session_reads_both_balances(self) -> None:
+        session = self._session([500000, 1000000])
+        site = LoginAsCheckInTests._site(credential={"session_cookie": ""})
+        result = await create_adapter(site, session).check_in()
+        self.assertEqual((result.total_quota, result.gained_quota), (2.0, 1.0))
+        self.assertEqual(session.count_to("/api/oauth/github"), 1)
+
+    async def test_generic_sites_get_no_header(self) -> None:
+        session = self._session([])
+        adapter = create_adapter(LoginAsCheckInTests._site(type="generic_rest"), session)
+        await adapter.check_in()
+        self.assertIsNone(adapter.writeback.balance_headers)
+
+
+class _TokenNewApiSession(FakeSession):
+    """Behaves like New-API ``main``: the dashboard reads only a bearer token,
+    and ``/api/user/auth/refresh`` trades the refresh cookie for a new token,
+    rotating the cookie and revoking the session if a retired one comes back."""
+
+    def __init__(self, quotas: list[int], refresh: str = "sid.r1", valid_token: str = "") -> None:
+        routes = LoginAsCheckInTests._routes(None)
+        super().__init__(routes)
+        self.quotas = list(quotas)
+        self.refresh = refresh
+        self.valid_token = valid_token
+        self.issued = 0
+        self.revoked = False
+
+    def _issue(self) -> FakeResponse:
+        self.issued += 1
+        self.valid_token = f"at-{self.issued}"
+        self.refresh = f"sid.r{self.issued + 1}"
+        body = json.dumps({"success": True, "data": {
+            "access_token": self.valid_token, "token_type": "Bearer",
+            "access_expires_at": 4102444800, "user": {"id": 2259}}})
+        return FakeResponse(200, body, cookies={"new_api_refresh": self.refresh, "new_api_has_session": "1"})
+
+    async def request(self, method, url, **kwargs):
+        headers = kwargs.get("headers") or {}
+        if url.endswith("/api/oauth/github"):
+            self.calls.append({"method": method, "url": url, **kwargs})
+            self.revoked = False
+            return self._issue()
+        if url.endswith("/api/user/auth/refresh"):
+            self.calls.append({"method": method, "url": url, **kwargs})
+            if self.revoked or f"new_api_refresh={self.refresh}" not in headers.get("Cookie", ""):
+                self.revoked = True
+                return FakeResponse(401, '{"success":false,"code":"AUTH_SESSION_REVOKED"}')
+            return self._issue()
+        if url.endswith("/api/user/self"):
+            self.calls.append({"method": method, "url": url, **kwargs})
+            if not self.valid_token or headers.get("Authorization") != f"Bearer {self.valid_token}":
+                return FakeResponse(401, '{"success":false,"code":"AUTH_UNAUTHORIZED"}')
+            return FakeResponse(200, self_payload(self.quotas.pop(0), 2259))
+        return await super().request(method, url, **kwargs)
+
+
+class OAuthTokenSessionTests(unittest.IsolatedAsyncioTestCase):
+    """Stations that authenticate with an access token plus a refresh cookie."""
+
+    @staticmethod
+    def _site(**credential) -> dict:
+        return LoginAsCheckInTests._site(credential={
+            "session_cookie": "new_api_refresh=sid.r1; new_api_has_session=1",
+            "access_token": "at-old", "access_expires_at": 1_000_000_000,  # long expired
+            **credential,
+        })
+
+    async def test_a_login_writes_back_both_tokens(self) -> None:
+        session = _TokenNewApiSession([500000, 500000])
+        adapter = create_adapter(LoginAsCheckInTests._site(credential={"session_cookie": ""}), session)
+        result = await adapter.check_in()
+        self.assertEqual(result.total_quota, 1.0)
+        self.assertEqual(adapter.writeback.oauth_tokens["gh"], ("at-1", 4102444800))
+        self.assertIn("new_api_refresh=sid.r2", adapter.writeback.oauth_sessions["gh"])
+
+    async def test_an_expired_token_is_refreshed_instead_of_logging_in(self) -> None:
+        session = _TokenNewApiSession([1500000])
+        adapter = create_adapter(self._site(), session)
+        quota, error = await adapter.query_balance()
+        self.assertEqual((quota, error), (3.0, ""))
+        self.assertEqual(session.count_to("/api/oauth/github"), 0)
+        self.assertEqual(session.count_to("/api/user/auth/refresh"), 1)
+
+    async def test_the_rotated_refresh_cookie_is_written_back(self) -> None:
+        """The presented one is retired; replaying it would revoke the session."""
+        session = _TokenNewApiSession([0])
+        adapter = create_adapter(self._site(), session)
+        await adapter.query_balance()
+        self.assertEqual(session.count_to("/api/oauth/github"), 0)
+        self.assertIn("new_api_refresh=sid.r2", adapter.writeback.oauth_sessions["gh"])
+        self.assertEqual(adapter.writeback.oauth_tokens["gh"][0], "at-1")
+
+    async def test_a_valid_token_is_used_as_is(self) -> None:
+        session = _TokenNewApiSession([0], valid_token="at-live")
+        site = self._site(access_token="at-live", access_expires_at=4102444800)
+        quota, error = await create_adapter(site, session).query_balance()
+        self.assertEqual(error, "")
+        self.assertEqual(session.count_to("/api/user/auth/refresh"), 0)
+
+    async def test_the_login_check_in_measures_the_bonus(self) -> None:
+        """The refresh lets the opening read happen before the login."""
+        session = _TokenNewApiSession([500000, 1500000])
+        result = await create_adapter(self._site(), session).check_in()
+        self.assertEqual((result.total_quota, result.gained_quota), (3.0, 2.0))
+        sequence = [url.rsplit("/", 1)[-1] for url in session.urls()
+                    if url.endswith(("/refresh", "/api/oauth/github", "/self"))]
+        self.assertEqual(sequence, ["refresh", "self", "github", "self"])
+
+    async def test_a_revoked_session_falls_back_to_a_login(self) -> None:
+        session = _TokenNewApiSession([0], refresh="sid.other")
+        adapter = create_adapter(self._site(), session)
+        quota, error = await adapter.query_balance()
+        self.assertEqual(error, "")
+        self.assertEqual(session.count_to("/api/user/auth/refresh"), 1)
+        self.assertEqual(session.count_to("/api/oauth/github"), 1)
+
+    async def test_a_rejected_token_of_unknown_expiry_refreshes_first(self) -> None:
+        session = _TokenNewApiSession([0])
+        site = self._site(access_expires_at=0)
+        quota, error = await create_adapter(site, session).query_balance()
+        self.assertEqual(error, "")
+        self.assertEqual(session.count_to("/api/user/auth/refresh"), 1)
+        self.assertEqual(session.count_to("/api/oauth/github"), 0)
+
+    async def test_the_opening_read_refreshes_even_where_login_is_not_allowed(self) -> None:
+        session = _TokenNewApiSession([0])
+        quota, error = await create_adapter(self._site(), session).query_balance(allow_login=False)
+        self.assertEqual(error, "")
+        self.assertEqual(session.count_to("/api/oauth/github"), 0)
+
+    async def test_a_legacy_login_clears_a_stale_token(self) -> None:
+        """A cookie-session station issues no token; an old one must not linger."""
+        session = OAuthNewApiUserTests._session([0, 0])
+        adapter = create_adapter(LoginAsCheckInTests._site(credential={"access_token": "at-stale"}), session)
+        await adapter.check_in()
+        self.assertEqual(adapter.writeback.oauth_tokens["gh"], ("", 0))
+        self.assertNotIn("Authorization", session.calls_to("/api/user/self")[-1]["headers"])
+
+
+class MldsaRequestTests(unittest.IsolatedAsyncioTestCase):
+    """The global ML-DSA option covers every request of every site."""
+
+    MLDSA = RequestOptions(tls_mldsa=True)
+
+    async def test_check_in_and_its_balance_query_carry_it(self) -> None:
+        session = FakeSession({
+            ("GET", f"{BASE}/api/user/self"): FakeResponse(200, self_payload(0)),
+            ("POST", f"{BASE}/api/user/checkin"): FakeResponse(200, '{"success":true,"message":"ok"}'),
+        })
+        result = await create_adapter(make_site(), session, options=self.MLDSA).check_in()
+        self.assertTrue(result.success, result.message)
+        self.assertTrue(session.calls_to("/api/user/checkin") and session.calls_to("/api/user/self"))
+        self.assertTrue(all(carries_mldsa(call) for call in session.calls))
+
+    async def test_a_new_api_user_probe_carries_it(self) -> None:
+        session = FakeSession({
+            ("GET", f"{BASE}/api/quota"): FakeResponse(200, '{"data":{"quota":500000}}'),
+            ("GET", f"{BASE}/api/user/self"): FakeResponse(200, self_payload(0)),
+        })
+        site = make_site(balance={"path": "/api/quota"})
+        quota, error = await create_adapter(site, session, options=self.MLDSA).query_balance()
+        self.assertEqual((quota, error), (1.0, ""))
+        self.assertEqual(len(session.calls), 2)
+        self.assertTrue(all(carries_mldsa(call) for call in session.calls))
+
+    async def test_nothing_is_altered_by_default(self) -> None:
+        session = FakeSession({("GET", f"{BASE}/api/user/self"): FakeResponse(200, self_payload(0))})
+        await create_adapter(make_site(), session).query_balance()
+        self.assertIsNone(session.calls[0]["extra_fp"])
+
+    async def test_every_leg_of_an_oauth_login_carries_it(self) -> None:
+        session = FakeSession(OAuthCheckInTests._github_routes({
+            ("GET", f"{BASE}/api/user/self"): FakeResponse(200, self_payload(0)),
+        }))
+        site = make_site(
+            credentials=[{"id": "gh", "type": "github_oauth", "value": "user_session=gh"}],
+            checkin={"protocol": "oauth"},
+        )
+        result = await create_adapter(site, session, options=self.MLDSA).check_in()
+        self.assertTrue(result.success, result.message)
+        login = [call for call in session.calls
+                 if "/oauth" in call["url"] or call["url"].endswith("/api/status")]
+        self.assertEqual(len(login), 5)
+        self.assertTrue(all(carries_mldsa(call) for call in session.calls))
+
+    def test_per_site_flags_of_earlier_versions_are_dropped(self) -> None:
+        site = make_site(
+            credentials=[{"id": "gh", "type": "github_oauth", "value": "v", "tls_mldsa": True}],
+            checkin={"tls_mldsa": True, "solve_acw_sc_v2": True},
+        )
+        adapter = create_adapter(site, FakeSession({}))
+        self.assertNotIn("tls_mldsa", adapter.checkin)
+        self.assertNotIn("solve_acw_sc_v2", adapter.checkin)
+        self.assertNotIn("tls_mldsa", adapter.credentials[0])
+
+
 class AdapterFactoryTests(unittest.TestCase):
     def test_new_api_types_select_the_new_api_adapter(self) -> None:
         for site_type in ("new-api", "one-api", "", None, "mystery"):
@@ -1026,6 +1313,17 @@ class WritebackTests(unittest.TestCase):
         persist_writeback(db, "s", writeback)
         self.assertEqual([entry[1] for entry in db.headers], [ACTION_CHECKIN, ACTION_BALANCE])
         self.assertEqual(db.sessions, [("s", "gh", "session=a")])
+
+    def test_tokens_travel_with_their_session(self) -> None:
+        calls = []
+
+        class Db:
+            def update_credential_session(self, *a): calls.append(a); return True
+
+        persist_writeback(Db(), "s", SiteWriteback(
+            oauth_sessions={"gh": "new_api_refresh=r"}, oauth_tokens={"gh": ("at", 123)},
+        ))
+        self.assertEqual(calls, [("s", "gh", "new_api_refresh=r", "at", 123)])
 
     def test_storage_errors_do_not_escape(self) -> None:
         """A locked vault must not turn a successful check-in into a crash."""

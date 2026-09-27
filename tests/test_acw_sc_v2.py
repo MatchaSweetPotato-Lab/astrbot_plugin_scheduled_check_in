@@ -16,6 +16,7 @@ from core.acw_sc_v2 import (
     translate_acw_sc_v2,
 )
 from core.adapters import GenericRestAdapter
+from core.http_client import RequestOptions
 
 ARG1 = "E516FCBA86E9AA50575BDFB0211588E628A0053F"
 PERMUTATION = (
@@ -192,7 +193,6 @@ class ChallengeAwareRequestTests(unittest.IsolatedAsyncioTestCase):
                 "path": "/api/user/sign_in",
                 "protocol": "get",
                 "headers": [{"key": "cookie", "value": "custom=header-value"}],
-                "solve_acw_sc_v2": True,
             },
             "balance": {},
             "enabled": True,
@@ -249,8 +249,8 @@ class ChallengeAwareRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertTrue(result.expired)
 
-    async def test_the_solver_flag_is_per_action(self) -> None:
-        """A challenge is only solved for the action that opted in."""
+    async def test_the_global_switch_turns_solving_off(self) -> None:
+        """Solving is on for every site unless the global setting turns it off."""
         session = _FakeSession([_FakeResponse(200, make_challenge(), {"acw_tc": "tc"})])
         config = {
             "id": "site-3",
@@ -258,18 +258,26 @@ class ChallengeAwareRequestTests(unittest.IsolatedAsyncioTestCase):
             "type": "generic_rest",
             "base_url": "https://example.test",
             "credentials": [{"id": "c1", "type": "cookie", "value": "session=v"}],
-            "checkin": {"path": "/sign", "protocol": "get", "solve_acw_sc_v2": True},
-            "balance": {"path": "/me", "protocol": "get", "solve_acw_sc_v2": False},
+            "checkin": {"path": "/sign", "protocol": "get"},
+            "balance": {"path": "/me", "protocol": "get"},
             "enabled": True,
         }
-        adapter = GenericRestAdapter(config, session)  # type: ignore[arg-type]
+        options = RequestOptions.from_settings({"acw_sc_v2_auto_solve": False})
+        adapter = GenericRestAdapter(config, session, None, None, options)  # type: ignore[arg-type]
 
         quota, error = await adapter.query_balance()
 
-        # Only one request: the balance action never retries the challenge.
+        # Only one request: the challenge is reported, not retried.
         self.assertEqual(len(session.requests), 1)
         self.assertEqual(quota, 0.0)
         self.assertIn("WAF", error)
+
+    def test_solving_is_on_by_default(self) -> None:
+        from core.storage import DEFAULT_SETTINGS
+
+        self.assertTrue(RequestOptions().solve_acw_sc_v2)
+        self.assertTrue(RequestOptions.from_settings({}).solve_acw_sc_v2)
+        self.assertTrue(RequestOptions.from_settings(DEFAULT_SETTINGS).solve_acw_sc_v2)
 
 
 if __name__ == "__main__":

@@ -2,9 +2,10 @@
 
 Every request is driven by two things the user configures per site: a
 **credential list** and an **action config** (one for check-in, one for balance).
-An action names a path, a protocol, an optional credential, extra headers, and
-whether to solve Aliyun's ``acw_sc__v2`` challenge. Leaving the path or protocol
-empty falls back to what the site's framework is known to expose.
+An action names a path, a protocol, an optional credential and extra headers.
+Leaving the path or protocol empty falls back to what the site's framework is
+known to expose. Solving Aliyun's ``acw_sc__v2`` challenge and adding ML-DSA to
+TLS handshakes are global settings (:class:`RequestOptions`), not per site.
 
 Runtime discoveries that belong in the config — a probed ``new-api-user`` id, a
 session cookie won by an OAuth login — are collected in ``SiteWriteback`` and
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,7 +26,19 @@ from urllib.parse import urlsplit, urlunsplit
 from curl_cffi.requests import AsyncSession
 
 from .acw_sc_v2 import AcwScV2Error, AcwScV2SolverCache, is_acw_sc_v2_challenge
-from .http_client import normalize_impersonate
+from .browser import BrowserRequest
+from .cloudflare import (
+    CloudflareContext,
+    is_cloudflare_challenge,
+    is_response_challenge,
+)
+from .http_client import (
+    MLDSA_ADDED,
+    RequestOptions,
+    mldsa_extra_fp,
+    mldsa_support,
+    normalize_impersonate,
+)
 from .oauth import OAuthLoginClient
 from .site_schema import (
     ACTION_BALANCE,
@@ -39,7 +53,10 @@ from .site_schema import (
     SITE_TYPE_GENERIC,
     SITE_TYPE_NEW_API,
     credential_label,
+    find_credential,
+    find_header,
     headers_to_mapping,
+    holds_refresh_cookie,
     normalize_action,
     normalize_credentials,
     normalize_site_type,
@@ -47,11 +64,16 @@ from .site_schema import (
     upsert_header,
     wants_new_api_user_probe,
 )
+from .task_schema import task_label
 
 logger = logging.getLogger("astrbot")
 
 # Standard conversion: 1 USD = 500,000 raw quota points in One-API / New-API
 QUOTA_CONVERSION_FACTOR = 500000.0
+
+# Seconds before its stated expiry an access token is already renewed, so one
+# does not lapse between the check and the request.
+_ACCESS_TOKEN_MARGIN = 60
 
 # Bounds on the per-run request trace. Traces are stored in history, so they
 # must not be allowed to grow without limit.
@@ -111,6 +133,9 @@ class SiteWriteback:
     checkin_headers: list[dict[str, str]] | None = None
     balance_headers: list[dict[str, str]] | None = None
     oauth_sessions: dict[str, str] = field(default_factory=dict)
+    # Access token and its expiry (unix seconds) issued with each of those
+    # sessions, keyed alike. An empty token clears a stale one.
+    oauth_tokens: dict[str, tuple[str, int]] = field(default_factory=dict)
     # Provider cookies the upstream rotated during a login, keyed by credential
     # id. Storing them keeps the next run from replaying a retired session.
     credential_values: dict[str, str] = field(default_factory=dict)
@@ -142,7 +167,11 @@ def persist_writeback(db: Any, site_id: str, writeback: SiteWriteback | None) ->
         if writeback.balance_headers is not None:
             db.update_action_headers(site_id, ACTION_BALANCE, writeback.balance_headers)
         for credential_id, session_cookie in writeback.oauth_sessions.items():
-            db.update_credential_session(site_id, credential_id, session_cookie)
+            token = writeback.oauth_tokens.get(credential_id)
+            if token is None:
+                db.update_credential_session(site_id, credential_id, session_cookie)
+            else:
+                db.update_credential_session(site_id, credential_id, session_cookie, *token)
         for credential_id, value in writeback.credential_values.items():
             db.update_credential_value(site_id, credential_id, value)
     except Exception as exc:
@@ -157,6 +186,20 @@ class _TextResponse:
     text: str
     challenge_error: str = ""
     challenge_solved: bool = False
+    # A Cloudflare challenge that fingerprint screening did not get past, and
+    # what was tried against it.
+    cloudflare: bool = False
+    cloudflare_detail: str = ""
+
+    @property
+    def new_api_user_refused(self) -> bool:
+        """A New-API refusal over the ``New-Api-User`` header, not the credential.
+
+        New-API checks the header on every user route, ``/api/user/self``
+        included, and answers a missing, malformed or mismatched one with 401,
+        which says nothing about whether the token or cookie is still good.
+        """
+        return self.status in (401, 403) and NEW_API_USER_HEADER in self.text.lower()
 
 
 @dataclass
@@ -185,6 +228,8 @@ class BaseCheckInAdapter(ABC):
         site_config: dict[str, Any],
         session: AsyncSession,
         acw_cache_file: Path | None = None,
+        cloudflare: CloudflareContext | None = None,
+        options: RequestOptions | None = None,
     ) -> None:
         """Initialize site adapter.
 
@@ -192,10 +237,15 @@ class BaseCheckInAdapter(ABC):
             site_config: Configuration dictionary for the target site.
             session: Active curl_cffi AsyncSession instance.
             acw_cache_file: Optional persistent translated-algorithm cache path.
+            cloudflare: The run's Cloudflare context, shared by every adapter
+                on ``session``. Without one a challenge is only reported.
+            options: The global request settings (ML-DSA, acw_sc__v2 solving).
         """
         self.config = site_config
         self.session = session
         self.impersonate = normalize_impersonate(getattr(session, "impersonate", None))
+        self.cloudflare = cloudflare
+        self.options = options or RequestOptions()
         self.site_id: str = str(site_config.get("id") or "")
         self.site_name: str = str(site_config.get("name") or "")
         self.site_type: str = normalize_site_type(site_config.get("type"))
@@ -214,8 +264,13 @@ class BaseCheckInAdapter(ABC):
         # Sessions won by a fresh login during this run, keyed by credential id.
         # A second login in the same run would be a duplicate sign-in attempt.
         self._fresh_sessions: dict[str, str] = {}
+        # Credentials whose access token was already refreshed (or tried) this run.
+        self._refresh_tried: set[str] = set()
         # Request trace for the current run, attached to the result.
         self.attempts: list[dict[str, Any]] = []
+        # Set once a Cloudflare challenge outlasted fingerprint screening this
+        # run, so the resulting failure is not mistaken for a dead credential.
+        self._cloudflare_blocked = False
 
     # ------------------------------------------------------------------
     # Request tracing
@@ -390,16 +445,9 @@ class BaseCheckInAdapter(ABC):
             headers["Cookie"] = value
         return headers
 
-    async def _oauth_login(self, credential: dict[str, Any]) -> tuple[str, str]:
-        """Run an OAuth login and remember the resulting session cookie.
-
-        Args:
-            credential: OAuth credential holding the third-party cookie.
-
-        Returns:
-            Tuple of ``(session_cookie, error_message)``.
-        """
-        client = OAuthLoginClient(
+    def _oauth_client(self) -> OAuthLoginClient:
+        """Build the client that logs a credential in or refreshes its token."""
+        return OAuthLoginClient(
             self.session,
             self.base_url,
             self.impersonate,
@@ -407,8 +455,42 @@ class BaseCheckInAdapter(ABC):
             # Record every leg, so a login failure is visible in the log detail
             # view instead of collapsing into a one-line message.
             on_attempt=self._record_attempt,
+            cloudflare=self.cloudflare,
+            mldsa=self.options.tls_mldsa,
         )
-        result = await client.login(str(credential.get("type") or ""), credential.get("value"))
+
+    def _store_station_session(
+        self,
+        credential: dict[str, Any],
+        session_cookie: str,
+        access_token: str,
+        access_expires_at: int,
+    ) -> None:
+        """Hold a login's or refresh's station secrets and queue their writeback.
+
+        The token is always written alongside the cookie, even when empty: a
+        login that issued none supersedes whatever token an earlier one left.
+        """
+        credential["session_cookie"] = session_cookie
+        credential["access_token"] = access_token
+        credential["access_expires_at"] = access_expires_at if access_token else 0
+        credential_id = str(credential.get("id") or "")
+        if credential_id:
+            self.writeback.oauth_sessions[credential_id] = session_cookie
+            self.writeback.oauth_tokens[credential_id] = (access_token, credential["access_expires_at"])
+
+    async def _oauth_login(self, credential: dict[str, Any]) -> tuple[str, str]:
+        """Run an OAuth login and remember the resulting station session.
+
+        Args:
+            credential: OAuth credential holding the third-party cookie.
+
+        Returns:
+            Tuple of ``(session_cookie, error_message)``.
+        """
+        result = await self._oauth_client().login(
+            str(credential.get("type") or ""), credential.get("value")
+        )
 
         # Persist a rotated provider cookie whether or not the login succeeded:
         # the provider may have moved the session on before rejecting, and
@@ -421,12 +503,73 @@ class BaseCheckInAdapter(ABC):
 
         if not result.success:
             return "", result.message
-        credential["session_cookie"] = result.session_cookie
+        if result.user_id:
+            # Authoritative for this session, whatever a header says.
+            self._new_api_user_id = result.user_id
+        self._store_station_session(
+            credential, result.session_cookie, result.access_token, result.access_expires_at
+        )
         credential_id = str(credential.get("id") or "")
         if credential_id:
-            self.writeback.oauth_sessions[credential_id] = result.session_cookie
             self._fresh_sessions[credential_id] = result.session_cookie
         return result.session_cookie, ""
+
+    def _can_refresh(self, credential: dict[str, Any]) -> bool:
+        """Whether the held session can mint an access token without a login.
+
+        Only sessions holding a refresh cookie qualify, and each credential is
+        refreshed at most once per run — a refresh that failed will not succeed
+        a moment later, and every attempt burns the refresh token it presents.
+        """
+        if str(credential.get("id") or "") in self._refresh_tried:
+            return False
+        return holds_refresh_cookie(credential.get("session_cookie"))
+
+    def _token_needs_refresh(self, credential: dict[str, Any]) -> bool:
+        """Whether a renewable access token is missing or about to expire."""
+        if not self._can_refresh(credential):
+            return False
+        if not str(credential.get("access_token") or "").strip():
+            return True
+        expires_at = int(credential.get("access_expires_at") or 0)
+        return bool(expires_at) and expires_at - _ACCESS_TOKEN_MARGIN <= time.time()
+
+    async def _refresh_access_token(self, credential: dict[str, Any]) -> bool:
+        """Mint a new access token from the stored refresh cookie.
+
+        Unlike a login this never consumes a login-granted daily bonus, so it
+        is allowed even where logging in is not.
+
+        Returns:
+            Whether a new token is now held.
+        """
+        self._refresh_tried.add(str(credential.get("id") or ""))
+        session_cookie = self._clean_credential_value(credential.get("session_cookie"))
+        result = await self._oauth_client().refresh(session_cookie)
+        if result.user_id:
+            self._new_api_user_id = result.user_id
+        if result.success:
+            self._store_station_session(
+                credential, result.session_cookie, result.access_token, result.access_expires_at
+            )
+            return True
+        if result.session_cookie and result.session_cookie != session_cookie:
+            # Rejected, but the station rotated the cookie anyway; keep that.
+            self._store_station_session(credential, result.session_cookie, "", 0)
+        logger.info("Access token refresh for %s failed: %s", self.site_name, result.message)
+        return False
+
+    def _session_headers(self, credential: dict[str, Any]) -> dict[str, str]:
+        """Auth headers for a held station session: its cookie and any bearer token."""
+        headers: dict[str, str] = {}
+        session_cookie = self._clean_credential_value(credential.get("session_cookie"))
+        if session_cookie:
+            headers["Cookie"] = session_cookie
+        access_token = self._clean_credential_value(credential.get("access_token"))
+        if access_token:
+            # Newer New-API builds ignore the cookie and read only this.
+            headers["Authorization"] = f"Bearer {access_token}"
+        return headers
 
     async def _authenticate(
         self,
@@ -449,6 +592,7 @@ class BaseCheckInAdapter(ABC):
             allow_login: When False, refuse to log in rather than doing so.
                 Used for the opening balance read of a login-style check-in, so
                 that reading the balance cannot consume the day's sign-in.
+                Refreshing an expired access token is still allowed.
         """
         plan = resolve_action_credential(self.credentials, action)
         headers = self._base_headers()
@@ -466,6 +610,10 @@ class BaseCheckInAdapter(ABC):
             already_fresh = bool(credential_id) and credential_id in self._fresh_sessions
             if session_cookie and (already_fresh or not force_login):
                 reused = not already_fresh
+                if self._token_needs_refresh(credential):
+                    # A failure falls through: the request then answers 401,
+                    # and that path logs in again where logging in is allowed.
+                    await self._refresh_access_token(credential)
             elif not allow_login:
                 return _AuthContext(
                     headers=headers,
@@ -474,10 +622,10 @@ class BaseCheckInAdapter(ABC):
                     oauth=True,
                 )
             else:
-                session_cookie, error = await self._oauth_login(credential)
+                _, error = await self._oauth_login(credential)
                 if error:
                     return _AuthContext(headers=headers, error=error, credential=credential, oauth=True)
-            headers["Cookie"] = session_cookie
+            headers.update(self._session_headers(credential))
         else:
             auth_headers = self._credential_headers(credential)
             if not auth_headers:
@@ -486,24 +634,57 @@ class BaseCheckInAdapter(ABC):
             headers.update(auth_headers)
 
         headers.update(headers_to_mapping(action.get("headers")))
-        return _AuthContext(
+        context = _AuthContext(
             headers=headers,
             credential=credential,
             oauth=plan.mode == "oauth",
             reused_session=reused,
         )
+        if context.oauth:
+            self._apply_oauth_user(action, context)
+        return context
 
     async def _refresh_oauth(self, auth: _AuthContext, action: dict[str, Any]) -> _AuthContext:
-        """Re-run the OAuth login after a stored session cookie was rejected."""
-        if auth.credential is None:
+        """Renew a stored station session the station just rejected.
+
+        A refresh cookie is tried first, since renewing the access token is
+        cheaper than a login and never consumes a login-granted bonus; the
+        login runs only when there is none or it failed too.
+        """
+        credential = auth.credential
+        if credential is None:
             return auth
-        session_cookie, error = await self._oauth_login(auth.credential)
-        if error:
-            return _AuthContext(headers=auth.headers, error=error, credential=auth.credential, oauth=True)
+        refreshed = self._can_refresh(credential) and await self._refresh_access_token(credential)
+        if not refreshed:
+            _, error = await self._oauth_login(credential)
+            if error:
+                return _AuthContext(headers=auth.headers, error=error, credential=credential, oauth=True)
         headers = self._base_headers()
-        headers["Cookie"] = session_cookie
+        headers.update(self._session_headers(credential))
         headers.update(headers_to_mapping(action.get("headers")))
-        return _AuthContext(headers=headers, credential=auth.credential, oauth=True)
+        context = _AuthContext(headers=headers, credential=credential, oauth=True)
+        self._apply_oauth_user(action, context)
+        return context
+
+    def _apply_oauth_user(self, action: dict[str, Any], auth: _AuthContext) -> None:
+        """Send the account id alongside an OAuth session cookie.
+
+        New-API refuses a cookie-authenticated dashboard request without a
+        matching ``new-api-user`` header, and ``/api/user/self`` cannot be asked
+        for the id without it either, so the id comes from the login response.
+        It is written back, so later runs reusing the session carry it too. A
+        header left over from another account would only fail as a mismatch,
+        so the login's id replaces it.
+        """
+        if not self._new_api_user_id or self.site_type != SITE_TYPE_NEW_API:
+            return
+        # An explicit GET/POST protocol means the user owns the headers.
+        if action.get("protocol") not in (PROTOCOL_AUTO, PROTOCOL_OAUTH):
+            return
+        if find_header(action.get("headers"), NEW_API_USER_HEADER).strip() == self._new_api_user_id:
+            return
+        action_name = ACTION_CHECKIN if action is self.checkin else ACTION_BALANCE
+        self._apply_new_api_user(action, action_name, auth)
 
     def _action_url(self, action: dict[str, Any], default_path: str = "") -> str:
         """Resolve an action's target URL, honouring an absolute custom path."""
@@ -546,21 +727,110 @@ class BaseCheckInAdapter(ABC):
         merged_headers["Cookie"] = "; ".join(f"{name}={value}" for name, value in cookies.items())
         return merged_headers
 
+    def _impersonate_for(self, url: str) -> str:
+        """Fingerprint for ``url``: one Cloudflare let through this run, else the configured one."""
+        if self.cloudflare is None:
+            return self.impersonate
+        return self.cloudflare.impersonate_for(url, self.impersonate)
+
+    async def _send(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        impersonate: str | None = None,
+        body: str | None = None,
+    ) -> Any:
+        """Issue one raw request with the site's proxy and fingerprint.
+
+        ML-DSA is added to the TLS handshake when the global option asks for
+        it and the fingerprint lacks it.
+
+        Args:
+            body: Request body, sent as UTF-8 exactly as given.
+        """
+        profile = impersonate or self._impersonate_for(url)
+        extra: dict[str, Any] = {}
+        if body is not None:
+            extra["data"] = body.encode("utf-8")
+        return await self.session.request(
+            method,
+            url,
+            headers=headers,
+            proxy=self.proxy,
+            impersonate=profile,
+            extra_fp=mldsa_extra_fp(profile, self.options.tls_mldsa),
+            **extra,
+        )
+
+    def _record_cloudflare(self, step: str, method: str, url: str, **fields: Any) -> None:
+        """Trace callback in the shape the Cloudflare context calls."""
+        self._record_attempt(step=step, method=method, endpoint=url, **fields)
+
+    async def _send_past_cloudflare(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: str | None = None,
+    ) -> tuple[Any, str]:
+        """Issue a request, letting the run's Cloudflare context retry a challenge.
+
+        Returns:
+            Tuple of the final response and, when a challenge survived, what
+            was tried against it.
+        """
+        mldsa = self.options.tls_mldsa
+        impersonate = self._impersonate_for(url)
+        response = await self._send(method, url, headers, impersonate, body)
+        detail = ""
+        if self.cloudflare is not None:
+            resolution = await self.cloudflare.resolve(
+                method=method,
+                url=url,
+                response=response,
+                impersonate=impersonate,
+                send=lambda profile: self._send(method, url, headers, profile, body),
+                record=self._record_cloudflare,
+                mldsa=mldsa,
+                browser_request=BrowserRequest(
+                    method,
+                    url,
+                    dict(headers),
+                    body=body,
+                    proxy=self.proxy,
+                    verify=getattr(self.session, "verify", True) is not False,
+                ),
+            )
+            response, detail = resolution.response, resolution.detail
+        if (
+            not mldsa
+            and mldsa_support(impersonate) == MLDSA_ADDED
+            and is_response_challenge(response)
+        ):
+            # The remedy is a global setting.
+            hint = f"{impersonate} 的 TLS 握手未携带 ML-DSA，可在「全局设置 → 网络与常规」开启「TLS 携带 ML-DSA」"
+            detail = f"{detail}；{hint}" if detail else hint
+        return response, detail
+
     async def _request_text(
         self,
         method: str,
         url: str,
         headers: dict[str, str],
-        solve_challenge: bool = False,
+        body: str | None = None,
     ) -> _TextResponse:
-        """Request text and optionally solve one inline ``acw_sc__v2`` challenge."""
+        """Request text, solving one inline ``acw_sc__v2`` challenge if one comes back.
+
+        Both follow the global settings: whether an Aliyun ``acw_sc__v2``
+        challenge is solved, and whether ML-DSA goes into every attempt's TLS
+        handshake, retries included. Cloudflare challenges are handled
+        regardless; the run's Cloudflare context decides whether to retry
+        other fingerprints.
+        """
         request_headers = self._merge_challenge_cookies(headers)
-        response = await self.session.request(
-            method,
-            url,
-            headers=request_headers,
-            proxy=self.proxy,
-            impersonate=self.impersonate,
+        response, cloudflare_detail = await self._send_past_cloudflare(
+            method, url, request_headers, body
         )
         status = response.status_code
         text = response.text
@@ -569,8 +839,13 @@ class BaseCheckInAdapter(ABC):
             for name, value in response.cookies.items()
         }
 
-        if not solve_challenge or not is_acw_sc_v2_challenge(text):
-            return _TextResponse(status=status, text=text)
+        if not self.options.solve_acw_sc_v2 or not is_acw_sc_v2_challenge(text):
+            return _TextResponse(
+                status=status,
+                text=text,
+                cloudflare=is_cloudflare_challenge(status, text, getattr(response, "headers", None)),
+                cloudflare_detail=cloudflare_detail,
+            )
 
         try:
             solution = self._acw_solver.solve(text)
@@ -588,13 +863,7 @@ class BaseCheckInAdapter(ABC):
             "cache hit" if solution.cache_hit else "translated",
         )
 
-        retry_response = await self.session.request(
-            method,
-            url,
-            headers=retry_headers,
-            proxy=self.proxy,
-            impersonate=self.impersonate,
-        )
+        retry_response = await self._send(method, url, retry_headers, body=body)
         retry_status = retry_response.status_code
         retry_text = retry_response.text
         for name, value in retry_response.cookies.items():
@@ -619,6 +888,7 @@ class BaseCheckInAdapter(ABC):
         auth: _AuthContext,
         action: dict[str, Any],
         step: str = "请求",
+        body: str | None = None,
     ) -> tuple[_TextResponse, _AuthContext]:
         """Perform an action request, re-logging in once if a session expired.
 
@@ -628,9 +898,14 @@ class BaseCheckInAdapter(ABC):
         Returns:
             Tuple of the response and the (possibly refreshed) auth context.
         """
-        solve = action.get("solve_acw_sc_v2", False)
-        response = await self._traced_request(method, url, auth.headers, solve, step)
-        if response.status not in (401, 403) or not (auth.oauth and auth.reused_session):
+        response = await self._traced_request(method, url, auth.headers, step, body)
+        # A challenge says nothing about the session, so logging in again would
+        # only spend the credential on a request the firewall still blocks.
+        if (
+            response.status not in (401, 403)
+            or not (auth.oauth and auth.reused_session)
+            or response.cloudflare
+        ):
             return response, auth
 
         logger.info("Stored OAuth session for %s expired; logging in again.", self.site_name)
@@ -638,7 +913,7 @@ class BaseCheckInAdapter(ABC):
         if not refreshed.ok:
             return response, refreshed
         retried = await self._traced_request(
-            method, url, refreshed.headers, solve, f"{step}（重新登录后）"
+            method, url, refreshed.headers, f"{step}（重新登录后）", body
         )
         return retried, refreshed
 
@@ -647,12 +922,12 @@ class BaseCheckInAdapter(ABC):
         method: str,
         url: str,
         headers: dict[str, str],
-        solve_challenge: bool,
         step: str,
+        body: str | None = None,
     ) -> _TextResponse:
         """Issue one request and record it in the run's trace."""
         try:
-            response = await self._request_text(method, url, headers, solve_challenge)
+            response = await self._request_text(method, url, headers, body)
         except Exception as exc:
             self._record_attempt(
                 step=step, method=method, endpoint=url, message=f"请求异常: {exc}", error=str(exc)
@@ -661,6 +936,11 @@ class BaseCheckInAdapter(ABC):
 
         if is_acw_sc_v2_challenge(response.text):
             message = self._waf_message(response)
+        elif response.cloudflare:
+            self._cloudflare_blocked = True
+            message = self._cloudflare_message(response)
+        elif response.new_api_user_refused:
+            message = self._new_api_user_message(response)
         elif response.status in (401, 403):
             message = "鉴权失败：凭据无效或已过期 (401/403)"
         else:
@@ -684,6 +964,27 @@ class BaseCheckInAdapter(ABC):
         return "被站点 WAF 防火墙拦截 (Aliyun WAF JS Challenge)"
 
     @staticmethod
+    def _cloudflare_message(response: _TextResponse) -> str:
+        """Describe a Cloudflare challenge that fingerprint screening did not get past."""
+        message = f"被 Cloudflare 人机验证拦截 (HTTP {response.status})，并非凭据失效"
+        if response.cloudflare_detail:
+            message += f"；{response.cloudflare_detail}"
+        return message
+
+    @classmethod
+    def _new_api_user_message(cls, response: _TextResponse) -> str:
+        """Describe a refusal over the New-Api-User header.
+
+        Worded without the status code on purpose: callers read a "401" in a
+        balance error as an expired credential, which this is not.
+        """
+        station = cls._response_message(None, response.text)
+        return (
+            f"站点拒绝了 New-Api-User 请求头（{station or '缺失或与账号不符'}），并非凭据失效："
+            "请在该操作的请求头中填写账号的数字用户 ID"
+        )
+
+    @staticmethod
     def _looks_like_html(text: str) -> bool:
         """Return whether a body is an HTML page rather than an API response."""
         lowered = text.lower()
@@ -693,6 +994,10 @@ class BaseCheckInAdapter(ABC):
         """Parse a JSON body, returning a human-readable error instead of raising."""
         if is_acw_sc_v2_challenge(response.text):
             return None, self._waf_message(response)
+        if response.cloudflare:
+            return None, self._cloudflare_message(response)
+        if response.new_api_user_refused:
+            return None, self._new_api_user_message(response)
         if response.status in (401, 403):
             return None, "鉴权失败：凭据无效或已过期 (401/403)"
         if self._looks_like_html(response.text):
@@ -717,9 +1022,10 @@ class BaseCheckInAdapter(ABC):
         """Fill in the ``new-api-user`` header by asking the station who we are.
 
         Only runs for New-API sites that follow the framework protocol and have
-        no such header yet. OAuth actions are excluded: their session cookie
-        already identifies the user. The id is probed at most once per run and
-        then shared with the other action.
+        no such header yet. OAuth actions are excluded: ``/api/user/self``
+        refuses their session cookie without this very header, so their id
+        comes from the login response instead (see ``_apply_oauth_user``). The
+        id is probed at most once per run and then shared with the other action.
         """
         if auth.oauth or not wants_new_api_user_probe(self.config, action):
             return
@@ -731,9 +1037,7 @@ class BaseCheckInAdapter(ABC):
             if self._action_url(action, self._default_balance_path()) == self._self_url():
                 return
             try:
-                response = await self._request_text(
-                    "GET", self._self_url(), auth.headers, action.get("solve_acw_sc_v2", False)
-                )
+                response = await self._request_text("GET", self._self_url(), auth.headers)
             except Exception as exc:
                 logger.debug(f"Could not probe new-api-user for {self.site_name}: {exc}")
                 return
@@ -764,7 +1068,7 @@ class BaseCheckInAdapter(ABC):
         if not auth.ok:
             return "", auth.error
         if auth.oauth:
-            return "", "OAuth 凭据的会话本身已标识用户，无需 new-api-user"
+            return "", "OAuth 凭据的用户 ID 会在登录时自动写入 new-api-user，无需手动获取"
 
         try:
             response, auth = await self._request_action(
@@ -777,6 +1081,14 @@ class BaseCheckInAdapter(ABC):
         except Exception as exc:
             return "", f"请求 {_NEW_API_SELF_PATH} 失败: {exc}"
 
+        if response.new_api_user_refused:
+            # The id cannot be learnt from the credential alone: the station
+            # demands it before answering, and the refusal does not name it.
+            return "", (
+                f"站点的 {_NEW_API_SELF_PATH} 本身也要求 New-Api-User 请求头"
+                f"（{self._response_message(None, response.text) or '缺失或与账号不符'}），"
+                "无法凭该凭据自动获取用户 ID，请手动填写账号的数字用户 ID"
+            )
         payload, error = self._parse_json(response)
         if error or payload is None:
             return "", error or "响应无法解析"
@@ -805,6 +1117,9 @@ class BaseCheckInAdapter(ABC):
         """Write the cached user id into an action's headers and the writeback."""
         headers = upsert_header(action.get("headers"), NEW_API_USER_HEADER, self._new_api_user_id)
         action["headers"] = headers
+        # Drop any differently-cased copy, or both would be sent.
+        for name in [name for name in auth.headers if name.lower() == NEW_API_USER_HEADER.lower()]:
+            del auth.headers[name]
         auth.headers[NEW_API_USER_HEADER] = self._new_api_user_id
         if action_name == ACTION_CHECKIN:
             self.writeback.checkin_headers = headers
@@ -905,6 +1220,73 @@ class BaseCheckInAdapter(ABC):
             return 0.0, "余额响应中未找到额度字段"
         return quota, ""
 
+    # ------------------------------------------------------------------
+    # Scheduled tasks
+    # ------------------------------------------------------------------
+    async def run_task(self, task: dict[str, Any]) -> CheckInResult:
+        """Send one scheduled task's request.
+
+        It goes out like the site's own requests — proxy, fingerprint,
+        Cloudflare handling, acw_sc__v2 solving — with the credential the task
+        names, if any, and its headers applied last. Any 2xx answer counts as
+        success; the response is kept in the trace either way.
+
+        Args:
+            task: A normalized task (see core/task_schema.py).
+
+        Returns:
+            The run's result, named after the site and the task.
+        """
+        label = task_label(task)
+        step = f"定时任务「{label}」"
+        method = "POST" if task.get("method") == "POST" else "GET"
+        url = self._action_url({"path": task.get("url")})
+        body_text = str(task.get("body") or "")
+        body = body_text if method == "POST" and body_text.strip() else None
+        # An explicit verb keeps the New-API user id of an OAuth login out of
+        # the headers, which belong to the task.
+        action = {
+            "protocol": method.lower(),
+            "credential_id": str(task.get("credential_id") or ""),
+            "headers": list(task.get("headers") or []),
+        }
+
+        def result(success: bool, message: str, expired: bool = False) -> CheckInResult:
+            outcome = self._result(success, message, expired=expired, detail_on_success=True)
+            outcome.site_name = f"{self.site_name} · {label}"
+            return outcome
+
+        if action["credential_id"]:
+            if find_credential(self.credentials, action["credential_id"]) is None:
+                return result(False, "任务使用的凭据已被删除，请在任务中重新选择")
+            auth = await self._authenticate(action)
+            if not auth.ok:
+                return result(False, auth.error, expired=True)
+        else:
+            headers = self._base_headers()
+            headers.update(headers_to_mapping(action["headers"]))
+            auth = _AuthContext(headers=headers)
+
+        try:
+            response, _auth = await self._request_action(method, url, auth, action, step=step, body=body)
+        except Exception as exc:
+            return result(False, f"请求异常：{exc}")
+
+        if is_acw_sc_v2_challenge(response.text):
+            return result(False, self._waf_message(response))
+        if response.cloudflare:
+            return result(False, self._cloudflare_message(response))
+        detail = self._response_message(None, response.text)
+        if 200 <= response.status < 300:
+            return result(True, f"请求成功（HTTP {response.status}）" + (f"：{detail}" if detail else ""))
+        if response.new_api_user_refused:
+            return result(False, self._new_api_user_message(response))
+        return result(
+            False,
+            f"请求失败（HTTP {response.status}）" + (f"：{detail}" if detail else ""),
+            expired=response.status in (401, 403),
+        )
+
     @abstractmethod
     async def check_in(self) -> CheckInResult:
         """Perform daily check-in action.
@@ -994,6 +1376,11 @@ class NewApiAdapter(BaseCheckInAdapter):
                     continue
                 missing = False
 
+                if response.cloudflare:
+                    # The next candidate sits behind the same firewall.
+                    return False, self._cloudflare_message(response), False, False
+                if response.new_api_user_refused:
+                    return False, self._new_api_user_message(response), False, False
                 if response.status in (401, 403):
                     return False, "凭据已失效 (401/403)", True, False
 
@@ -1162,8 +1549,13 @@ class NewApiAdapter(BaseCheckInAdapter):
 
         # A working key behind a blocked management API is not an expired
         # credential; reporting it as one would send the user to regenerate a
-        # perfectly good key.
-        return self._result(False, error, expired=not key_is_valid, detail_on_success=False)
+        # perfectly good key. Neither is one behind a Cloudflare challenge.
+        return self._result(
+            False,
+            error,
+            expired=not key_is_valid and not self._cloudflare_blocked,
+            detail_on_success=False,
+        )
 
 
 class GenericRestAdapter(BaseCheckInAdapter):
@@ -1220,7 +1612,7 @@ class GenericRestAdapter(BaseCheckInAdapter):
             success=success,
             message=message,
             total_quota=total_quota,
-            expired=response.status in (401, 403),
+            expired=response.status in (401, 403) and not response.cloudflare,
         )
 
     async def test_connection(self) -> CheckInResult:
@@ -1242,12 +1634,7 @@ class GenericRestAdapter(BaseCheckInAdapter):
             return self._result(False, auth.error, expired=True)
 
         try:
-            response = await self._request_text(
-                "GET",
-                self._action_url(self.balance),
-                auth.headers,
-                self.balance.get("solve_acw_sc_v2", False),
-            )
+            response = await self._request_text("GET", self._action_url(self.balance), auth.headers)
         except Exception as exc:
             return self._result(False, f"请求失败: {exc}")
 
@@ -1260,7 +1647,7 @@ class GenericRestAdapter(BaseCheckInAdapter):
             success=success,
             message=message,
             total_quota=total_quota,
-            expired=response.status in (401, 403),
+            expired=response.status in (401, 403) and not response.cloudflare,
         )
 
 
@@ -1272,6 +1659,8 @@ def _interpret_generic_response(
     """Judge a free-form REST response, honouring an explicit ``success`` or ``ok`` field."""
     if is_acw_sc_v2_challenge(response.text):
         return False, waf_message(response)
+    if response.cloudflare:
+        return False, BaseCheckInAdapter._cloudflare_message(response)
 
     text_clean = response.text.strip()
     success = 200 <= response.status < 300
@@ -1316,6 +1705,8 @@ def create_adapter(
     site_config: dict[str, Any],
     session: AsyncSession,
     acw_cache_file: Path | None = None,
+    cloudflare: CloudflareContext | None = None,
+    options: RequestOptions | None = None,
 ) -> BaseCheckInAdapter:
     """Factory function creating appropriate site adapter.
 
@@ -1323,10 +1714,12 @@ def create_adapter(
         site_config: Site configuration.
         session: Active curl_cffi AsyncSession.
         acw_cache_file: Optional persistent translated-algorithm cache path.
+        cloudflare: The run's Cloudflare context; see :class:`BaseCheckInAdapter`.
+        options: The global request settings; see :class:`BaseCheckInAdapter`.
 
     Returns:
         Subclass instance of BaseCheckInAdapter.
     """
     if normalize_site_type(site_config.get("type")) == SITE_TYPE_GENERIC:
-        return GenericRestAdapter(site_config, session, acw_cache_file)
-    return NewApiAdapter(site_config, session, acw_cache_file)
+        return GenericRestAdapter(site_config, session, acw_cache_file, cloudflare, options)
+    return NewApiAdapter(site_config, session, acw_cache_file, cloudflare, options)

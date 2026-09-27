@@ -64,6 +64,9 @@ SITE_TYPES: tuple[str, ...] = (SITE_TYPE_NEW_API, SITE_TYPE_GENERIC)
 # Header New-API uses to scope a Cookie session to a numeric user id.
 NEW_API_USER_HEADER = "new-api-user"
 
+# Cookie newer New-API builds keep their refresh token in.
+REFRESH_COOKIE_NAME = "new_api_refresh"
+
 ACTION_CHECKIN = "checkin"
 ACTION_BALANCE = "balance"
 
@@ -187,6 +190,29 @@ def credential_label(credential: Any) -> str:
     return CREDENTIAL_LABELS.get(str(credential.get("type") or ""), "凭据")
 
 
+def holds_refresh_cookie(cookie: Any) -> bool:
+    """Whether a stored station cookie jar can be refreshed without a login.
+
+    Newer New-API builds keep a thirty-day refresh token in this cookie and
+    authenticate with short-lived bearer tokens minted from it.
+    """
+    for part in str(cookie or "").split(";"):
+        name, sep, _value = part.strip().partition("=")
+        if sep and name.strip() == REFRESH_COOKIE_NAME:
+            return True
+    return False
+
+
+def _to_int(raw: Any) -> int:
+    """Coerce a stored number to a non-negative int, 0 when unusable."""
+    if isinstance(raw, bool):
+        return 0
+    try:
+        return max(int(float(raw)), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def normalize_credential(raw: Any, index: int = 0) -> dict[str, Any]:
     """Normalize one credential entry.
 
@@ -210,8 +236,14 @@ def normalize_credential(raw: Any, index: int = 0) -> dict[str, Any]:
         # Users paste raw tokens far more often than "Bearer <token>".
         credential["auto_bearer"] = bool(source.get("auto_bearer", True))
     if cred_type in OAUTH_CREDENTIAL_TYPES:
+        # The station cookie jar the login produced. On newer New-API builds it
+        # holds the refresh token (``new_api_refresh``) rather than a session.
         credential["session_cookie"] = str(source.get("session_cookie") or "").strip()
         credential["session_updated_at"] = str(source.get("session_updated_at") or "").strip()
+        # The short-lived bearer token those builds authenticate with instead,
+        # and when it expires (unix seconds, 0 when unknown).
+        credential["access_token"] = str(source.get("access_token") or "").strip()
+        credential["access_expires_at"] = _to_int(source.get("access_expires_at"))
         # When the provider last rotated the cookie we hold. Kept here because
         # normalization runs on every read and write, and an unlisted field
         # would be dropped on the next save.
@@ -342,8 +374,9 @@ def normalize_action(raw: Any, allow_oauth: bool) -> dict[str, Any]:
         allow_oauth: Whether the OAuth protocol is selectable.
 
     Returns:
-        An action dict with path, protocol, credential_id, headers, and the
-        acw_sc__v2 solver flag.
+        An action dict with path, protocol, credential_id and headers. The
+        acw_sc__v2 and ML-DSA options are global settings, so the per-action
+        flags earlier versions stored are dropped.
     """
     source = raw if isinstance(raw, dict) else {}
     return {
@@ -351,7 +384,6 @@ def normalize_action(raw: Any, allow_oauth: bool) -> dict[str, Any]:
         "protocol": normalize_protocol(source.get("protocol"), allow_oauth=allow_oauth),
         "credential_id": str(source.get("credential_id") or "").strip(),
         "headers": normalize_headers(source.get("headers")),
-        "solve_acw_sc_v2": bool(source.get("solve_acw_sc_v2")),
     }
 
 

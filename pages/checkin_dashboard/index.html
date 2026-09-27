@@ -92,6 +92,9 @@
           </button>
           <button type="button" class="tab-btn" data-tab="checkin" onclick="switchSiteTab('checkin')">签到</button>
           <button type="button" class="tab-btn" data-tab="balance" onclick="switchSiteTab('balance')">余额</button>
+          <button type="button" class="tab-btn" data-tab="tasks" onclick="switchSiteTab('tasks')">
+            定时任务 <span id="tasks-count" class="tab-count">0</span>
+          </button>
         </div>
         <div class="modal-body">
           <!-- Tab: 基本 -->
@@ -178,12 +181,6 @@
               <div id="checkin-headers-container" class="kv-editor"></div>
               <div class="form-hint" id="checkin-headers-hint"></div>
             </div>
-            <div class="form-group">
-              <label class="checkbox-label" title="遇到阿里云 WAF JavaScript 挑战时，使用纯 Python 解算并自动重试">
-                <input type="checkbox" id="checkin-solve-acw" />
-                <span>解算 acw_sc__v2 (Beta)</span>
-              </label>
-            </div>
           </div>
 
           <!-- Tab: 余额 -->
@@ -222,12 +219,18 @@
               <div id="balance-headers-container" class="kv-editor"></div>
               <div class="form-hint" id="balance-headers-hint"></div>
             </div>
-            <div class="form-group">
-              <label class="checkbox-label" title="遇到阿里云 WAF JavaScript 挑战时，使用纯 Python 解算并自动重试">
-                <input type="checkbox" id="balance-solve-acw" />
-                <span>解算 acw_sc__v2 (Beta)</span>
-              </label>
+          </div>
+
+          <!-- Tab: 定时任务 -->
+          <div class="tab-panel" data-panel="tasks">
+            <div class="panel-intro">
+              按 cron 表达式或随机时间间隔，定时向指定 URL 发送 GET / POST 请求。请求经由本站点的代理、浏览器指纹与 Cloudflare / WAF 处理发出，
+              可选用本站点的凭据；站点停用或配置锁定时不运行。保存站点后生效。
             </div>
+            <div class="add-cred-row">
+              <button type="button" class="btn btn-sm btn-primary-plain" onclick="addTask()">+ 添加定时任务</button>
+            </div>
+            <div id="tasks-list" class="cred-list"></div>
           </div>
         </div>
         <div class="modal-footer">
@@ -322,10 +325,130 @@
             </div>
             <div class="form-group">
               <label for="setting-http-impersonate">网络请求浏览器指纹</label>
-              <select id="setting-http-impersonate" class="form-control">
+              <select id="setting-http-impersonate" class="form-control" onchange="renderMldsaHint()">
                 <option value="" disabled selected>正在读取指纹列表...</option>
               </select>
-              <div class="form-hint">选项及默认值由服务端根据当前 curl_cffi 版本动态提供。</div>
+              <div class="form-hint">
+                选项及默认值由服务端根据当前 curl_cffi 版本动态提供。
+                chrome150 起的 Chrome 指纹自带 ML-DSA 签名算法，较旧的 Chrome 指纹可用下方「TLS 携带 ML-DSA」补上。
+              </div>
+              <div style="display: flex; align-items: center; gap: 12px; margin-top: 8px;">
+                <button type="button" id="btn-reinstall-curl-cffi" class="btn btn-sm btn-primary-plain" style="white-space: nowrap; flex-shrink: 0;" onclick="reinstallCurlCffi()"
+                        title="通过 AstrBot 的 pip（沿用其镜像源与安装参数）重新安装插件要求范围内的最新 curl_cffi">重新安装 curl_cffi</button>
+                <span id="curl-cffi-status" class="form-hint" style="margin: 0;"></span>
+              </div>
+            </div>
+            <div class="form-group">
+              <div style="display: flex; align-items: center; justify-content: space-between;">
+                <label style="margin: 0;" for="setting-tls-mldsa"
+                       title="在 TLS 握手的签名算法中加入 ML-DSA（mldsa44 / mldsa65 / mldsa87），与新版 Chrome 一致。Cloudflare 会以人机验证拦截不带它的 Chrome 握手（如 chrome146 及更早的指纹）。">TLS 携带 ML-DSA</label>
+                <label class="switch">
+                  <input type="checkbox" id="setting-tls-mldsa" />
+                  <span class="slider"></span>
+                </label>
+              </div>
+              <div class="form-hint">
+                对所有站点的签到、余额查询与 OAuth 登录各步生效，指纹轮换的重试也一样。<span id="setting-mldsa-hint"></span>
+              </div>
+            </div>
+            <div class="form-group">
+              <div style="display: flex; align-items: center; justify-content: space-between;">
+                <label style="margin: 0;" for="setting-acw-solve"
+                       title="遇到阿里云 WAF 的 JavaScript 挑战（acw_sc__v2）时，用纯 Python 解算出 Cookie 并自动重试">检测到 acw_sc__v2 挑战时自动解算 (Beta)</label>
+                <label class="switch">
+                  <input type="checkbox" id="setting-acw-solve" />
+                  <span class="slider"></span>
+                </label>
+              </div>
+              <div class="form-hint">
+                任何站点的请求收到阿里云 WAF 的 acw_sc__v2 挑战页时，自动解算并重试一次，无需逐站配置。纯 Python 实现，不依赖浏览器或 Node.js。
+              </div>
+            </div>
+            <div class="form-group">
+              <div style="display: flex; align-items: center; justify-content: space-between;">
+                <label style="margin: 0;" for="setting-cf-fallback"
+                       title="Cloudflare 的判定与 TLS 指纹绑定，换一个指纹常常就能直接通过">被 Cloudflare 拦截时轮换浏览器指纹</label>
+                <label class="switch">
+                  <input type="checkbox" id="setting-cf-fallback" />
+                  <span class="slider"></span>
+                </label>
+              </div>
+              <div class="form-hint">
+                请求（含 OAuth 各步）收到 Cloudflare 人机验证页时，依次换用 chrome150、Firefox、Safari 等指纹重试（最多 4 个），通过的指纹在本轮后续请求中沿用。
+              </div>
+            </div>
+            <div class="form-group">
+              <div style="display: flex; align-items: center; justify-content: space-between;">
+                <label style="margin: 0;" for="setting-cf-browser"
+                       title="托管质询须由浏览器执行脚本才能通过，且通过凭证与浏览器绑定，只能由浏览器完成整个请求">指纹均未通过时，用无头浏览器通过验证</label>
+                <label class="switch">
+                  <input type="checkbox" id="setting-cf-browser" onchange="toggleCloudflareBrowserFields()" />
+                  <span class="slider"></span>
+                </label>
+              </div>
+              <div class="form-hint">
+                由 Playwright 驱动真实的 Chrome / Edge / Chromium 打开被拦截的地址，通过 Cloudflare 托管质询后在浏览器内完成该请求（OAuth 授权一步在跳回站点前截下授权码）。
+                验证 Cookie 在本轮后续请求中沿用，浏览器空闲 5 分钟后自动关闭。
+                <span id="cf-browser-install-hint"></span>
+              </div>
+            </div>
+            <div id="cf-browser-fields">
+              <div class="form-group">
+                <label>浏览器组件（可选）</label>
+                <div class="form-hint" style="margin-top: 0;">
+                  此功能依赖 Playwright，插件默认不安装。以下安装均在运行 AstrBot 的机器上进行（Docker 部署即容器内），与打开本页面的电脑无关。
+                </div>
+                <div style="display: flex; align-items: center; gap: 12px; margin-top: 8px;">
+                  <button type="button" id="btn-install-playwright" class="btn btn-sm btn-primary-plain" style="white-space: nowrap; flex-shrink: 0;" onclick="installPlaywright()"
+                          title="通过 AstrBot 的 pip（沿用其镜像源与安装参数）安装 Playwright">安装 Playwright</button>
+                  <span id="playwright-status" class="form-hint" style="margin: 0;"></span>
+                </div>
+                <div id="playwright-pip-guide" class="form-hint">
+                  也可在 AstrBot 所用的 Python 环境中执行：
+                  <div class="command-line">
+                    <code id="playwright-pip-command"></code>
+                    <button type="button" class="btn btn-sm btn-primary-plain" onclick="copyCommand('playwright-pip-command')">复制</button>
+                  </div>
+                </div>
+                <div id="chromium-setup" style="margin-top: 12px;">
+                  <div style="display: flex; align-items: center; gap: 12px;">
+                    <button type="button" id="btn-download-chromium" class="btn btn-sm btn-primary-plain" style="white-space: nowrap; flex-shrink: 0;" onclick="downloadChromium()"
+                            title="用 Playwright 自带的安装程序下载它所驱动的 Chromium（约 200 MB）">一键下载 Chromium</button>
+                    <span id="chromium-status" class="form-hint" style="margin: 0;"></span>
+                  </div>
+                  <div id="chromium-guide" class="form-hint">
+                    也可在命令行中执行：
+                    <div class="command-line">
+                      <code id="chromium-command"></code>
+                      <button type="button" class="btn btn-sm btn-primary-plain" onclick="copyCommand('chromium-command')">复制</button>
+                    </div>
+                    <span id="chromium-guide-note"></span>
+                  </div>
+                </div>
+              </div>
+              <div class="form-group">
+                <label for="setting-cf-browser-channel">使用的浏览器</label>
+                <select id="setting-cf-browser-channel" class="form-control">
+                  <option value="auto">自动</option>
+                </select>
+                <div class="form-hint" id="cf-browser-channel-hint"></div>
+              </div>
+              <div class="form-group" style="display: flex; align-items: center; justify-content: space-between;">
+                <label style="margin: 0;" for="setting-cf-browser-headless"
+                       title="关闭后会弹出浏览器窗口，仅用于在有桌面的机器上排查问题">无头模式（不显示浏览器窗口）</label>
+                <label class="switch">
+                  <input type="checkbox" id="setting-cf-browser-headless" />
+                  <span class="slider"></span>
+                </label>
+              </div>
+              <div class="form-group">
+                <label for="setting-cf-browser-timeout">浏览器验证超时（秒）</label>
+                <input type="number" id="setting-cf-browser-timeout" class="form-control" min="15" max="300" step="1" value="60" />
+              </div>
+              <div class="form-group" style="display: flex; align-items: center; gap: 12px;">
+                <button type="button" id="btn-check-browser" class="btn btn-sm btn-primary-plain" onclick="checkCloudflareBrowser()">检测浏览器</button>
+                <span id="cf-browser-check-result" class="form-hint" style="margin: 0;"></span>
+              </div>
             </div>
             <div class="form-group">
               <label for="setting-max-history-records">历史日志保留上限（条数）</label>

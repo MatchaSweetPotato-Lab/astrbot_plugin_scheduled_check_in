@@ -5,12 +5,14 @@ from __future__ import annotations
 import unittest
 
 import tests  # noqa: F401
+from core.cloudflare import CloudflareContext, CloudflareOptions
 from core.oauth import (
     GITHUB_OAUTH,
     LINUXDO_OAUTH,
     PROVIDERS,
     OAuthLoginClient,
     _extract_flow_token,
+    _extract_login_fields,
     _missing_cookies,
     _safe_location,
     get_provider,
@@ -18,7 +20,7 @@ from core.oauth import (
     merge_rotated_cookies,
     parse_cookie_header,
 )
-from tests.fakes import FakeResponse, FakeSession
+from tests.fakes import FakeResponse, FakeSession, carries_mldsa
 
 BASE = "https://relay.example.com"
 GITHUB_AUTHORIZE = "https://github.com/login/oauth/authorize"
@@ -87,6 +89,21 @@ class SuccessfulLoginTests(unittest.IsolatedAsyncioTestCase):
         result = await make_client(session).login(GITHUB_OAUTH, "user_session=abc")
         self.assertTrue(result.success)
         self.assertEqual(result.session_cookie, "session=sess-1; extra=e")
+
+    async def test_returns_the_account_id_from_the_callback(self) -> None:
+        """New-API needs it as New-Api-User beside the cookie; nothing else reveals it."""
+        session = FakeSession(github_routes({
+            ("GET", f"{BASE}/api/oauth/github"): FakeResponse(
+                200, '{"success":true,"data":{"id":2259,"username":"u"}}', cookies={"session": "s"}
+            ),
+        }))
+        result = await make_client(session).login(GITHUB_OAUTH, "user_session=abc")
+        self.assertEqual(result.user_id, "2259")
+
+    async def test_a_callback_without_an_id_leaves_it_empty(self) -> None:
+        result = await make_client(FakeSession(github_routes())).login(GITHUB_OAUTH, "user_session=abc")
+        self.assertTrue(result.success)
+        self.assertEqual(result.user_id, "")
 
     async def test_walks_all_four_legs_in_order(self) -> None:
         session = FakeSession(github_routes())
@@ -338,6 +355,80 @@ class FailedLoginTests(unittest.IsolatedAsyncioTestCase):
         result = await make_client(BoomSession({})).login(GITHUB_OAUTH, "user_session=abc")
         self.assertFalse(result.success)
         self.assertIn("dns failure", result.message)
+
+
+# What newer New-API answers a login with: a bearer token in the body, the
+# user nested beside it, and the refresh token as a cookie.
+TOKEN_LOGIN_BODY = (
+    '{"success":true,"data":{"access_token":"at-1","token_type":"Bearer",'
+    '"access_expires_at":1900000000,"user":{"id":7,"username":"u"}}}'
+)
+REFRESH_URL = f"{BASE}/api/user/auth/refresh"
+
+
+class TokenLoginTests(unittest.IsolatedAsyncioTestCase):
+    """Newer New-API issues an access token and a refresh cookie instead of a session."""
+
+    def _session(self) -> FakeSession:
+        return FakeSession(github_routes({
+            ("GET", f"{BASE}/api/oauth/github"): FakeResponse(
+                200, TOKEN_LOGIN_BODY,
+                cookies={"new_api_refresh": "sid.r1", "new_api_has_session": "1"},
+            ),
+        }))
+
+    async def test_the_login_returns_both_tokens(self) -> None:
+        result = await make_client(self._session()).login(GITHUB_OAUTH, "user_session=abc")
+        self.assertTrue(result.success)
+        self.assertEqual((result.access_token, result.access_expires_at), ("at-1", 1900000000))
+        self.assertIn("new_api_refresh=sid.r1", result.session_cookie)
+        self.assertEqual(result.user_id, "7")
+
+    async def test_the_token_body_is_kept_out_of_the_trace(self) -> None:
+        trace: list[dict] = []
+        client = OAuthLoginClient(self._session(), BASE, "chrome131",
+                                  on_attempt=lambda **kw: trace.append(kw))
+        await client.login(GITHUB_OAUTH, "user_session=abc")
+        callback = [t for t in trace if t["step"] == "OAuth 回调"][0]
+        self.assertNotIn("at-1", callback["response_text"])
+        self.assertIn("访问令牌", callback["message"])
+
+    def test_milliseconds_are_normalized(self) -> None:
+        fields = _extract_login_fields('{"data":{"access_token":"t","access_expires_at":1900000000000}}')
+        self.assertEqual(fields.access_expires_at, 1900000000)
+
+    def test_a_legacy_body_carries_no_token(self) -> None:
+        fields = _extract_login_fields('{"success":true,"data":{"id":9,"username":"u"}}')
+        self.assertEqual((fields.user_id, fields.access_token, fields.access_expires_at), ("9", "", 0))
+
+
+class TokenRefreshTests(unittest.IsolatedAsyncioTestCase):
+    HELD = "new_api_refresh=sid.r1; new_api_has_session=1"
+
+    async def test_a_refresh_returns_the_token_and_the_rotated_cookie(self) -> None:
+        session = FakeSession({("POST", REFRESH_URL): FakeResponse(
+            200, TOKEN_LOGIN_BODY.replace("at-1", "at-2"), cookies={"new_api_refresh": "sid.r2"},
+        )})
+        result = await make_client(session).refresh(self.HELD)
+        self.assertTrue(result.success)
+        self.assertEqual(result.access_token, "at-2")
+        self.assertEqual(result.session_cookie, "new_api_refresh=sid.r2; new_api_has_session=1")
+
+    async def test_the_refresh_presents_the_cookie_from_the_station_origin(self) -> None:
+        session = FakeSession({("POST", REFRESH_URL): FakeResponse(200, TOKEN_LOGIN_BODY)})
+        await make_client(session).refresh(self.HELD)
+        headers = session.calls[0]["headers"]
+        self.assertEqual(headers["Cookie"], self.HELD)
+        self.assertEqual(headers["Origin"], BASE)
+
+    async def test_a_revoked_session_is_reported(self) -> None:
+        session = FakeSession({("POST", REFRESH_URL): FakeResponse(
+            401, '{"success":false,"code":"AUTH_SESSION_REVOKED","message":"Unauthorized"}',
+        )})
+        result = await make_client(session).refresh(self.HELD)
+        self.assertFalse(result.success)
+        self.assertIn("AUTH_SESSION_REVOKED", result.message)
+        self.assertEqual(result.session_cookie, self.HELD)
 
 
 class FlowTokenShapeTests(unittest.TestCase):
@@ -783,6 +874,69 @@ class LinuxdoAuthorizeHelpers:
         return await client.login(LINUXDO_OAUTH, cookie or self.COOKIE)
 
 
+class DiscourseRelayTests(LinuxdoAuthorizeHelpers, unittest.IsolatedAsyncioTestCase):
+    """Without its own session connect.linux.do bounces through Discourse SSO
+    on linux.do, as observed live on 2026-09-26; a browser follows that."""
+
+    SSO = "https://linux.do/session/sso_provider?sso=A&sig=B"
+    CALLBACK = "https://connect.linux.do/discourse/sso_callback?sso=C&sig=D"
+    AGAIN = "https://connect.linux.do/oauth2/authorize?response_type=code&client_id=cid&state=st"
+
+    def _relay_session(self, final):
+        routes = self._routes(FakeResponse(
+            302, "", headers={"location": self.SSO}, cookies={"auth.session-token": "pre"}))
+        routes[self.SSO] = FakeResponse(
+            302, "", headers={"location": self.CALLBACK}, cookies={"_t": "rotated"})
+        routes[self.CALLBACK] = FakeResponse(
+            302, "", headers={"location": self.AGAIN[len("https://connect.linux.do"):]},
+            cookies={"auth.session-token": "tok"})
+        routes[self.AGAIN] = final
+        return FakeSession(routes)
+
+    async def test_the_relay_is_followed_to_the_code(self) -> None:
+        session = self._relay_session(FakeResponse(
+            302, "", headers={"location": f"{BASE}/oauth/linuxdo?code=C&state=st"}))
+        client = OAuthLoginClient(session, BASE, "chrome131", None)
+        result = await client.login(LINUXDO_OAUTH, self.COOKIE)
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(session.urls()[2:6], [LINUXDO_AUTHORIZE, self.SSO, self.CALLBACK, self.AGAIN])
+        # The callback's session reaches the second authorize, and is kept.
+        self.assertIn("auth.session-token=tok", session.calls[5]["headers"]["Cookie"])
+        jar = parse_cookie_header(result.rotated_provider_cookie)
+        self.assertEqual(jar["auth.session-token"], "tok")
+        self.assertEqual(jar["_t"], "rotated")
+
+    async def test_a_redirect_off_the_relay_still_fails(self) -> None:
+        session = self._relay_session(FakeResponse(
+            302, "", headers={"location": "https://evil.example/x"}))
+        client = OAuthLoginClient(session, BASE, "chrome131", None)
+        result = await client.login(LINUXDO_OAUTH, self.COOKIE)
+        self.assertFalse(result.success)
+        self.assertNotIn("https://evil.example/x", session.urls())
+
+    async def test_the_consent_page_is_approved_once(self) -> None:
+        approve = "https://connect.linux.do/oauth2/approve/abc123"
+        page = FakeResponse(200, '<a href="/oauth2/approve/abc123">允许</a><a href="/oauth2/decline/abc123">拒绝</a>')
+        session = self._relay_session(page)
+        session.routes[approve] = FakeResponse(
+            302, "", headers={"location": f"{BASE}/oauth/linuxdo?code=C&state=st"})
+        client = OAuthLoginClient(session, BASE, "chrome131", None)
+        result = await client.login(LINUXDO_OAUTH, self.COOKIE)
+        self.assertTrue(result.success, result.message)
+        click = session.calls_to("/oauth2/approve/abc123")[0]["headers"]
+        self.assertEqual(click["Sec-Fetch-Site"], "same-origin")
+        self.assertEqual(click["Referer"], self.AGAIN)
+        self.assertEqual(session.count_to("/oauth2/decline/abc123"), 0)
+
+    async def test_a_consent_page_that_repeats_is_not_clicked_forever(self) -> None:
+        page = FakeResponse(200, '<a href="/oauth2/approve/abc123">允许</a>')
+        session = self._relay_session(page)
+        session.routes["https://connect.linux.do/oauth2/approve/abc123"] = page
+        result = await OAuthLoginClient(session, BASE, "chrome131", None).login(LINUXDO_OAUTH, self.COOKIE)
+        self.assertFalse(result.success)
+        self.assertEqual(session.count_to("/oauth2/approve/abc123"), 1)
+
+
 class RefusedAuthorizeTests(LinuxdoAuthorizeHelpers, unittest.IsolatedAsyncioTestCase):
     """A flat refusal is a different failure from a bounce to the login page,
     and conflating them sends the user to re-copy a cookie that is fine."""
@@ -908,16 +1062,34 @@ class CloudflareChallengeLoginTests(LinuxdoAuthorizeHelpers, unittest.IsolatedAs
         self.assertIn("IP", result.message)
         self.assertIn("指纹", result.message)
 
-    async def test_states_that_solving_is_not_implemented(self) -> None:
-        """Solving needs a JavaScript runtime, i.e. a headless-browser dependency.
-
-        Users would otherwise keep retrying, or wait for a fix that is a
-        deliberate non-goal, so the message has to say it outright.
-        """
+    async def test_points_at_the_ml_dsa_option(self) -> None:
+        """chrome131 sends no ML-DSA, the gap Cloudflare challenges; say where to close it."""
         result = await self._login(FakeResponse(403, CLOUDFLARE_PAGE))
-        self.assertIn("JavaScript", result.message)
-        self.assertIn("无头浏览器", result.message)
-        self.assertIn("暂不实现", result.message)
+        self.assertIn("chrome131", result.message)
+        self.assertIn("未携带 ML-DSA", result.message)
+        self.assertIn("全局设置", result.message)
+        self.assertIn("TLS 携带 ML-DSA", result.message)
+        self.assertIn("chrome150", result.message)
+
+    async def test_no_ml_dsa_advice_once_the_handshake_had_it(self) -> None:
+        for impersonate, mldsa in (("chrome131", True), ("chrome150", False)):
+            session = FakeSession(self._routes(FakeResponse(403, CLOUDFLARE_PAGE)))
+            client = OAuthLoginClient(session, BASE, impersonate, None, mldsa=mldsa)
+            result = await client.login(LINUXDO_OAUTH, self.COOKIE)
+            with self.subTest(impersonate=impersonate, mldsa=mldsa):
+                self.assertIn("Cloudflare", result.message)
+                self.assertNotIn("未携带 ML-DSA", result.message)
+
+    async def test_reports_what_fingerprint_screening_tried(self) -> None:
+        """Without it the user cannot tell a disabled fallback from a lost one."""
+        session = FakeSession(self._routes(FakeResponse(403, CLOUDFLARE_PAGE)))
+        context = CloudflareContext(CloudflareOptions(), pacing=0)
+        client = OAuthLoginClient(session, BASE, "chrome131", None, cloudflare=context)
+        result = await client.login(LINUXDO_OAUTH, self.COOKIE)
+        self.assertFalse(result.success)
+        self.assertIn("已自动尝试", result.message)
+        self.assertIn("指纹轮换", result.message)
+        self.assertRegex(result.message, r"(不是|并非|而非)凭据失效")
 
     async def test_offers_the_durable_alternative(self) -> None:
         """A clearance cookie expires long before the next scheduled run."""
@@ -943,6 +1115,33 @@ class CloudflareChallengeLoginTests(LinuxdoAuthorizeHelpers, unittest.IsolatedAs
         await client.login(LINUXDO_OAUTH, cookie)
         authorize = session.calls_to("/oauth2/authorize")[0]
         self.assertIn("cf_clearance=solved-token", authorize["headers"]["Cookie"])
+
+
+class MldsaLoginTests(LinuxdoAuthorizeHelpers, unittest.IsolatedAsyncioTestCase):
+    """The credential's ML-DSA option covers every leg of its login."""
+
+    REDIRECT = FakeResponse(302, "", headers={"location": f"{BASE}/oauth/linuxdo?code=C&state=st"})
+
+    async def _calls(self, impersonate: str, mldsa: bool) -> list[dict]:
+        session = FakeSession(self._routes(self.REDIRECT))
+        result = await OAuthLoginClient(session, BASE, impersonate, None, mldsa=mldsa).login(
+            LINUXDO_OAUTH, self.COOKIE
+        )
+        self.assertTrue(result.success, result.message)
+        return session.calls
+
+    async def test_every_leg_carries_it_when_asked(self) -> None:
+        calls = await self._calls("chrome131", True)
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(all(carries_mldsa(call) for call in calls))
+
+    async def test_no_leg_is_altered_by_default(self) -> None:
+        calls = await self._calls("chrome131", False)
+        self.assertTrue(all(call["extra_fp"] is None for call in calls))
+
+    async def test_a_fingerprint_that_carries_it_is_left_alone(self) -> None:
+        calls = await self._calls("chrome150", True)
+        self.assertTrue(all(call["extra_fp"] is None for call in calls))
 
 
 class AuthorizeFingerprintTests(unittest.IsolatedAsyncioTestCase):

@@ -7,10 +7,11 @@ import logging
 import sqlite3
 import threading
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from .crypto import (
     Vault,
@@ -32,6 +33,7 @@ from .site_schema import (
     ACTION_CHECKIN,
     CRED_COOKIE,
     CRED_TOKEN,
+    holds_refresh_cookie,
     normalize_action,
     normalize_credential_type,
     normalize_credentials,
@@ -39,6 +41,7 @@ from .site_schema import (
     normalize_path,
     normalize_site_type,
 )
+from .task_schema import join_tasks, normalize_tasks, split_task
 
 logger = logging.getLogger("astrbot")
 
@@ -51,6 +54,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "http_ssl_verify": True,
     "http_timeout_seconds": 15,
     "http_impersonate": DEFAULT_IMPERSONATE,
+    # Add ML-DSA to the TLS handshake of fingerprints that lack it, for every
+    # request of every site (see core/http_client.py RequestOptions).
+    "http_tls_mldsa": False,
+    # Solve an Aliyun acw_sc__v2 challenge wherever one comes back.
+    "acw_sc_v2_auto_solve": True,
     "manual_target_time": "",
     "auto_cleanup_logs": True,
     "history_retention_days": 0,
@@ -60,6 +68,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "lock_notify_session": "",
     # Reporting verbosity level: "all" (full briefing) or "failure_only" (alerts on failures only).
     "report_level": "all",
+    # When Cloudflare challenges a request (see core/cloudflare.py), retry it
+    # with other browser fingerprints.
+    "cf_fingerprint_fallback": True,
+    # When no fingerprint gets past it, re-issue the request from a headless
+    # browser that solves the challenge (see core/browser.py). Needs Playwright.
+    "cf_browser_fallback": True,
+    "cf_browser_headless": True,
+    "cf_browser_channel": "auto",
+    "cf_browser_timeout_seconds": 60,
 }
 
 # Vault bookkeeping lives in the settings table but is managed separately from
@@ -86,7 +103,16 @@ USER_KEY_SLOT_ID = "slot_user_key"
 _PRF_BYTES = 32
 
 # Columns holding vault-protected values.
-_SENSITIVE_COLUMNS = ("proxy", "credentials", "checkin_headers", "balance_headers")
+_SENSITIVE_COLUMNS = ("proxy", "credentials", "checkin_headers", "balance_headers", "tasks_secrets")
+
+# Columns added to the sites table after the credential-list schema, with
+# their definitions, so an existing table can be brought up to date in place.
+_ADDED_SITE_COLUMNS = {
+    # Scheduled tasks, split like the actions: schedule, method and URL in the
+    # clear; headers and body, which may carry secrets, sealed by the vault.
+    "tasks_config": "TEXT NOT NULL DEFAULT ''",
+    "tasks_secrets": "TEXT NOT NULL DEFAULT ''",
+}
 
 _SITES_SCHEMA = """
     CREATE TABLE IF NOT EXISTS sites (
@@ -100,6 +126,8 @@ _SITES_SCHEMA = """
         checkin_headers TEXT NOT NULL DEFAULT '',
         balance_config TEXT NOT NULL DEFAULT '',
         balance_headers TEXT NOT NULL DEFAULT '',
+        tasks_config TEXT NOT NULL DEFAULT '',
+        tasks_secrets TEXT NOT NULL DEFAULT '',
         enabled INTEGER NOT NULL DEFAULT 1,
         last_checkin_date TEXT,
         last_checkin_time TEXT,
@@ -280,6 +308,19 @@ class DatabaseManager:
 
                 CREATE INDEX IF NOT EXISTS idx_vault_slots_credential
                     ON vault_slots(credential_id);
+
+                -- When each scheduled task runs next and how it last went. Kept
+                -- apart from the sites table, which a save rewrites whole.
+                CREATE TABLE IF NOT EXISTS site_task_state (
+                    site_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    schedule_key TEXT NOT NULL DEFAULT '',
+                    next_run_at TEXT,
+                    last_run_at TEXT,
+                    last_success INTEGER,
+                    last_message TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (site_id, task_id)
+                );
             """)
             self._ensure_sites_table(conn)
 
@@ -368,6 +409,9 @@ class DatabaseManager:
 
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(sites)").fetchall()}
         if "credentials" in columns:
+            for column, definition in _ADDED_SITE_COLUMNS.items():
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE sites ADD COLUMN {column} {definition}")
             return
 
         logger.info("Upgrading sites table to the credential-list schema.")
@@ -485,6 +529,10 @@ class DatabaseManager:
             "credentials": [] if locked else self._decode_credentials(row["credentials"]),
             "checkin": self._decode_action(row["checkin_config"], row["checkin_headers"], locked, allow_oauth=True),
             "balance": self._decode_action(row["balance_config"], row["balance_headers"], locked, allow_oauth=False),
+            "tasks": join_tasks(
+                _load_json(row["tasks_config"], []),
+                {} if locked else self._decode_json(row["tasks_secrets"], {}),
+            ),
             "enabled": bool(row["enabled"]),
             "locked": locked,
         }
@@ -561,6 +609,7 @@ class DatabaseManager:
 
             checkin = normalize_action(site.get("checkin"), allow_oauth=True)
             balance = normalize_action(site.get("balance"), allow_oauth=False)
+            tasks_plain, tasks_secret = _split_tasks(site.get("tasks"))
 
             created_at = site.get("created_at") or _row_value(previous, "created_at") or now_str
             last_success = None
@@ -572,10 +621,11 @@ class DatabaseManager:
                 INSERT INTO sites (
                     id, name, type, base_url, proxy, credentials,
                     checkin_config, checkin_headers, balance_config, balance_headers,
+                    tasks_config, tasks_secrets,
                     enabled, last_checkin_date, last_checkin_time, last_checkin_success, last_quota,
                     display_order, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     name=excluded.name,
                     type=excluded.type,
@@ -586,6 +636,8 @@ class DatabaseManager:
                     checkin_headers=excluded.checkin_headers,
                     balance_config=excluded.balance_config,
                     balance_headers=excluded.balance_headers,
+                    tasks_config=excluded.tasks_config,
+                    tasks_secrets=excluded.tasks_secrets,
                     enabled=excluded.enabled,
                     last_checkin_date=excluded.last_checkin_date,
                     last_checkin_time=excluded.last_checkin_time,
@@ -605,6 +657,9 @@ class DatabaseManager:
                     self._seal_json(checkin["headers"], previous, "checkin_headers", keep_all),
                     _dump_action_config(balance),
                     self._seal_json(balance["headers"], previous, "balance_headers", keep_all),
+                    # A locked site cannot be edited, so its stored tasks stand.
+                    (_row_value(previous, "tasks_config") or "") if keep_all else json.dumps(tasks_plain, ensure_ascii=False),
+                    self._seal_json(tasks_secret, previous, "tasks_secrets", keep_all),
                     1 if site.get("enabled", True) else 0,
                     site.get("last_checkin_date"),
                     site.get("last_checkin_time"),
@@ -653,6 +708,9 @@ class DatabaseManager:
             if not credential["session_cookie"]:
                 credential["session_cookie"] = str(match.get("session_cookie") or "")
                 credential["session_updated_at"] = str(match.get("session_updated_at") or "")
+            if not credential.get("access_token"):
+                credential["access_token"] = str(match.get("access_token") or "")
+                credential["access_expires_at"] = match.get("access_expires_at") or 0
             if not credential.get("value"):
                 credential["value"] = str(match.get("value") or "")
                 credential["value_updated_at"] = str(match.get("value_updated_at") or "")
@@ -694,19 +752,52 @@ class DatabaseManager:
             return [self._site_row_to_dict(row) for row in cursor.fetchall()]
 
     def get_sites_for_display(self) -> list[dict[str, Any]]:
-        """Get all sites with OAuth session cookies withheld.
+        """Get all sites with OAuth session cookies and tokens withheld.
 
-        Used by the web API: the dashboard never needs the station session
-        cookies a login produced, only whether one is currently held.
+        Used by the web API: the dashboard never needs the station secrets a
+        login produced, only which of them are currently held.
         """
         sites = self.get_sites()
+        states = self.get_task_states()
         for site in sites:
+            for task in site.get("tasks", []):
+                task["state"] = states.get((site["id"], task["id"]), {})
             for credential in site.get("credentials", []):
                 if "session_cookie" not in credential:
                     continue
                 credential["has_session"] = bool(credential.get("session_cookie"))
+                credential["has_refresh_token"] = holds_refresh_cookie(credential.get("session_cookie"))
+                credential["has_access_token"] = bool(credential.get("access_token"))
                 credential["session_cookie"] = ""
+                credential["access_token"] = ""
         return sites
+
+    def merge_stored_oauth_secrets(self, site: dict[str, Any]) -> dict[str, Any]:
+        """Fill in the OAuth secrets a site posted by the dashboard lacks.
+
+        The display view withholds every login's station secrets, and the site
+        editor omits an untouched provider cookie, so a site posted back for a
+        connection test or probe arrives without them. An adapter built from it
+        holds no session and can only log in again, which on login-as-check-in
+        stations spends the day's sign-in. The stored site with the same id
+        supplies them exactly as a save would; see ``_carry_oauth_sessions``.
+
+        Args:
+            site: Site config as the dashboard posted it. Left unmodified.
+
+        Returns:
+            A copy of ``site`` carrying the stored secrets, or ``site`` itself
+            when no stored site has its id.
+        """
+        site_id = str(site.get("id") or "").strip()
+        if not site_id:
+            return site
+        with self._lock, self._connection() as conn:
+            row = conn.execute("SELECT credentials FROM sites WHERE id = ?", (site_id,)).fetchone()
+        if row is None:
+            return site
+        credentials = normalize_credentials(site.get("credentials"))
+        return {**site, "credentials": self._carry_oauth_sessions(credentials, row)}
 
     def save_sites(self, sites_data: list[dict[str, Any]]) -> None:
         """Replace the full sites configuration atomically while preserving created_at.
@@ -720,10 +811,73 @@ class DatabaseManager:
                 existing = {row["id"]: dict(row) for row in conn.execute("SELECT * FROM sites").fetchall()}
                 conn.execute("DELETE FROM sites")
                 self._insert_sites_records(conn, sites_data, existing_rows=existing)
+                self._prune_task_states(conn)
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
+
+    # ------------------------------------------------------------------
+    # Scheduled task state
+    # ------------------------------------------------------------------
+    def get_task_states(self) -> dict[tuple[str, str], dict[str, Any]]:
+        """Every task's run state, keyed by ``(site_id, task_id)``."""
+        with self._lock, self._connection() as conn:
+            rows = conn.execute("SELECT * FROM site_task_state").fetchall()
+        return {
+            (row["site_id"], row["task_id"]): {
+                "schedule_key": row["schedule_key"],
+                "next_run_at": row["next_run_at"],
+                "last_run_at": row["last_run_at"],
+                "last_success": None if row["last_success"] is None else bool(row["last_success"]),
+                "last_message": row["last_message"],
+            }
+            for row in rows
+        }
+
+    def set_task_schedule(self, site_id: str, task_id: str, schedule_key: str, next_run_at: str | None) -> None:
+        """Record when a task runs next, and under which schedule that was worked out."""
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO site_task_state (site_id, task_id, schedule_key, next_run_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(site_id, task_id) DO UPDATE SET
+                    schedule_key = excluded.schedule_key,
+                    next_run_at = excluded.next_run_at
+                """,
+                (site_id, task_id, schedule_key, next_run_at),
+            )
+
+    def record_task_run(self, site_id: str, task_id: str, run_at: str, success: bool, message: str) -> None:
+        """Record how a task's latest run went."""
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO site_task_state (site_id, task_id, last_run_at, last_success, last_message)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(site_id, task_id) DO UPDATE SET
+                    last_run_at = excluded.last_run_at,
+                    last_success = excluded.last_success,
+                    last_message = excluded.last_message
+                """,
+                (site_id, task_id, run_at, 1 if success else 0, message),
+            )
+
+    @staticmethod
+    def _prune_task_states(conn: sqlite3.Connection) -> None:
+        """Drop the state of tasks no longer configured."""
+        configured = set()
+        for row in conn.execute("SELECT id, tasks_config FROM sites").fetchall():
+            for task in _load_json(row["tasks_config"], []) or []:
+                if isinstance(task, dict) and task.get("id"):
+                    configured.add((row["id"], str(task["id"])))
+        stale = [
+            (row["site_id"], row["task_id"])
+            for row in conn.execute("SELECT site_id, task_id FROM site_task_state").fetchall()
+            if (row["site_id"], row["task_id"]) not in configured
+        ]
+        conn.executemany("DELETE FROM site_task_state WHERE site_id = ? AND task_id = ?", stale)
 
     def update_site_checkin_state(
         self,
@@ -769,13 +923,20 @@ class DatabaseManager:
         site_id: str,
         credential_id: str,
         session_cookie: str,
+        access_token: str | None = None,
+        access_expires_at: int = 0,
     ) -> bool:
-        """Write an OAuth session cookie back onto its own credential.
+        """Write an OAuth login's station secrets back onto its own credential.
 
         Args:
             site_id: Owning site.
             credential_id: Credential that performed the login.
-            session_cookie: Station session cookie to remember.
+            session_cookie: Station cookie jar to remember — a session cookie,
+                or on newer New-API builds the refresh-token cookie.
+            access_token: Short-lived bearer token to remember alongside it.
+                None leaves the stored token alone; an empty string clears it,
+                which is what a login that issued none must do.
+            access_expires_at: When that token expires, in unix seconds.
 
         Returns:
             Whether a credential was updated.
@@ -794,6 +955,9 @@ class DatabaseManager:
                     continue
                 credential["session_cookie"] = str(session_cookie or "").strip()
                 credential["session_updated_at"] = now_str
+                if access_token is not None:
+                    credential["access_token"] = str(access_token).strip()
+                    credential["access_expires_at"] = int(access_expires_at or 0) if access_token else 0
                 updated = True
                 break
             if not updated:
@@ -1530,6 +1694,7 @@ class DatabaseManager:
         start_date: str | None = None,
         end_date: str | None = None,
         site_id: str | None = None,
+        exclude_type: str | None = None,
     ) -> list[dict[str, Any]]:
         """Read recent history log records ordered from newest to oldest.
 
@@ -1539,6 +1704,7 @@ class DatabaseManager:
             start_date: Optional inclusive start date in YYYY-MM-DD format.
             end_date: Optional inclusive end date in YYYY-MM-DD format.
             site_id: Optional site ID used to filter through the indexed association table.
+            exclude_type: Optional log type to leave out.
 
         Returns:
             List of history log dictionaries.
@@ -1559,6 +1725,7 @@ class DatabaseManager:
                       AND (? IS NULL OR history_logs.timestamp >= ?)
                       AND (? IS NULL OR history_logs.timestamp <= ?)
                       AND (? IS NULL OR history_logs.id < ?)
+                      AND (? IS NULL OR history_logs.type != ?)
                     ORDER BY history_logs.id DESC
                     LIMIT ?
                     """,
@@ -1570,6 +1737,8 @@ class DatabaseManager:
                         end_bound,
                         before_id,
                         before_id,
+                        exclude_type,
+                        exclude_type,
                         limit if limit is not None else -1,
                     ),
                 )
@@ -1580,6 +1749,7 @@ class DatabaseManager:
                     WHERE (? IS NULL OR timestamp >= ?)
                       AND (? IS NULL OR timestamp <= ?)
                       AND (? IS NULL OR id < ?)
+                      AND (? IS NULL OR type != ?)
                     ORDER BY id DESC
                     LIMIT ?
                     """,
@@ -1590,6 +1760,8 @@ class DatabaseManager:
                         end_bound,
                         before_id,
                         before_id,
+                        exclude_type,
+                        exclude_type,
                         limit if limit is not None else -1,
                     ),
                 )
@@ -1657,10 +1829,25 @@ def _dump_action_config(action: dict[str, Any]) -> str:
             "path": action.get("path", ""),
             "protocol": action.get("protocol", "auto"),
             "credential_id": action.get("credential_id", ""),
-            "solve_acw_sc_v2": bool(action.get("solve_acw_sc_v2")),
         },
         ensure_ascii=False,
     )
+
+
+def _split_tasks(raw: Any) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Split a task list into its plain config and its secrets, keyed by task id.
+
+    A task without headers or a body gets no secret entry, so a site without
+    any stays unencrypted, as an empty header list does.
+    """
+    plain: list[dict[str, Any]] = []
+    secrets: dict[str, dict[str, Any]] = {}
+    for task in normalize_tasks(raw):
+        task_plain, task_secret = split_task(task)
+        plain.append(task_plain)
+        if task_secret["headers"] or task_secret["body"]:
+            secrets[task["id"]] = task_secret
+    return plain, secrets
 
 
 def _row_value(row: sqlite3.Row | dict[str, Any], key: str) -> Any:
@@ -1693,8 +1880,9 @@ def _legacy_site_to_site(row: dict[str, Any]) -> dict[str, Any]:
     """Convert a pre-credential-list site row into the current shape.
 
     The single ``auth_type``/``auth_value`` pair becomes one credential; the
-    legacy endpoint becomes the check-in path; custom headers and the
-    acw_sc__v2 flag apply to both the check-in and balance actions.
+    legacy endpoint becomes the check-in path; custom headers apply to both
+    the check-in and balance actions. The acw_sc__v2 flag is dropped: solving
+    is a global setting now.
     """
     auth_value = str(row.get("auth_value") or "").strip()
     cred_type = normalize_credential_type(row.get("auth_type"))
@@ -1716,12 +1904,10 @@ def _legacy_site_to_site(row: dict[str, Any]) -> dict[str, Any]:
         credentials.append(credential)
 
     headers = normalize_headers(row.get("custom_headers"))
-    solve_acw = bool(row.get("solve_acw_sc_v2"))
     shared = {
         "protocol": "auto",
         "credential_id": credential_id,
         "headers": headers,
-        "solve_acw_sc_v2": solve_acw,
     }
 
     site: dict[str, Any] = {

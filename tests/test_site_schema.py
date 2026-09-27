@@ -118,6 +118,11 @@ class CredentialNormalizationTests(unittest.TestCase):
     def test_cookie_credentials_have_no_bearer_flag(self) -> None:
         self.assertNotIn("auto_bearer", normalize_credential({"type": "cookie"}))
 
+    def test_credentials_have_no_ml_dsa_flag(self) -> None:
+        """ML-DSA is a global setting; a flag an earlier version stored is dropped."""
+        for cred_type in ("token", "cookie", "github_oauth", "linuxdo_oauth"):
+            self.assertNotIn("tls_mldsa", normalize_credential({"type": cred_type, "tls_mldsa": True}))
+
     def test_missing_id_is_synthesized_from_position(self) -> None:
         self.assertEqual(normalize_credential({}, 2)["id"], "cred_3")
 
@@ -220,7 +225,6 @@ class ActionNormalizationTests(unittest.TestCase):
                 "protocol": PROTOCOL_AUTO,
                 "credential_id": "",
                 "headers": [],
-                "solve_acw_sc_v2": False,
             },
         )
 
@@ -232,6 +236,7 @@ class ActionNormalizationTests(unittest.TestCase):
                 "credential_id": " tk ",
                 "headers": "X-A: 1",
                 "solve_acw_sc_v2": 1,
+                "tls_mldsa": "yes",
             },
             allow_oauth=True,
         )
@@ -239,7 +244,9 @@ class ActionNormalizationTests(unittest.TestCase):
         self.assertEqual(action["protocol"], PROTOCOL_POST)
         self.assertEqual(action["credential_id"], "tk")
         self.assertEqual(action["headers"], [{"key": "X-A", "value": "1"}])
-        self.assertTrue(action["solve_acw_sc_v2"])
+        # Global settings now; what an earlier version stored per action is dropped.
+        self.assertNotIn("solve_acw_sc_v2", action)
+        self.assertNotIn("tls_mldsa", action)
 
 
 class SiteTypeTests(unittest.TestCase):
