@@ -1,13 +1,14 @@
 """Scheduler module managing daily sign-in execution and report formatting."""
 
 import asyncio
+import json
 import logging
 import random
 from datetime import datetime
 from typing import Any
 
 from .adapters import CheckInResult, create_adapter, persist_writeback
-from .http_client import create_client_session
+from .http_client import RequestOptions, create_client_session
 
 logger = logging.getLogger("astrbot")
 
@@ -404,6 +405,11 @@ class CheckInScheduler:
         site_results_to_persist: list[CheckInResult] = []
 
         async with create_client_session(settings) as session:
+            # One context for the whole run: a fingerprint Cloudflare let
+            # through for one site is reused by the next, and a host that
+            # turned every fingerprint away is not screened again per site.
+            cloudflare = self._cloudflare_context(settings)
+            options = RequestOptions.from_settings(settings)
             for idx, site_config in enumerate(enabled_sites):
                 site_id = self._normalize_site_id(site_config.get("id"))
                 site_name = site_config.get("name", "<unnamed>")
@@ -432,6 +438,8 @@ class CheckInScheduler:
                     site_config,
                     session,
                     getattr(self.plugin, "acw_cache_file", None),
+                    cloudflare,
+                    options,
                 )
                 result = await adapter.check_in()
                 self._persist_site_writeback(site_id, adapter)
@@ -474,11 +482,14 @@ class CheckInScheduler:
                 message=LOCKED_MESSAGE,
             )
 
-        async with create_client_session(self.plugin.get_settings()) as session:
+        settings = self.plugin.get_settings()
+        async with create_client_session(settings) as session:
             adapter = create_adapter(
                 site_config,
                 session,
                 getattr(self.plugin, "acw_cache_file", None),
+                self._cloudflare_context(settings),
+                RequestOptions.from_settings(settings),
             )
             result = await adapter.check_in()
             self._persist_site_writeback(normalized_site_id, adapter)
@@ -487,6 +498,21 @@ class CheckInScheduler:
             [result], manual, [result], checked_at
         )
         return result
+
+    def _cloudflare_context(self, settings: dict[str, Any]) -> Any:
+        """Build the run's Cloudflare context, or None when the plugin offers none.
+
+        Optional on purpose, like the lock-alert hook: a context that cannot be
+        built costs the run its challenge handling, never the run itself.
+        """
+        factory = getattr(self.plugin, "cloudflare_context", None)
+        if not callable(factory):
+            return None
+        try:
+            return factory(settings)
+        except Exception as exc:
+            logger.warning(f"Cloudflare handling unavailable for this run: {exc}", exc_info=True)
+            return None
 
     def _persist_site_writeback(self, site_id: str, adapter: Any) -> None:
         """Store config values the adapter discovered while running."""
@@ -502,6 +528,7 @@ class CheckInScheduler:
         results: list[CheckInResult],
         log_type: str,
         timestamp: str,
+        manual: bool | None = None,
     ) -> list[dict[str, Any]]:
         """Build one history entry per site result.
 
@@ -510,8 +537,10 @@ class CheckInScheduler:
 
         Args:
             results: Results of one run.
-            log_type: ``scheduled``, ``manual`` or ``test``.
+            log_type: ``scheduled``, ``manual``, ``test`` or ``task``.
             timestamp: Shared timestamp for every row of this run.
+            manual: Whether a user started the run; by default, whether
+                ``log_type`` is ``manual``.
 
         Returns:
             Entry dictionaries ready for ``record_history_entries``.
@@ -520,7 +549,7 @@ class CheckInScheduler:
             {
                 "timestamp": timestamp,
                 "type": log_type,
-                "manual": log_type == "manual",
+                "manual": log_type == "manual" if manual is None else manual,
                 "success": bool(result.success),
                 "report": CheckInScheduler.format_result_line(result),
                 "details": [result.to_dict()],

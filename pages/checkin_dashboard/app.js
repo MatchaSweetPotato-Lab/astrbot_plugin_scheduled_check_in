@@ -13,9 +13,19 @@ let settings = {
   http_timeout_seconds: 15,
   http_impersonate: '',
   http_impersonate_options: [],
+  http_impersonate_mldsa: {},
+  http_tls_mldsa: false,
+  acw_sc_v2_auto_solve: true,
   max_history_records: 0,
   lock_notify_session: '',
-  report_level: 'all'
+  report_level: 'all',
+  cf_fingerprint_fallback: true,
+  cf_browser_fallback: true,
+  cf_browser_headless: true,
+  cf_browser_channel: 'auto',
+  cf_browser_timeout_seconds: 60,
+  cf_browser_installed: false,
+  playwright: {}
 };
 let logItems = [];
 let logsNextBeforeId = null;
@@ -47,6 +57,9 @@ const SLOT_TYPE_LABELS = {
 // Credentials being edited in the site modal, kept out of `sites` until saved.
 let credentialDraft = [];
 let credentialSeq = 0;
+// Scheduled tasks being edited in the site modal; see the 「定时任务」 tab.
+let taskDraft = [];
+let taskSeq = 0;
 
 const CREDENTIAL_LABELS = {
   token: 'Authorization Token',
@@ -79,13 +92,22 @@ const OAUTH_COOKIE_NOTES = {
 const OAUTH_COOKIE_VOLATILITY = {
   github_oauth: 'Github 会对请求环境做检测，服务端发起的授权可能触发风控并使该 Cookie 失效'
     + '（有时会连带注销浏览器登录）。失效后需重新复制，必要时改用 LinuxDO OAuth 或 Token / Cookie 凭据。',
-  // Cloudflare fronts connect.linux.do and can serve a JS challenge that no
-  // server-side request can solve. Say it here, with why it is not implemented,
-  // rather than only after a check-in has already failed. Kept to roughly the
-  // length of the Github note above — the full detail is in the failure message.
+  // Cloudflare fronts connect.linux.do and can serve a JS challenge. Say what
+  // gets past it here, rather than only after a check-in failed. Kept to
+  // roughly the length of the Github note above — the full detail is in the
+  // failure message.
   linuxdo_oauth: 'connect.linux.do 由 Cloudflare 托管，可能以人机验证页拦截服务端请求；'
-    + '解算需引入无头浏览器依赖，插件暂不实现。应急可补一个浏览器通过验证后的 cf_clearance'
-    + '（绑定 IP 与浏览器指纹，仅数十分钟有效），长期建议改用 Github OAuth 或 Token / Cookie 凭据。'
+    + 'Cloudflare 会拦截不带 ML-DSA 的 Chrome 握手，可在「全局设置 → 网络与常规」开启「TLS 携带 ML-DSA」补上；'
+    + '带上也不保证每次通过，长期稳定建议改用 Github OAuth 或 Token / Cookie 凭据。'
+};
+
+// What the global ML-DSA switch does under a fingerprint, keyed by
+// core/http_client.py mldsa_support().
+const MLDSA_SUPPORT_NOTES = {
+  native: fingerprint => `所选指纹 ${fingerprint} 已自带 ML-DSA，开关与否都会携带。`,
+  added: fingerprint => `所选指纹 ${fingerprint} 不带 ML-DSA，开启后在其签名算法前补上。`,
+  not_chromium: fingerprint => `所选指纹 ${fingerprint} 不是 Chrome / Edge 指纹，此项不生效——真实的 Firefox / Safari 不发送 ML-DSA。`,
+  old_build: () => '当前 curl_cffi 版本过旧，无法发送 ML-DSA，此项不生效；可在「全局设置 → 网络与常规」重新安装 curl_cffi（需 0.16.2 及以上）。'
 };
 
 // Endpoints each framework already knows, shown as placeholder hints.
@@ -204,6 +226,20 @@ async function apiPost(endpoint, body = {}) {
     body: JSON.stringify(body)
   });
   return await res.json();
+}
+
+// Like apiPost, but a failure's message reaches the caller rather than the
+// console, and a failed request is never sent a second time: installs are not
+// something to repeat by accident.
+async function apiPostReportingErrors(endpoint, body = {}) {
+  if (window.AstrBotPluginPage) {
+    try {
+      return await window.AstrBotPluginPage.apiPost(endpoint, body);
+    } catch (e) {
+      return { status: 'error', message: e?.message || String(e) };
+    }
+  }
+  return apiPost(endpoint, body);
 }
 
 // Modal Controls
@@ -718,10 +754,16 @@ async function toggleSiteEnabled(index, enabled) {
 
 async function saveSites() {
   try {
-    await apiPost('/api/sites', sites);
+    const data = await apiPostReportingErrors('/api/sites', sites);
+    if (data && data.status === 'error') {
+      showToast(data.message || '保存配置失败', 'error', 8000);
+      return false;
+    }
     showToast('配置更新成功', 'success');
+    return true;
   } catch (e) {
     showToast('保存配置失败', 'error');
+    return false;
   }
 }
 
@@ -779,6 +821,10 @@ function getHeaderPairs(action) {
 
 // Site Modal Tabs
 function switchSiteTab(tab) {
+  if (tab === 'tasks') {
+    readCredentialDraftFromDom();
+    refreshTaskCredentialOptions();
+  }
   document.querySelectorAll('#site-tab-bar .tab-btn').forEach(button => {
     button.classList.toggle('active', button.dataset.tab === tab);
   });
@@ -908,6 +954,12 @@ function credentialSummary(credential) {
   return text.length <= 10 ? '******' : `${text.slice(0, 4)}***${text.slice(-4)}`;
 }
 
+/** Say what the ML-DSA switch does under a fingerprint (the saved one by default), if known. */
+function mldsaSupportNote(fingerprint = settings.http_impersonate || '') {
+  const note = MLDSA_SUPPORT_NOTES[settings.http_impersonate_mldsa?.[fingerprint]];
+  return note ? note(fingerprint) : '';
+}
+
 function buildCredentialCard(credential) {
   const isOauth = OAUTH_TYPES.includes(credential.type);
   const card = document.createElement('div');
@@ -1022,13 +1074,32 @@ function buildCredentialCard(credential) {
     const hasSession = credential.has_session === true || Boolean(credential.session_cookie);
     state.className = `cred-session-state${hasSession ? ' has-session' : ''}`;
     state.textContent = hasSession
-      ? `站点会话已保存${credential.session_updated_at ? ` (${credential.session_updated_at})` : ''}`
+      ? `${describeStationSession(credential)}${credential.session_updated_at ? ` (${credential.session_updated_at})` : ''}`
       : '尚未登录，首次签到时会自动完成 OAuth';
     body.appendChild(state);
   }
 
   card.appendChild(body);
   return card;
+}
+
+/**
+ * Name the station secrets an OAuth credential holds. Newer New-API builds
+ * issue a refresh-token cookie plus a short-lived access token instead of a
+ * session cookie; the values themselves never reach the dashboard.
+ */
+function describeStationSession(credential) {
+  const parts = [credential.has_refresh_token ? '刷新令牌 Cookie' : '会话 Cookie'];
+  if (credential.has_access_token) {
+    const expiresAt = Number(credential.access_expires_at) || 0;
+    const expiry = expiresAt
+      ? (expiresAt * 1000 > Date.now()
+        ? `，${new Date(expiresAt * 1000).toLocaleString()} 到期`
+        : `，已过期${credential.has_refresh_token ? '，使用时自动刷新' : ''}`)
+      : '';
+    parts.push(`访问令牌${expiry}`);
+  }
+  return `站点已保存：${parts.join('、')}`;
 }
 
 /**
@@ -1281,10 +1352,8 @@ function fillActionForm(action, config) {
   const source = config && typeof config === 'object' ? config : {};
   const path = document.getElementById(`${action}-path`);
   const protocol = document.getElementById(`${action}-protocol`);
-  const solve = document.getElementById(`${action}-solve-acw`);
   if (path) path.value = source.path || '';
   if (protocol) protocol.value = source.protocol || 'auto';
-  if (solve) solve.checked = source.solve_acw_sc_v2 === true;
   setHeaderRows(action, source.headers);
   renderActionCredentialOptions(action);
   const credential = document.getElementById(`${action}-credential`);
@@ -1299,8 +1368,7 @@ function readActionForm(action) {
     path: document.getElementById(`${action}-path`)?.value.trim() || '',
     protocol: document.getElementById(`${action}-protocol`)?.value || 'auto',
     credential_id: document.getElementById(`${action}-credential`)?.value || '',
-    headers: getHeaderPairs(action),
-    solve_acw_sc_v2: document.getElementById(`${action}-solve-acw`)?.checked === true
+    headers: getHeaderPairs(action)
   };
 }
 
@@ -1370,6 +1438,541 @@ function upsertHeaderPair(pairs, key, value) {
   return next;
 }
 
+// ---------------------------------------------------------------------------
+// Scheduled tasks (site editor, 「定时任务」 tab)
+// ---------------------------------------------------------------------------
+// Mirrors core/task_schema.py.
+const TASK_INTERVAL_LIMITS = { min: 1, max: 7 * 24 * 60 };
+const TASK_CRON_EXAMPLES = '例：*/30 * * * *（每 30 分钟）、0 * * * *（每小时整点）、0 8 * * *（每天 08:00）、0 9 * * 1-5（工作日 09:00）。'
+  + '字段依次为 分 时 日 月 星期，星期 0 与 7 都是周日；按运行 AstrBot 的机器的本地时间计算。';
+
+function nextTaskId() {
+  taskSeq += 1;
+  return `task_${Date.now()}_${taskSeq}`;
+}
+
+function newTaskDraft() {
+  return {
+    id: nextTaskId(),
+    name: '',
+    enabled: true,
+    schedule: 'cron',
+    cron: '0 * * * *',
+    interval_min: 60,
+    interval_max: 120,
+    method: 'GET',
+    url: '',
+    credential_id: '',
+    headers: [],
+    body: '',
+    log_history: true,
+    state: {},
+    expanded: true
+  };
+}
+
+function addTask() {
+  readTaskDraftFromDom();
+  taskDraft.forEach(task => { task.expanded = false; });
+  taskDraft.push(newTaskDraft());
+  renderTasks();
+}
+
+function removeTask(taskId) {
+  readTaskDraftFromDom();
+  taskDraft = taskDraft.filter(task => task.id !== taskId);
+  renderTasks();
+}
+
+function renderTasks() {
+  const list = document.getElementById('tasks-list');
+  const count = document.getElementById('tasks-count');
+  if (count) count.textContent = String(taskDraft.length);
+  if (!list) return;
+  list.replaceChildren();
+  if (taskDraft.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-text';
+    empty.textContent = '暂无定时任务，请从上方按钮添加';
+    list.appendChild(empty);
+    return;
+  }
+  taskDraft.forEach(task => list.appendChild(buildTaskCard(task)));
+}
+
+function taskHeadersKey(task) {
+  return `task-${task.id}`;
+}
+
+/** Read every task card back into taskDraft, headers included. */
+function readTaskDraftFromDom() {
+  document.querySelectorAll('#tasks-list .task-card').forEach(card => {
+    const task = taskDraft.find(item => item.id === card.dataset.taskId);
+    if (!task) return;
+    const value = selector => card.querySelector(selector);
+    task.name = value('.task-name').value.trim();
+    task.enabled = value('.task-enabled').checked;
+    task.schedule = value('.task-schedule').value;
+    task.cron = value('.task-cron').value.trim().split(/\s+/).filter(Boolean).join(' ');
+    task.interval_min = Number(value('.task-interval-min').value);
+    task.interval_max = Number(value('.task-interval-max').value);
+    task.method = value('.task-method').value;
+    task.url = value('.task-url').value.trim();
+    task.credential_id = value('.task-credential').value;
+    task.headers = getHeaderPairs(taskHeadersKey(task));
+    task.body = value('.task-body').value;
+    task.log_history = value('.task-log-history').checked;
+    task.expanded = !card.classList.contains('collapsed');
+  });
+}
+
+/** Why a task cannot be saved or run, mirroring validate_task(); '' when it can. */
+function validateTaskDraft(task) {
+  if (!task.url) return '请填写请求 URL';
+  if (!/^(https?:\/\/|\/)/i.test(task.url)) return 'URL 须以 http:// 或 https:// 开头，或以 / 开头表示站点 Base URL 下的路径';
+  if (task.schedule === 'cron') {
+    if (!task.cron) return '请填写 cron 表达式';
+    if (task.cron.split(' ').length !== 5) return 'cron 表达式应有 5 个字段（分 时 日 月 星期）';
+  } else {
+    const { min, max } = TASK_INTERVAL_LIMITS;
+    const low = task.interval_min;
+    const high = task.interval_max;
+    if (!Number.isInteger(low) || !Number.isInteger(high) || low < min || high < min || low > max || high > max) {
+      return `随机间隔须为 ${min} ~ ${max} 之间的整数分钟`;
+    }
+    if (low > high) return '随机间隔的最小值不能大于最大值';
+  }
+  if (task.method === 'POST' && task.body.trim()) {
+    try {
+      JSON.parse(task.body);
+    } catch (e) {
+      return `JSON Body 不是合法的 JSON：${e.message}`;
+    }
+  }
+  return '';
+}
+
+/** The tasks as they are saved: the editor-only fields left out. */
+function readTasksForSave() {
+  readTaskDraftFromDom();
+  return taskDraft.map(task => ({
+    id: task.id,
+    name: task.name,
+    enabled: task.enabled,
+    schedule: task.schedule,
+    cron: task.cron,
+    interval_min: task.interval_min,
+    interval_max: task.interval_max,
+    method: task.method,
+    url: task.url,
+    credential_id: task.credential_id,
+    headers: task.headers,
+    body: task.body,
+    log_history: task.log_history
+  }));
+}
+
+function describeTaskSchedule(task) {
+  if (task.schedule === 'interval') {
+    return task.interval_min === task.interval_max
+      ? `每 ${task.interval_min} 分钟`
+      : `每 ${task.interval_min}~${task.interval_max} 分钟`;
+  }
+  return task.cron ? `cron ${task.cron}` : '未设置 cron';
+}
+
+function describeTaskState(task) {
+  const state = task.state || {};
+  const parts = [];
+  if (!task.enabled) {
+    parts.push('已停用');
+  } else if (state.next_run_at) {
+    parts.push(`下次运行 ${state.next_run_at.slice(0, 16)}`);
+  }
+  if (state.last_run_at) {
+    parts.push(`上次 ${state.last_run_at.slice(5, 16)} ${state.last_success ? '成功' : '失败'}`);
+  }
+  return parts.join(' · ') || '尚未运行，保存后开始计时';
+}
+
+// The credential picker lists the credentials currently drafted.
+function fillTaskCredentialOptions(select, selected) {
+  select.replaceChildren();
+  const none = document.createElement('option');
+  none.value = '';
+  none.textContent = '不使用凭据（仅发送下方请求头）';
+  select.appendChild(none);
+  credentialDraft.forEach(credential => {
+    const option = document.createElement('option');
+    option.value = credential.id;
+    const name = CREDENTIAL_LABELS[credential.type] || credential.type;
+    option.textContent = credential.label ? `${name} — ${credential.label}` : name;
+    select.appendChild(option);
+  });
+  if (selected && !credentialDraft.some(item => item.id === selected)) {
+    const missing = document.createElement('option');
+    missing.value = selected;
+    missing.textContent = '（该凭据已删除，请重新选择）';
+    select.appendChild(missing);
+  }
+  select.value = selected || '';
+}
+
+function refreshTaskCredentialOptions() {
+  document.querySelectorAll('#tasks-list .task-card').forEach(card => {
+    const select = card.querySelector('.task-credential');
+    fillTaskCredentialOptions(select, select.value);
+  });
+}
+
+let taskPreviewTimers = {};
+
+/** Show the next run times of a card's schedule, as the server works them out. */
+function scheduleTaskPreview(card, task) {
+  clearTimeout(taskPreviewTimers[task.id]);
+  const hint = card.querySelector('.task-schedule-preview');
+  taskPreviewTimers[task.id] = setTimeout(async () => {
+    const schedule = card.querySelector('.task-schedule').value;
+    const payload = {
+      schedule,
+      cron: card.querySelector('.task-cron').value,
+      interval_min: Number(card.querySelector('.task-interval-min').value),
+      interval_max: Number(card.querySelector('.task-interval-max').value)
+    };
+    if (schedule === 'cron' && !payload.cron.trim()) {
+      hint.textContent = TASK_CRON_EXAMPLES;
+      hint.classList.remove('task-hint-error');
+      return;
+    }
+    try {
+      const data = await apiPost('/api/tasks/preview', payload);
+      if (data?.error) {
+        hint.textContent = data.error;
+        hint.classList.add('task-hint-error');
+      } else {
+        const runs = Array.isArray(data?.runs) ? data.runs : [];
+        hint.textContent = schedule === 'cron' ? `接下来：${runs.join('、')}` : runs.join('');
+        hint.classList.remove('task-hint-error');
+      }
+    } catch (e) {
+      hint.textContent = schedule === 'cron' ? TASK_CRON_EXAMPLES : '';
+      hint.classList.remove('task-hint-error');
+    }
+  }, 350);
+}
+
+function buildTaskCard(task) {
+  const card = document.createElement('div');
+  card.className = `cred-card task-card${task.expanded ? '' : ' collapsed'}`;
+  card.dataset.taskId = task.id;
+  const field = (labelText, ...children) => {
+    const group = document.createElement('div');
+    group.className = 'form-group';
+    if (labelText) {
+      const label = document.createElement('label');
+      label.textContent = labelText;
+      group.appendChild(label);
+    }
+    group.append(...children);
+    return group;
+  };
+  const input = (className, type = 'text', value = '') => {
+    const element = document.createElement('input');
+    element.type = type;
+    element.className = `form-control ${className}`;
+    element.value = value;
+    return element;
+  };
+  const select = (className, options, value) => {
+    const element = document.createElement('select');
+    element.className = `form-control ${className}`;
+    options.forEach(([optionValue, text]) => {
+      const option = document.createElement('option');
+      option.value = optionValue;
+      option.textContent = text;
+      element.appendChild(option);
+    });
+    element.value = value;
+    return element;
+  };
+  const hint = (className = '') => {
+    const element = document.createElement('div');
+    element.className = `form-hint ${className}`.trim();
+    return element;
+  };
+
+  // ---------- header ----------
+  const header = document.createElement('div');
+  header.className = 'cred-card-header';
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'cred-toggle';
+  const caret = document.createElement('span');
+  caret.className = 'cred-caret';
+  caret.textContent = task.expanded ? '▾' : '▸';
+  const tag = document.createElement('span');
+  const name = document.createElement('span');
+  name.className = 'cred-name';
+  const summary = document.createElement('span');
+  summary.className = 'cred-summary';
+  toggle.append(caret, tag, name, summary);
+  toggle.addEventListener('click', () => {
+    const collapsed = card.classList.toggle('collapsed');
+    caret.textContent = collapsed ? '▸' : '▾';
+  });
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'btn-icon-danger';
+  remove.title = '删除此任务';
+  remove.textContent = '×';
+  remove.addEventListener('click', event => {
+    event.stopPropagation();
+    showConfirm(`确定删除定时任务「${task.name || '未命名任务'}」吗？保存站点后生效。`, () => removeTask(task.id));
+  });
+  header.append(toggle, remove);
+
+  const body = document.createElement('div');
+  body.className = 'cred-card-body';
+
+  // ---------- name and switch ----------
+  const nameInput = input('task-name', 'text', task.name);
+  nameInput.placeholder = '例如：保活请求';
+  body.appendChild(field('任务名称', nameInput));
+  const enabledLabel = document.createElement('label');
+  enabledLabel.className = 'checkbox-label';
+  const enabledInput = document.createElement('input');
+  enabledInput.type = 'checkbox';
+  enabledInput.className = 'task-enabled';
+  enabledInput.checked = task.enabled !== false;
+  const enabledText = document.createElement('span');
+  enabledText.textContent = '启用此任务';
+  enabledLabel.append(enabledInput, enabledText);
+  body.appendChild(field('', enabledLabel));
+
+  // ---------- schedule ----------
+  const scheduleSelect = select('task-schedule', [['cron', 'Cron 表达式'], ['interval', '随机时间间隔']], task.schedule);
+  const cronInput = input('task-cron', 'text', task.cron);
+  cronInput.placeholder = '*/30 * * * *';
+  cronInput.spellcheck = false;
+  const minInput = input('task-interval task-interval-min', 'number', task.interval_min);
+  const maxInput = input('task-interval task-interval-max', 'number', task.interval_max);
+  [minInput, maxInput].forEach(element => {
+    element.min = String(TASK_INTERVAL_LIMITS.min);
+    element.max = String(TASK_INTERVAL_LIMITS.max);
+    element.step = '1';
+  });
+  const intervalRow = document.createElement('div');
+  intervalRow.className = 'task-row';
+  const between = document.createElement('span');
+  between.textContent = '~';
+  const unit = document.createElement('span');
+  unit.textContent = '分钟（每次运行后在此范围内随机取值）';
+  intervalRow.append(minInput, between, maxInput, unit);
+  const preview = hint('task-schedule-preview');
+  body.appendChild(field('调度方式', scheduleSelect));
+  const cronGroup = field('Cron 表达式', cronInput);
+  const intervalGroup = field('随机间隔', intervalRow);
+  body.append(cronGroup, intervalGroup);
+  body.appendChild(preview);
+
+  // ---------- request ----------
+  const methodSelect = select('task-method', [['GET', 'GET'], ['POST', 'POST']], task.method);
+  const urlInput = input('task-url', 'text', task.url);
+  urlInput.placeholder = 'https://example.com/api/ping 或 /api/ping（相对站点 Base URL）';
+  const requestRow = document.createElement('div');
+  requestRow.className = 'task-row';
+  requestRow.append(methodSelect, urlInput);
+  body.appendChild(field('请求', requestRow));
+
+  const credentialSelect = document.createElement('select');
+  credentialSelect.className = 'form-control task-credential';
+  fillTaskCredentialOptions(credentialSelect, task.credential_id);
+  const credentialHint = hint();
+  credentialHint.textContent = '选用凭据时按签到请求的方式带上它（Token / Cookie，或 OAuth 登录后的会话），下方请求头最后应用、可覆盖同名项。';
+  body.appendChild(field('使用凭据', credentialSelect, credentialHint));
+
+  // ---------- headers (the shared key-value editor) ----------
+  const headersKey = taskHeadersKey(task);
+  const headersGroup = document.createElement('div');
+  headersGroup.className = 'form-group';
+  const headersHeader = document.createElement('div');
+  headersHeader.className = 'kv-header';
+  const headersLabel = document.createElement('label');
+  headersLabel.style.margin = '0';
+  headersLabel.textContent = '自定义请求头 (可选)';
+  const addHeader = document.createElement('button');
+  addHeader.type = 'button';
+  addHeader.className = 'btn btn-sm btn-primary-plain';
+  addHeader.textContent = '+ 添加 Header';
+  addHeader.addEventListener('click', () => addHeaderRow(headersKey));
+  headersHeader.append(headersLabel, addHeader);
+  const headersContainer = document.createElement('div');
+  headersContainer.className = 'kv-editor';
+  headersContainer.id = `${headersKey}-headers-container`;
+  headersGroup.append(headersHeader, headersContainer);
+  body.appendChild(headersGroup);
+
+  // ---------- JSON body ----------
+  const bodyInput = document.createElement('textarea');
+  bodyInput.className = 'form-control task-body';
+  bodyInput.rows = 5;
+  bodyInput.spellcheck = false;
+  bodyInput.placeholder = '{"key": "value"}';
+  bodyInput.value = task.body || '';
+  const bodyHint = hint();
+  const formatBody = document.createElement('button');
+  formatBody.type = 'button';
+  formatBody.className = 'btn btn-sm';
+  formatBody.textContent = '格式化';
+  formatBody.addEventListener('click', () => {
+    try {
+      bodyInput.value = JSON.stringify(JSON.parse(bodyInput.value), null, 2);
+      checkBody();
+    } catch (e) {
+      checkBody();
+    }
+  });
+  const checkBody = () => {
+    const text = bodyInput.value.trim();
+    if (!text) {
+      bodyHint.textContent = '留空则不发送请求体。会以 Content-Type: application/json 发送。';
+      bodyHint.classList.remove('task-hint-error');
+      return;
+    }
+    try {
+      JSON.parse(text);
+      bodyHint.textContent = 'JSON 格式正确。';
+      bodyHint.classList.remove('task-hint-error');
+    } catch (e) {
+      bodyHint.textContent = `JSON 格式错误：${e.message}`;
+      bodyHint.classList.add('task-hint-error');
+    }
+  };
+  bodyInput.addEventListener('input', checkBody);
+  const bodyHeader = document.createElement('div');
+  bodyHeader.className = 'kv-header';
+  const bodyLabel = document.createElement('label');
+  bodyLabel.style.margin = '0';
+  bodyLabel.textContent = 'JSON Body (可选)';
+  bodyHeader.append(bodyLabel, formatBody);
+  const bodyGroup = document.createElement('div');
+  bodyGroup.className = 'form-group';
+  bodyGroup.append(bodyHeader, bodyInput, bodyHint);
+  body.appendChild(bodyGroup);
+
+  // ---------- history ----------
+  const logLabel = document.createElement('label');
+  logLabel.className = 'checkbox-label';
+  logLabel.title = '运行频繁的任务可关闭，以免挤占历史日志的保留条数；手动运行总会记录';
+  const logInput = document.createElement('input');
+  logInput.type = 'checkbox';
+  logInput.className = 'task-log-history';
+  logInput.checked = task.log_history !== false;
+  const logText = document.createElement('span');
+  logText.textContent = '每次运行写入历史日志';
+  logLabel.append(logInput, logText);
+  body.appendChild(field('', logLabel));
+
+  // ---------- state and run-now ----------
+  const stateRow = document.createElement('div');
+  stateRow.className = 'task-state';
+  const stateText = document.createElement('span');
+  stateText.className = 'task-state-text';
+  const lastMessage = document.createElement('span');
+  const runButton = document.createElement('button');
+  runButton.type = 'button';
+  runButton.className = 'btn btn-sm btn-success-plain';
+  runButton.textContent = '立即运行';
+  runButton.title = '按当前填写的内容（无需先保存）发送一次请求，结果写入历史日志';
+  runButton.addEventListener('click', () => runTaskNow(task.id, runButton, lastMessage));
+  stateRow.append(stateText, runButton);
+  const messageRow = hint();
+  messageRow.appendChild(lastMessage);
+  body.append(stateRow, messageRow);
+
+  const renderLastMessage = () => {
+    const state = task.state || {};
+    lastMessage.className = state.last_success ? 'ok' : 'fail';
+    lastMessage.textContent = state.last_message ? `上次结果：${state.last_message}` : '';
+  };
+
+  // ---------- keep the header and the visible fields in step ----------
+  const sync = () => {
+    readTaskDraftFromDom();
+    const isCron = scheduleSelect.value === 'cron';
+    cronGroup.style.display = isCron ? '' : 'none';
+    intervalGroup.style.display = isCron ? 'none' : '';
+    bodyGroup.style.display = methodSelect.value === 'POST' ? '' : 'none';
+    tag.className = `cred-type-tag task-tag${enabledInput.checked ? '' : ' disabled'}`;
+    tag.textContent = enabledInput.checked ? methodSelect.value : '停用';
+    name.textContent = nameInput.value.trim() || '未命名任务';
+    summary.textContent = `${describeTaskSchedule(task)} · ${describeTaskState(task)}`;
+    stateText.textContent = describeTaskState(task);
+  };
+  [nameInput, cronInput, minInput, maxInput, urlInput].forEach(element => element.addEventListener('input', sync));
+  [enabledInput, scheduleSelect, methodSelect].forEach(element => element.addEventListener('change', sync));
+  [scheduleSelect, cronInput, minInput, maxInput].forEach(element => {
+    element.addEventListener(element === scheduleSelect ? 'change' : 'input', () => scheduleTaskPreview(card, task));
+  });
+
+  card.append(header, body);
+  // Header rows need the container in the document to be found by id.
+  queueMicrotask(() => {
+    setHeaderRows(headersKey, task.headers);
+    sync();
+    checkBody();
+    renderLastMessage();
+    scheduleTaskPreview(card, task);
+  });
+  card.renderLastMessage = renderLastMessage;
+  card.syncTask = sync;
+  return card;
+}
+
+async function runTaskNow(taskId, button, output) {
+  readCredentialDraftFromDom();
+  readTaskDraftFromDom();
+  const task = taskDraft.find(item => item.id === taskId);
+  if (!task) return;
+  const problem = validateTaskDraft(task);
+  if (problem) {
+    output.className = 'fail';
+    output.textContent = problem;
+    showToast(problem, 'warning');
+    return;
+  }
+  const site = buildSitePayloadFromForm();
+  if (task.url.startsWith('/') && !site.base_url) {
+    showToast('URL 为相对路径时，请先在「基本」页填写 Base URL', 'warning');
+    return;
+  }
+  button.disabled = true;
+  output.className = '';
+  output.textContent = '正在运行…';
+  try {
+    const data = await apiPostReportingErrors('/api/sites/tasks/run', { site, task_id: taskId });
+    if (!data || data.status !== 'ok') {
+      output.className = 'fail';
+      output.textContent = data?.message || '运行失败';
+      showToast(output.textContent, 'error');
+      return;
+    }
+    const result = data.result || {};
+    task.state = data.state && Object.keys(data.state).length
+      ? data.state
+      : { ...task.state, last_success: result.success, last_message: result.message };
+    const card = document.querySelector(`#tasks-list .task-card[data-task-id="${CSS.escape(taskId)}"]`);
+    card?.syncTask?.();
+    card?.renderLastMessage?.();
+    showToast(result.message || (result.success ? '运行成功' : '运行失败'), result.success ? 'success' : 'error', 6000);
+  } catch (e) {
+    output.className = 'fail';
+    output.textContent = '运行请求失败';
+  } finally {
+    button.disabled = false;
+  }
+}
+
 /** Build a site payload from the editor, for actions that run before saving. */
 function buildSitePayloadFromForm() {
   const previous = isEdit && editIndex >= 0 ? sites[editIndex] : null;
@@ -1400,6 +2003,7 @@ function buildSitePayloadFromForm() {
     }),
     checkin: readActionForm('checkin'),
     balance: readActionForm('balance'),
+    tasks: readTasksForSave(),
     enabled: document.getElementById('site-enabled')?.checked === true
   };
 }
@@ -1416,6 +2020,8 @@ function openAddSiteModal() {
   document.getElementById('site-enabled').checked = true;
   credentialDraft = [];
   renderCredentials();
+  taskDraft = [];
+  renderTasks();
   fillActionForm('checkin', {});
   fillActionForm('balance', {});
   renderFrameworkHints();
@@ -1448,6 +2054,13 @@ function openEditSiteModal(index) {
     loadedValue: credential.value || ''
   }));
   renderCredentials();
+  taskDraft = (Array.isArray(site.tasks) ? site.tasks : []).map(task => ({
+    ...task,
+    headers: Array.isArray(task.headers) ? task.headers.map(pair => ({ ...pair })) : [],
+    state: task.state || {},
+    expanded: false
+  }));
+  renderTasks();
   fillActionForm('checkin', site.checkin);
   fillActionForm('balance', site.balance);
   renderFrameworkHints();
@@ -1489,6 +2102,18 @@ async function submitSiteForm() {
     return;
   }
 
+  const tasks = readTasksForSave();
+  for (const task of taskDraft) {
+    const problem = validateTaskDraft(task);
+    if (problem) {
+      showToast(`定时任务「${task.name || '未命名任务'}」：${problem}`, 'warning', 6000);
+      switchSiteTab('tasks');
+      const card = document.querySelector(`#tasks-list .task-card[data-task-id="${CSS.escape(task.id)}"]`);
+      if (card?.classList.contains('collapsed')) card.querySelector('.cred-toggle')?.click();
+      return;
+    }
+  }
+
   const previous = isEdit && editIndex >= 0 ? sites[editIndex] : null;
   const siteData = {
     id: previous ? previous.id : 'site_' + Date.now(),
@@ -1513,6 +2138,7 @@ async function submitSiteForm() {
     }),
     checkin,
     balance: readActionForm('balance'),
+    tasks,
     enabled
   };
   if (previous) {
@@ -1529,7 +2155,11 @@ async function submitSiteForm() {
   }
 
   renderSitesTable();
-  await saveSites();
+  if (!(await saveSites())) {
+    // Keep the editor open with its contents; put the table back as stored.
+    await loadSites();
+    return;
+  }
   closeModal('site-modal');
   await loadSites();
 }
@@ -2264,9 +2894,23 @@ function renderSettingsForm() {
   if (reportLevelSelect) {
     reportLevelSelect.value = settings.report_level || 'all';
   }
+  document.getElementById('setting-cf-fallback').checked = settings.cf_fingerprint_fallback !== false;
+  document.getElementById('setting-tls-mldsa').checked = settings.http_tls_mldsa === true;
+  document.getElementById('setting-acw-solve').checked = settings.acw_sc_v2_auto_solve !== false;
+  renderCloudflareBrowserFields();
   renderImpersonateOptions();
+  renderMldsaHint();
+  renderCurlCffiStatus();
   toggleRandomMode();
   renderVaultUi();
+}
+
+// What the ML-DSA switch does under the fingerprint picked in the form.
+function renderMldsaHint() {
+  const hint = document.getElementById('setting-mldsa-hint');
+  if (!hint) return;
+  const fingerprint = document.getElementById('setting-http-impersonate')?.value || settings.http_impersonate || '';
+  hint.textContent = mldsaSupportNote(fingerprint);
 }
 
 function renderImpersonateOptions() {
@@ -2297,6 +2941,304 @@ function renderImpersonateOptions() {
     select.appendChild(option);
   });
   select.value = options.includes(normalizedCurrent) ? normalizedCurrent : options[0];
+}
+
+// Which curl_cffi runs, and whether a reinstall is waiting for a restart.
+function renderCurlCffiStatus() {
+  const status = document.getElementById('curl-cffi-status');
+  const button = document.getElementById('btn-reinstall-curl-cffi');
+  if (!status || !button) return;
+  const info = settings.curl_cffi || {};
+  const loaded = info.loaded_version || '未知版本';
+  const installed = info.installed_version || '';
+  const options = Array.isArray(settings.http_impersonate_options) ? settings.http_impersonate_options : [];
+  button.disabled = info.reinstalling === true;
+  if (info.reinstalling) {
+    status.textContent = '正在重新安装 curl_cffi…';
+  } else if (installed && installed !== loaded) {
+    status.textContent = `已安装 curl_cffi ${installed}，当前运行的仍是 ${loaded}，重启 AstrBot 后生效。`;
+  } else if (!options.includes('chrome150')) {
+    status.textContent = `当前 curl_cffi ${loaded} 不含 chrome150 指纹（插件要求 ${info.requirement || 'curl_cffi>=0.16.2'}），建议重新安装。`;
+  } else {
+    status.textContent = `当前 curl_cffi ${loaded}。`;
+  }
+}
+
+function reinstallCurlCffi() {
+  showConfirm(
+    '将通过 AstrBot 的 pip（沿用其镜像源与安装参数）重新安装 curl_cffi，可能需要一两分钟。安装完成后须重启 AstrBot 才会生效，确定继续？',
+    async () => {
+      const button = document.getElementById('btn-reinstall-curl-cffi');
+      const status = document.getElementById('curl-cffi-status');
+      button.disabled = true;
+      status.textContent = '正在重新安装 curl_cffi，请勿关闭本页…';
+      try {
+        const data = await apiPost('/api/dependencies/curl_cffi/reinstall', {});
+        if (!data || data.status !== 'ok') {
+          status.textContent = data?.message || '重新安装 curl_cffi 失败';
+          showToast(status.textContent, 'error', 8000);
+          return;
+        }
+        settings.curl_cffi = data.curl_cffi || settings.curl_cffi;
+        renderCurlCffiStatus();
+        showToast(data.message || 'curl_cffi 已重新安装，重启 AstrBot 后生效', 'success', 8000);
+      } catch (e) {
+        status.textContent = '重新安装请求失败';
+        showToast(status.textContent, 'error');
+      } finally {
+        button.disabled = false;
+      }
+    }
+  );
+}
+
+function renderCloudflareBrowserFields() {
+  document.getElementById('setting-cf-browser').checked = settings.cf_browser_fallback !== false;
+  document.getElementById('setting-cf-browser-headless').checked = settings.cf_browser_headless !== false;
+  renderBrowserChannelOptions(settings.cf_browser_channel || 'auto');
+  document.getElementById('setting-cf-browser-timeout').value = settings.cf_browser_timeout_seconds ?? 60;
+  document.getElementById('cf-browser-check-result').textContent = '';
+  renderBrowserInstallHint();
+  renderPlaywrightSetup();
+  toggleCloudflareBrowserFields();
+  const info = settings.playwright || {};
+  if (info.installing || info.chromium?.downloading) watchPlaywrightSetup();
+}
+
+const BROWSER_CHANNEL_NAMES = { chrome: 'Chrome', msedge: 'Edge', chromium: 'Chromium' };
+
+// The browser choices are the browsers the server found on its machine, in the
+// order "auto" tries them. A saved choice no longer found stays selectable,
+// marked as such, rather than being switched to another behind the user's back.
+function renderBrowserChannelOptions(selected) {
+  const select = document.getElementById('setting-cf-browser-channel');
+  const browsers = Array.isArray(settings.playwright?.browsers) ? settings.playwright.browsers : [];
+  const names = browsers.map(b => b.name);
+  const option = (value, text, title = '') => {
+    const element = document.createElement('option');
+    element.value = value;
+    element.textContent = text;
+    if (title) element.title = title;
+    return element;
+  };
+
+  let autoText = '自动（未检测到可用的浏览器）';
+  if (names.length === 1) autoText = `自动（${names[0]}）`;
+  else if (names.length > 1) autoText = `自动（依次尝试 ${names.join('、')}，使用第一个能启动的）`;
+  select.replaceChildren(option('auto', autoText));
+  browsers.forEach(b => {
+    const version = b.version ? ` ${b.version}` : '';
+    const origin = b.channel === 'chromium' ? '（Playwright 下载）' : '';
+    select.appendChild(option(b.channel, `${b.name}${version}${origin}`, b.path || ''));
+  });
+  if (selected !== 'auto' && !browsers.some(b => b.channel === selected) && BROWSER_CHANNEL_NAMES[selected]) {
+    select.appendChild(option(selected, `${BROWSER_CHANNEL_NAMES[selected]}（未检测到）`));
+  }
+  select.value = selected;
+  if (select.value !== selected) select.value = 'auto';
+
+  document.getElementById('cf-browser-channel-hint').textContent = names.length
+    ? '列出的是在运行 AstrBot 的机器上检测到的浏览器（Chrome / Edge 按 Playwright 查找的安装位置检测，不启动浏览器）。可用下方「检测浏览器」确认能否启动。'
+    : '未在运行 AstrBot 的机器上检测到 Chrome、Edge 或 Playwright 的 Chromium：请按上方说明下载 Chromium。';
+}
+
+function renderBrowserInstallHint() {
+  document.getElementById('cf-browser-install-hint').textContent = settings.cf_browser_installed
+    ? ''
+    : '当前未安装 Playwright，此项暂不生效：开启后可在下方「浏览器组件」中一键安装。';
+}
+
+// Playwright, and the Chromium it drives, as the server last reported them.
+function renderPlaywrightSetup() {
+  const info = settings.playwright || {};
+  const chromium = info.chromium || {};
+  const commands = info.commands || {};
+  const loaded = info.loaded === true;
+  const installed = info.installed_version || '';
+
+  const installButton = document.getElementById('btn-install-playwright');
+  const status = document.getElementById('playwright-status');
+  installButton.style.display = loaded ? 'none' : '';
+  installButton.disabled = info.installing === true;
+  if (info.installing) {
+    status.textContent = '正在安装 Playwright，请勿关闭本页…';
+  } else if (loaded) {
+    status.textContent = `Playwright ${installed} 已就绪。`;
+  } else if (installed && info.import_error) {
+    status.textContent = `已安装 Playwright ${installed}，但当前进程无法加载（${info.import_error}），请重启 AstrBot。`;
+  } else if (installed) {
+    status.textContent = `已安装 Playwright ${installed}，重启 AstrBot 后生效。`;
+  } else {
+    status.textContent = `未安装 Playwright（插件要求 ${info.requirement || 'playwright>=1.49.0'}，约 40 MB）。安装后无需重启即可使用。`;
+  }
+  const pipGuide = document.getElementById('playwright-pip-guide');
+  pipGuide.style.display = !loaded && !installed && commands.pip ? '' : 'none';
+  document.getElementById('playwright-pip-command').textContent = commands.pip || '';
+
+  // Chromium is downloaded by Playwright's own installer, so only once it runs.
+  document.getElementById('chromium-setup').style.display = loaded ? '' : 'none';
+  const downloaded = chromium.downloaded === true;
+  const version = chromium.version ? ` ${chromium.version}` : '';
+  const systemBrowsers = (Array.isArray(info.browsers) ? info.browsers : [])
+    .filter(b => b.channel !== 'chromium')
+    .map(b => b.name);
+  const downloadButton = document.getElementById('btn-download-chromium');
+  const chromiumStatus = document.getElementById('chromium-status');
+  downloadButton.style.display = downloaded ? 'none' : '';
+  downloadButton.disabled = chromium.downloading === true;
+  if (chromium.downloading) {
+    chromiumStatus.textContent = chromium.progress || '正在下载 Chromium，请稍候…';
+  } else if (downloaded) {
+    chromiumStatus.textContent = `已下载 Playwright 的 Chromium${version}。`;
+  } else if (systemBrowsers.length) {
+    chromiumStatus.textContent = `未下载 Playwright 的 Chromium${version}。已检测到 ${systemBrowsers.join('、')}，可直接使用，无需下载。`;
+  } else {
+    chromiumStatus.textContent = `未下载 Playwright 的 Chromium${version}，也未检测到 Chrome / Edge，请下载（约 200 MB）。`;
+  }
+  const command = commands.browser || '';
+  document.getElementById('chromium-guide').style.display = !downloaded && !systemBrowsers.length && command ? '' : 'none';
+  document.getElementById('chromium-command').textContent = command;
+  document.getElementById('chromium-guide-note').textContent = command.includes('--with-deps')
+    ? '--with-deps 会一并用系统包管理器安装 Chromium 所需的系统库，需要 root 权限（一键下载仅在 AstrBot 以 root 运行时附带此项）。下载经由 AstrBot 进程的 HTTPS_PROXY 代理。'
+    : '下载经由 AstrBot 进程的 HTTPS_PROXY 代理。';
+  // A download may have just added Chromium; keep what the form has chosen.
+  renderBrowserChannelOptions(document.getElementById('setting-cf-browser-channel').value || 'auto');
+}
+
+async function copyCommand(id) {
+  const box = document.getElementById(id);
+  if (await copyText(box?.textContent || '')) {
+    showToast('命令已复制', 'success');
+  } else {
+    selectElementText(box);
+    showToast('复制失败，命令已选中，请按 Ctrl+C 复制', 'error');
+  }
+}
+
+// Poll Playwright's state while an install or download runs, so its progress
+// shows — including one started before this page was opened.
+let playwrightWatchTimer = null;
+let playwrightSetupsRunning = 0;
+
+function watchPlaywrightSetup() {
+  if (playwrightWatchTimer) return;
+  playwrightWatchTimer = setInterval(async () => {
+    const info = await refreshPlaywrightStatus();
+    const busy = info && (info.installing || info.chromium?.downloading);
+    if (!busy && playwrightSetupsRunning === 0) {
+      clearInterval(playwrightWatchTimer);
+      playwrightWatchTimer = null;
+    }
+  }, 1500);
+}
+
+async function refreshPlaywrightStatus() {
+  try {
+    const data = await apiGet('/api/dependencies/playwright');
+    if (data?.playwright) {
+      settings.playwright = data.playwright;
+      settings.cf_browser_installed = data.playwright.loaded === true;
+      renderBrowserInstallHint();
+      renderPlaywrightSetup();
+      return data.playwright;
+    }
+  } catch (e) {
+    // Keep what is shown; the next poll or the final response catches up.
+  }
+  return null;
+}
+
+async function runPlaywrightSetup({ endpoint, buttonId, statusId, pendingText, failureText }) {
+  const button = document.getElementById(buttonId);
+  const status = document.getElementById(statusId);
+  button.disabled = true;
+  status.textContent = pendingText;
+  playwrightSetupsRunning += 1;
+  watchPlaywrightSetup();
+  let data = null;
+  try {
+    data = await apiPostReportingErrors(endpoint, {});
+  } catch (e) {
+    data = { status: 'error', message: `${failureText}（详情见 AstrBot 日志）` };
+  } finally {
+    playwrightSetupsRunning -= 1;
+  }
+  if (data?.status === 'ok' && data.playwright) {
+    settings.playwright = data.playwright;
+    settings.cf_browser_installed = data.playwright.loaded === true;
+    renderBrowserInstallHint();
+    renderPlaywrightSetup();
+    showToast(data.message || '已完成', 'success', 8000);
+    return;
+  }
+  await refreshPlaywrightStatus();
+  button.disabled = false;
+  status.textContent = data?.message || failureText;
+  showToast(status.textContent, 'error', 10000);
+}
+
+function installPlaywright() {
+  showConfirm(
+    '将通过 AstrBot 的 pip（沿用其镜像源与安装参数）安装 Playwright，可能需要一两分钟，确定继续？',
+    () => runPlaywrightSetup({
+      endpoint: '/api/dependencies/playwright/install',
+      buttonId: 'btn-install-playwright',
+      statusId: 'playwright-status',
+      pendingText: '正在安装 Playwright，请勿关闭本页…',
+      failureText: '安装 Playwright 失败'
+    })
+  );
+}
+
+function downloadChromium() {
+  showConfirm(
+    '将在运行 AstrBot 的机器上下载 Playwright 所用的 Chromium（约 200 MB），视网络情况可能需要数分钟，确定继续？',
+    () => runPlaywrightSetup({
+      endpoint: '/api/dependencies/playwright/chromium',
+      buttonId: 'btn-download-chromium',
+      statusId: 'chromium-status',
+      pendingText: '正在下载 Chromium，请勿关闭本页…',
+      failureText: '下载 Chromium 失败'
+    })
+  );
+}
+
+function toggleCloudflareBrowserFields() {
+  const enabled = document.getElementById('setting-cf-browser').checked;
+  document.getElementById('cf-browser-fields').style.display = enabled ? 'block' : 'none';
+}
+
+function readCloudflareBrowserForm() {
+  const timeoutElement = document.getElementById('setting-cf-browser-timeout');
+  const timeout = Number(timeoutElement.value);
+  const cf_browser_timeout_seconds = Number.isFinite(timeout) ? Math.min(300, Math.max(15, Math.round(timeout))) : 60;
+  timeoutElement.value = String(cf_browser_timeout_seconds);
+  return {
+    cf_browser_fallback: document.getElementById('setting-cf-browser').checked,
+    cf_browser_headless: document.getElementById('setting-cf-browser-headless').checked,
+    cf_browser_channel: document.getElementById('setting-cf-browser-channel').value || 'auto',
+    cf_browser_timeout_seconds
+  };
+}
+
+async function checkCloudflareBrowser() {
+  const button = document.getElementById('btn-check-browser');
+  const result = document.getElementById('cf-browser-check-result');
+  button.disabled = true;
+  result.textContent = '正在启动浏览器…';
+  try {
+    // The form as it stands, so a channel can be tried before it is saved.
+    const data = await apiPost('/api/cloudflare/browser/check', readCloudflareBrowserForm());
+    if (!data || data.status !== 'ok') {
+      result.textContent = data?.message || '浏览器检测失败';
+      return;
+    }
+    result.textContent = data.message || `已启动 ${data.browser}`;
+  } catch (e) {
+    result.textContent = '浏览器检测请求失败';
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function toggleRandomMode() {
@@ -2334,6 +3276,10 @@ async function saveSettings() {
   if (lockNotifyInput) lockNotifyInput.value = lock_notify_session;
   const reportLevelSelect = document.getElementById('setting-report-level');
   const report_level = reportLevelSelect ? reportLevelSelect.value : 'all';
+  const cf_fingerprint_fallback = document.getElementById('setting-cf-fallback').checked;
+  const http_tls_mldsa = document.getElementById('setting-tls-mldsa').checked;
+  const acw_sc_v2_auto_solve = document.getElementById('setting-acw-solve').checked;
+  const cloudflareBrowser = readCloudflareBrowserForm();
 
   settings = {
     enabled,
@@ -2346,7 +3292,11 @@ async function saveSettings() {
     http_impersonate,
     max_history_records,
     lock_notify_session,
-    report_level
+    report_level,
+    cf_fingerprint_fallback,
+    http_tls_mldsa,
+    acw_sc_v2_auto_solve,
+    ...cloudflareBrowser
   };
 
   try {
@@ -2401,6 +3351,7 @@ async function resetCustomTargetTime() {
 
 // History Logs Actions & Infinite Scroll Pagination
 function getLogTitle(log) {
+  if (log.type === 'task') return log.manual ? '定时任务（手动运行）' : '定时任务';
   if (log.type === 'test') return '单站连通性测试';
   if (log.type === 'manual' || (log.manual && log.type !== 'test')) return '手动一键签到';
   return '自动定时签到';

@@ -58,3 +58,9 @@ class FakeSession:
     def count_to(self, suffix: str) -> int:
         """Return how many calls targeted a URL ending with ``suffix``."""
         return len(self.calls_to(suffix))
+
+
+def carries_mldsa(call: dict[str, Any]) -> bool:
+    """Whether a recorded request added ML-DSA to its TLS handshake."""
+    extra_fp = call.get("extra_fp") or {}
+    return "mldsa44" in (extra_fp.get("tls_signature_algorithms") or [])

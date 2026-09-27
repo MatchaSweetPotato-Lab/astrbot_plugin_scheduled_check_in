@@ -3,6 +3,7 @@
 import logging
 import os
 from collections.abc import AsyncGenerator
+from dataclasses import replace
 from datetime import datetime, timedelta
 from math import isfinite
 from pathlib import Path
@@ -14,16 +15,51 @@ from astrbot.api.web import error_response, file_response, json_response, reques
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .core.adapters import create_adapter, persist_writeback
+from .core.browser import (
+    BROWSER_CHANNELS,
+    BrowserSolver,
+    BrowserUnavailable,
+    playwright_installed,
+)
+from .core.cloudflare import (
+    CloudflareContext,
+    CloudflareOptions,
+    normalize_cloudflare_settings,
+)
 from .core.crypto import VaultError, encode_bytes
+from .core.dependencies import (
+    ReinstallError,
+    astrbot_pip_environment,
+    cleanup_leftovers,
+    curl_cffi_status,
+    download_chromium,
+    install_playwright,
+    playwright_status,
+    reinstall_curl_cffi,
+    reinstall_running,
+)
 from .core.http_client import (
+    RequestOptions,
     create_client_session,
     get_impersonate_options,
+    mldsa_support,
     normalize_impersonate,
 )
 from .core.lock_notifier import LockNotifier
 from .core.scheduler import LOCKED_MESSAGE, CheckInScheduler
-from .core.site_schema import NEW_API_USER_HEADER, SITE_TYPE_NEW_API, normalize_site_type
-from .core.storage import SLOT_WEBAUTHN, DEFAULT_SETTINGS, DatabaseManager
+from .core.site_schema import (
+    NEW_API_USER_HEADER,
+    SITE_TYPE_NEW_API,
+    normalize_site_type,
+)
+from .core.storage import DEFAULT_SETTINGS, SLOT_WEBAUTHN, DatabaseManager
+from .core.task_scheduler import LOG_TYPE_TASK, TaskScheduler
+from .core.task_schema import (
+    normalize_tasks,
+    preview_schedule,
+    task_label,
+    validate_task,
+)
 
 logger = logging.getLogger("astrbot")
 
@@ -52,7 +88,7 @@ async def _read_json_body() -> tuple[bool, Any]:
     "astrbot_plugin_scheduled_check_in",
     "Soulter",
     "LLM API 中转站自动签到插件，支持 Pages 可视化配置与定时广播简报",
-    "1.2.0",
+    "1.3.0",
 )
 class ScheduledCheckInPlugin(Star):
     """Star plugin managing auto sign-ins for API relay stations."""
@@ -74,7 +110,11 @@ class ScheduledCheckInPlugin(Star):
         # AstrBot would auto-discover and render inside the sandboxed iframe.
         self.passkey_page_file: Path = Path(__file__).parent / "webauthn" / "passkey.html"
 
+        # One headless browser for the plugin's lifetime, launched on the first
+        # challenge nothing else got past and closed again once idle.
+        self.browser_solver = BrowserSolver()
         self.scheduler = CheckInScheduler(self)
+        self.task_scheduler = TaskScheduler(self)
         self.lock_notifier = LockNotifier(
             is_locked=self.is_config_locked,
             get_target=self._get_lock_notify_session,
@@ -87,11 +127,19 @@ class ScheduledCheckInPlugin(Star):
     async def initialize(self) -> None:
         """Lifecycle method called after plugin initialization."""
         self.scheduler.start()
+        self.task_scheduler.start()
+        try:
+            # Files a curl_cffi reinstall could not delete while they were loaded.
+            cleanup_leftovers(astrbot_pip_environment()[1])
+        except Exception as exc:
+            logger.warning(f"Cleaning up after a curl_cffi reinstall failed: {exc}")
         logger.info("ScheduledCheckInPlugin initialized successfully.")
 
     async def terminate(self) -> None:
         """Lifecycle method called when plugin is stopping or unloading."""
         self.scheduler.stop()
+        self.task_scheduler.stop()
+        await self.browser_solver.aclose()
         logger.info("ScheduledCheckInPlugin terminated successfully.")
 
     # ------------------------------------------------------------------
@@ -205,7 +253,17 @@ class ScheduledCheckInPlugin(Star):
             logger.error(f"Error saving settings to database: {e}", exc_info=True)
             return False
 
-    def record_history(self, results: list[Any], log_type: str = "scheduled") -> None:
+    def cloudflare_context(self, settings: dict[str, Any] | None = None) -> CloudflareContext:
+        """Create the Cloudflare context for one client session's worth of requests."""
+        settings = self.get_settings() if settings is None else settings
+        return CloudflareContext(CloudflareOptions.from_settings(settings), browser=self.browser_solver)
+
+    def record_history(
+        self,
+        results: list[Any],
+        log_type: str = "scheduled",
+        manual: bool | None = None,
+    ) -> None:
         """Record check-in results into the history table, one entry per site.
 
         A batch run writes a separate row for every site instead of one
@@ -215,13 +273,15 @@ class ScheduledCheckInPlugin(Star):
 
         Args:
             results: List of CheckInResult objects.
-            log_type: Type of log entry ("scheduled", "manual", "test").
+            log_type: Type of log entry ("scheduled", "manual", "test", "task").
+            manual: Whether a user started the run; see build_history_entries.
         """
         try:
             entries = CheckInScheduler.build_history_entries(
                 results,
                 log_type,
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                manual=manual,
             )
             if not entries:
                 return
@@ -236,6 +296,7 @@ class ScheduledCheckInPlugin(Star):
         start_date: str | None = None,
         end_date: str | None = None,
         site_id: str | None = None,
+        exclude_type: str | None = None,
     ) -> list[dict[str, Any]]:
         """Read history log entries from SQLite database.
 
@@ -245,6 +306,7 @@ class ScheduledCheckInPlugin(Star):
             start_date: Optional inclusive start date (YYYY-MM-DD).
             end_date: Optional inclusive end date (YYYY-MM-DD).
             site_id: Optional site filter, resolved through the index table.
+            exclude_type: Optional log type to leave out.
 
         Returns:
             List of history log entries.
@@ -256,6 +318,7 @@ class ScheduledCheckInPlugin(Star):
                 start_date=start_date,
                 end_date=end_date,
                 site_id=site_id,
+                exclude_type=exclude_type,
             )
         except Exception as e:
             logger.error(f"Error reading history logs from database: {e}", exc_info=True)
@@ -293,10 +356,17 @@ class ScheduledCheckInPlugin(Star):
             ("/api/sites/probe-new-api-user", self.api_probe_new_api_user, ["POST"], "探测 new-api-user"),
             ("/api/sites/recheckin", self.api_recheckin_site, ["POST"], "重新签到单个站点"),
             ("/api/sites/activity", self.api_get_site_activity, ["GET"], "获取站点签到日历与余额变化"),
+            ("/api/sites/tasks/run", self.api_run_site_task, ["POST"], "立即运行定时任务"),
+            ("/api/tasks/preview", self.api_preview_task_schedule, ["POST"], "预览定时任务触发时间"),
             ("/api/checkin/run", self.api_run_checkin, ["POST"], "触发一键打卡"),
             ("/api/settings", self.api_get_settings, ["GET"], "获取设置"),
             ("/api/settings", self.api_save_settings, ["POST"], "保存设置"),
             ("/api/settings/target_time", self.api_save_custom_target_time, ["POST"], "设置自定义下次签到时间"),
+            ("/api/cloudflare/browser/check", self.api_check_browser, ["POST"], "检测无头浏览器"),
+            ("/api/dependencies/curl_cffi/reinstall", self.api_reinstall_curl_cffi, ["POST"], "重新安装 curl_cffi"),
+            ("/api/dependencies/playwright", self.api_get_playwright_status, ["GET"], "获取 Playwright 状态"),
+            ("/api/dependencies/playwright/install", self.api_install_playwright, ["POST"], "安装 Playwright"),
+            ("/api/dependencies/playwright/chromium", self.api_download_chromium, ["POST"], "下载 Chromium"),
             ("/api/vault", self.api_get_vault, ["GET"], "获取加密状态"),
             ("/api/vault/enable", self.api_enable_vault, ["POST"], "启用配置加密"),
             ("/api/vault/unlock", self.api_unlock_vault, ["POST"], "输入密钥解锁配置"),
@@ -373,8 +443,64 @@ class ScheduledCheckInPlugin(Star):
             isinstance(site, dict) for site in sites
         ):
             return error_response("站点配置必须是对象数组")
+        for site in sites:
+            if site.get("locked"):
+                continue  # a locked site's stored tasks are kept, not replaced
+            for task in normalize_tasks(site.get("tasks")):
+                problem = validate_task(task)
+                if problem:
+                    return error_response(
+                        f"站点「{site.get('name') or ''}」的定时任务「{task_label(task)}」：{problem}"
+                    )
         self.save_sites(sites)
+        try:
+            # Show a new or changed schedule's next run straight away.
+            self.task_scheduler.plan()
+        except Exception as exc:
+            logger.warning(f"Could not schedule tasks after saving: {exc}", exc_info=True)
         return json_response({"status": "ok", "message": "站点配置保存成功"})
+
+    async def api_preview_task_schedule(self) -> Any:
+        """Web API: The next run times of a task's schedule, or why it is invalid.
+
+        Returns:
+            JSON response with ``runs`` (formatted times) and ``error``.
+        """
+        parsed, task = await _read_json_body()
+        if not parsed or not isinstance(task, dict):
+            return error_response("请求体必须是合法 JSON 对象")
+        runs, error = preview_schedule(task, datetime.now())
+        return json_response({"status": "ok", "runs": runs, "error": error})
+
+    async def api_run_site_task(self) -> Any:
+        """Web API: Run one scheduled task now, as the editor currently has it.
+
+        The dashboard posts the whole site from its editor, unsaved changes
+        included, and the id of the task to run; the stored OAuth secrets are
+        merged in as for a connection test. The run is recorded in history and
+        as the task's latest run, but leaves its schedule alone.
+
+        Returns:
+            JSON response with the result and the task's run state.
+        """
+        parsed, body = await _read_json_body()
+        if not parsed or not isinstance(body, dict) or not isinstance(body.get("site"), dict):
+            return error_response("请求体必须包含站点配置 site 与任务 task_id")
+        site = body["site"]
+        if self.is_config_locked() or site.get("locked"):
+            return error_response(LOCKED_MESSAGE)
+        task_id = str(body.get("task_id") or "").strip()
+        task = next((item for item in normalize_tasks(site.get("tasks")) if item["id"] == task_id), None)
+        if task is None:
+            return error_response("未找到该定时任务")
+        problem = validate_task(task)
+        if problem:
+            return error_response(problem)
+        site = self.db.merge_stored_oauth_secrets(site)
+        result = await self.task_scheduler.run(site, task, manual=True)
+        site_id = str(site.get("id") or "").strip()
+        state = self.db.get_task_states().get((site_id, task_id), {}) if site_id else {}
+        return json_response({"status": "ok", "result": result.to_dict(), "state": state})
 
     async def api_test_site(self) -> Any:
         """Web API: Test site connection.
@@ -389,8 +515,19 @@ class ScheduledCheckInPlugin(Star):
             return error_response("站点配置必须是对象")
         if self.is_config_locked() or site_config.get("locked"):
             return error_response(LOCKED_MESSAGE)
-        async with create_client_session(self.get_settings()) as session:
-            adapter = create_adapter(site_config, session, self.acw_cache_file)
+        # The dashboard never holds a login's station secrets, and without them
+        # the test could only log in again, spending the day's sign-in on
+        # login-as-check-in stations.
+        site_config = self.db.merge_stored_oauth_secrets(site_config)
+        settings = self.get_settings()
+        async with create_client_session(settings) as session:
+            adapter = create_adapter(
+                site_config,
+                session,
+                self.acw_cache_file,
+                self.cloudflare_context(settings),
+                RequestOptions.from_settings(settings),
+            )
             result = await adapter.test_connection()
             site_id = str(site_config.get("id") or "").strip()
             if site_id:
@@ -420,9 +557,29 @@ class ScheduledCheckInPlugin(Star):
             return error_response("仅 New-API 框架支持 new-api-user，请将框架类型设为 New-API")
 
         try:
-            async with create_client_session(self.get_settings()) as session:
-                adapter = create_adapter(site_config, session, self.acw_cache_file)
+            # As for a connection test: the stored session, never a login.
+            site_config = self.db.merge_stored_oauth_secrets(site_config)
+            settings = self.get_settings()
+            async with create_client_session(settings) as session:
+                adapter = create_adapter(
+                    site_config,
+                    session,
+                    self.acw_cache_file,
+                    self.cloudflare_context(settings),
+                    RequestOptions.from_settings(settings),
+                )
                 user_id, detail = await adapter.probe_new_api_user_id()
+                site_id = str(site_config.get("id") or "").strip()
+                if site_id:
+                    # Reusing that session may refresh its access token, which
+                    # retires the refresh cookie it presented, so the rotated
+                    # secrets are kept. The headers are not: they come from an
+                    # editor form that may never be saved.
+                    persist_writeback(
+                        self.db,
+                        site_id,
+                        replace(adapter.writeback, checkin_headers=None, balance_headers=None),
+                    )
         except Exception as exc:
             logger.error(f"Error probing new-api-user: {exc}", exc_info=True)
             return error_response(f"探测失败: {exc}")
@@ -493,6 +650,8 @@ class ScheduledCheckInPlugin(Star):
                 start_date=start_date,
                 end_date=end_date,
                 site_id=site_id,
+                # A frequent task would otherwise crowd the check-ins out.
+                exclude_type=LOG_TYPE_TASK,
             )
             if not batch:
                 return logs, False
@@ -603,7 +762,8 @@ class ScheduledCheckInPlugin(Star):
         events.sort(key=lambda item: item["timestamp"])
 
         # Connection tests can provide a balance, but they do not count as a
-        # check-in day. A day keeps the latest real check-in result.
+        # check-in day. A day keeps the latest real check-in result. Scheduled
+        # tasks were already left out when the logs were read.
         daily_checkins: dict[str, dict[str, Any]] = {}
         for event in events:
             if event["type"] == "test":
@@ -715,6 +875,15 @@ class ScheduledCheckInPlugin(Star):
         settings["target_info"] = target_info
         settings["today_target_time"] = target_info.get("display_text", "")
         settings["http_impersonate_options"] = get_impersonate_options()
+        # How the per-request ML-DSA option applies to each fingerprint, so the
+        # site editor can say what ticking it does under the current one.
+        settings["http_impersonate_mldsa"] = {
+            option: mldsa_support(option) for option in settings["http_impersonate_options"]
+        }
+        settings["cf_browser_channels"] = list(BROWSER_CHANNELS)
+        settings["cf_browser_installed"] = playwright_installed()
+        settings["playwright"] = self._playwright_status()
+        settings["curl_cffi"] = {**curl_cffi_status(), "reinstalling": reinstall_running()}
         settings["vault"] = self.db.vault_status()
         return json_response(settings)
 
@@ -745,10 +914,131 @@ class ScheduledCheckInPlugin(Star):
         settings["http_impersonate"] = normalize_impersonate(
             settings.get("http_impersonate")
         )
+        options = RequestOptions.from_settings(settings)
+        settings["http_tls_mldsa"] = options.tls_mldsa
+        settings["acw_sc_v2_auto_solve"] = options.solve_acw_sc_v2
+        normalize_cloudflare_settings(settings)
         if not self.save_settings(settings, rearm_lock_alert=notify_session_changed):
             return error_response("全局设置保存失败")
         self.scheduler.reset_today_target_time()
         return json_response({"status": "ok", "message": "全局设置已更新"})
+
+    async def api_check_browser(self) -> Any:
+        """Web API: Launch the headless browser with the saved settings and name it.
+
+        Installing Playwright is not the whole setup — a browser has to be
+        found or downloaded too — so this is how a user learns it works
+        before a challenge depends on it.
+
+        Returns:
+            JSON response naming the browser, or why none could be launched.
+        """
+        settings = self.get_settings()
+        # The dashboard sends its unsaved form, so a channel can be tried first.
+        parsed, body = await _read_json_body()
+        if parsed and isinstance(body, dict):
+            settings.update({k: v for k, v in body.items() if str(k).startswith("cf_browser_")})
+        options = CloudflareOptions.from_settings(settings).browser
+        try:
+            label = await self.browser_solver.check(options)
+        except BrowserUnavailable as exc:
+            return error_response(str(exc))
+        except Exception as exc:
+            logger.warning(f"Browser check failed: {exc}", exc_info=True)
+            return error_response(f"浏览器检测失败：{exc}")
+        mode = "无头模式" if options.headless else "有界面模式"
+        return json_response({"status": "ok", "browser": label, "message": f"已启动 {label}（{mode}）"})
+
+    async def api_reinstall_curl_cffi(self) -> Any:
+        """Web API: Reinstall curl_cffi through AstrBot's own pip installer.
+
+        The fingerprint list is whatever the installed build ships, so this is
+        how a deployment left on an old build gets the current ones. The new
+        build is only imported once AstrBot restarts.
+
+        Returns:
+            JSON response with the installed and running versions.
+        """
+        try:
+            installer, target_dir = astrbot_pip_environment()
+            version = await reinstall_curl_cffi(installer, target_dir)
+        except ReinstallError as exc:
+            return error_response(str(exc))
+        except Exception as exc:
+            logger.warning(f"curl_cffi reinstall failed: {exc}", exc_info=True)
+            return error_response(f"重新安装 curl_cffi 失败：{exc}（pip 的完整输出见 AstrBot 日志）")
+        status = curl_cffi_status()
+        return json_response({
+            "status": "ok",
+            "curl_cffi": {**status, "reinstalling": False},
+            "message": f"已安装 curl_cffi {version}，重启 AstrBot 后生效",
+        })
+
+    @staticmethod
+    def _playwright_status() -> dict[str, Any]:
+        """Playwright's state for the dashboard; see core.dependencies.playwright_status."""
+        try:
+            target_dir = astrbot_pip_environment()[1]
+        except Exception:  # only the commands shown depend on it
+            target_dir = None
+        return playwright_status(target_dir)
+
+    async def api_get_playwright_status(self) -> Any:
+        """Web API: Playwright's state, polled while an install or download runs.
+
+        Returns:
+            JSON response with what is installed and downloaded.
+        """
+        return json_response({"status": "ok", "playwright": self._playwright_status()})
+
+    async def api_install_playwright(self) -> Any:
+        """Web API: Install Playwright through AstrBot's own pip installer.
+
+        Playwright is optional: only the headless-browser fallback needs it.
+        It has not been imported before, so it is usable without a restart
+        unless something it depends on was loaded at another version.
+
+        Returns:
+            JSON response with Playwright's new state.
+        """
+        try:
+            installer, target_dir = astrbot_pip_environment()
+            version = await install_playwright(installer, target_dir)
+        except ReinstallError as exc:
+            return error_response(str(exc))
+        except Exception as exc:
+            logger.warning(f"Playwright install failed: {exc}", exc_info=True)
+            return error_response(f"安装 Playwright 失败：{exc}（pip 的完整输出见 AstrBot 日志）")
+        status = self._playwright_status()
+        if not status["loaded"]:
+            message = f"已安装 Playwright {version}，重启 AstrBot 后生效"
+        elif status["chromium"]["downloaded"]:
+            message = f"已安装 Playwright {version}"
+        else:
+            message = f"已安装 Playwright {version}。本机没有 Chrome / Edge 时，还需下载 Chromium"
+        return json_response({"status": "ok", "playwright": status, "message": message})
+
+    async def api_download_chromium(self) -> Any:
+        """Web API: Download the Chromium build Playwright drives.
+
+        Needed only where neither Chrome nor Edge is installed, as on most
+        Linux servers and in Docker.
+
+        Returns:
+            JSON response with Playwright's new state.
+        """
+        try:
+            version = await download_chromium()
+        except ReinstallError as exc:
+            return error_response(str(exc))
+        except Exception as exc:
+            logger.warning(f"Chromium download failed: {exc}", exc_info=True)
+            return error_response(f"下载 Chromium 失败：{exc}（完整输出见 AstrBot 日志）")
+        return json_response({
+            "status": "ok",
+            "playwright": self._playwright_status(),
+            "message": f"已下载 Chromium {version}",
+        })
 
     async def api_save_custom_target_time(self) -> Any:
         """Web API: Save custom manual next target check-in time.
@@ -1388,7 +1678,10 @@ class ScheduledCheckInPlugin(Star):
 
         yield event.plain_result("正在查询各中转站余额与连通性...")
         results = []
-        async with create_client_session(self.get_settings()) as session:
+        settings = self.get_settings()
+        async with create_client_session(settings) as session:
+            cloudflare = self.cloudflare_context(settings)
+            options = RequestOptions.from_settings(settings)
             for site in sites:
                 site_id = str(site.get("id", "")).strip()
                 if not site_id:
@@ -1403,7 +1696,7 @@ class ScheduledCheckInPlugin(Star):
                         site_id,
                     )
                     continue
-                adapter = create_adapter(site, session, self.acw_cache_file)
+                adapter = create_adapter(site, session, self.acw_cache_file, cloudflare, options)
                 res = await adapter.test_connection()
                 persist_writeback(self.db, site_id, adapter.writeback)
                 results.append(res)

@@ -444,6 +444,32 @@ input:checked + .slider:before {
   line-height: 1.4;
 }
 
+/* A shell command offered alongside an install button. */
+.command-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.command-line code {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--text);
+  word-break: break-all;
+  background: #f1f5f9;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  user-select: all;
+}
+
+.command-line .btn {
+  flex-shrink: 0;
+}
+
 .checkbox-label {
   display: inline-flex;
   align-items: center;
@@ -1662,4 +1688,65 @@ input:checked + .slider:before {
   text-align: center;
   border: 1px dashed var(--border);
   border-radius: 6px;
+}
+
+/* Scheduled task cards reuse the credential card; these are their extras. */
+.task-tag {
+  background: #ecfdf5;
+  color: #047857;
+  border-color: #a7f3d0;
+}
+
+.task-tag.disabled {
+  background: #f1f5f9;
+  color: var(--text-muted);
+  border-color: var(--border);
+}
+
+.task-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.task-row .task-method {
+  flex: 0 0 96px;
+}
+
+.task-row .task-interval {
+  flex: 0 0 110px;
+}
+
+.task-body {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.task-hint-error {
+  color: var(--danger);
+}
+
+.task-state {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-muted);
+  border-top: 1px dashed var(--border);
+  padding-top: 10px;
+  margin-top: 4px;
+}
+
+.task-state .task-state-text {
+  flex: 1;
+  min-width: 200px;
+}
+
+.task-card .ok {
+  color: var(--success-hover);
+}
+
+.task-card .fail {
+  color: var(--danger);
 }
