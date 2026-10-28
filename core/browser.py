@@ -50,6 +50,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import unquote, urljoin, urlsplit
 
+from .site_schema import normalize_provider_cookies
+
 logger = logging.getLogger("astrbot")
 
 # Playwright's entry point, once imported; see load_playwright().
@@ -201,6 +203,9 @@ class BrowserRequest:
     # A top-level navigation that must stop at the first redirect off the
     # target's domain (OAuth authorize), rather than an API call.
     navigate: bool = False
+    # Scoped provider cookies from a previous authorization, including expired
+    # records that suppress stale values in the legacy Cookie header.
+    provider_cookies: list[dict[str, Any]] | None = None
 
 
 class BrowserResponse:
@@ -215,12 +220,14 @@ class BrowserResponse:
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
         url: str = "",
+        provider_cookies: list[dict[str, Any]] | None = None,
     ) -> None:
         self.status_code = status
         self.text = text
         self.headers = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
         self.cookies = dict(cookies or {})
         self.url = url
+        self.provider_cookies = provider_cookies
 
 
 @dataclass
@@ -285,27 +292,84 @@ def _parse_cookie_header(value: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def _cookie_specs(url: str, pairs: Iterable[tuple[str, str]], *, zone_wide: bool) -> list[dict[str, Any]]:
+def _cookie_specs(
+    url: str,
+    pairs: Iterable[tuple[str, str]],
+    *,
+    zone_wide: bool,
+    provider_cookies: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Turn ``Cookie`` header pairs into cookies Playwright can add.
 
+    Cookies are made host-only (Playwright makes one from a URL), as linux.do
+    and connect.linux.do set their sessions, so a value the site sets afresh
+    replaces the pasted one. A domain-wide copy would stay beside it, and with
+    a name sent twice the site reads the older, pasted value: connect.linux.do
+    then turns its own SSO callback away with "Invalid state".
+
     Args:
-        zone_wide: Scope them to the registrable domain, as a provider's own
-            session cookies are (``_t`` lives on ``.linux.do`` and must reach
-            ``connect.linux.do``); otherwise to the exact host.
+        url: Initial request URL.
+        pairs: Legacy header values whose scopes are not yet known.
+        zone_wide: The cookies are a provider's, pasted as one jar for its
+            whole domain, so they go on the registrable domain as well as on
+            the host — ``_t`` belongs to linux.do, where the SSO relay of a
+            ``connect.linux.do`` authorize reads it. Cloudflare's own go on the
+            domain itself: a clearance holds for the whole zone. Otherwise
+            every cookie goes on the exact host.
+        provider_cookies: Known scopes, which override legacy values by name.
+
+    Returns:
+        Live cookie records accepted by Playwright.
     """
     parts = urlsplit(url)
     host = parts.hostname or ""
-    secure = parts.scheme == "https"
-    specs = []
+    zone = _zone(host)
+    port = f":{parts.port}" if parts.port else ""
+    origins = [f"{parts.scheme}://{parts.netloc}/"]
+    if zone_wide and zone != host:
+        origins.append(f"{parts.scheme}://{zone}{port}/")
+    specs: list[dict[str, Any]] = []
+    scoped = normalize_provider_cookies(provider_cookies)
+    known = {cookie["name"] for cookie in scoped}
     for name, value in pairs:
-        spec: dict[str, Any] = {"name": name, "value": value, "path": "/", "secure": secure}
-        if zone_wide and not name.startswith("__Host-"):
-            spec["domain"] = f".{_zone(host)}"
-        else:
-            # A __Host- cookie must be host-only; Playwright makes one from a URL.
-            spec = {"name": name, "value": value, "url": f"{parts.scheme}://{parts.netloc}/"}
-        specs.append(spec)
+        if name in known:
+            continue
+        if zone_wide and name in _CLOUDFLARE_COOKIES:
+            specs.append({"name": name, "value": value, "domain": f".{zone}", "path": "/",
+                          "secure": parts.scheme == "https"})
+            continue
+        # A __Host- cookie belongs to its host alone.
+        for origin in origins[:1] if name.startswith("__Host-") else origins:
+            specs.append({"name": name, "value": value, "url": origin})
+    specs.extend(
+        cookie
+        for cookie in scoped
+        if cookie["expires"] < 0 or cookie["expires"] > time.time()
+    )
     return specs
+
+
+def _site_cookies(cookies: Iterable[dict[str, Any]], pasted: dict[str, str]) -> dict[str, str]:
+    """Provide the legacy header view; the scoped jar controls future requests.
+
+    The jar may hold a name twice — the pasted copy on one host, the site's
+    rotation of it on another (``_t`` on connect.linux.do and on linux.do) —
+    and the rotation is the value worth keeping.
+
+    Args:
+        cookies: Browser cookie records, kept separately with their scopes.
+        pasted: Header values used to seed the navigation.
+
+    Returns:
+        A legacy name/value view for the credential editor. Authorization
+        replays the separate scoped jar instead of this flattened view.
+    """
+    held: dict[str, str] = {}
+    for cookie in cookies:
+        name, value = cookie["name"], cookie["value"]
+        if name not in held or held[name] == pasted.get(name):
+            held[name] = value
+    return held
 
 
 def _proxy_settings(proxy: str | None) -> dict[str, str] | None:
@@ -663,8 +727,14 @@ class BrowserSolver:
         parts = urlsplit(request.url)
         zone = _zone(parts.hostname or "")
         cookies = _parse_cookie_header(_header(request.headers, "cookie"))
-        if cookies:
-            await context.add_cookies(_cookie_specs(request.url, cookies, zone_wide=True))
+        specs = _cookie_specs(
+            request.url,
+            cookies,
+            zone_wide=True,
+            provider_cookies=request.provider_cookies,
+        )
+        if specs:
+            await context.add_cookies(specs)
 
         page = await context.new_page()
         document = self._watch(page)
@@ -709,10 +779,20 @@ class BrowserSolver:
         if error and not document.status and not captured:
             raise RuntimeError(f"浏览器打开 {parts.hostname} 失败：{error}")
         solved = await self._settle(page, document, deadline, done=left_domain)
-        held = {c["name"]: c["value"] for c in await context.cookies(request.url)}
+        # The domain's own host too: the SSO relay rotates _t there, on linux.do.
+        jar = normalize_provider_cookies(
+            [
+                cookie
+                for cookie in await context.cookies()
+                if _in_zone(str(cookie.get("domain") or "").lstrip("."), zone)
+            ]
+        )
+        held = _site_cookies(jar, dict(cookies))
 
         if captured:
-            return BrowserResponse(302, "", {"location": captured[0]}, held, request.url), solved
+            return BrowserResponse(
+                302, "", {"location": captured[0]}, held, request.url, jar
+            ), solved
         text = ""
         with contextlib.suppress(Exception):
             text = await page.content()
@@ -720,8 +800,12 @@ class BrowserSolver:
         if document.status == 200 and final_url and not _same_page(final_url, request.url):
             # Redirected within the provider — to its login page, say. Report
             # the hop a non-browser client would have seen.
-            return BrowserResponse(302, text, {"location": final_url}, held, final_url), solved
-        return BrowserResponse(document.status, text, document.headers, held, final_url), solved
+            return BrowserResponse(
+                302, text, {"location": final_url}, held, final_url, jar
+            ), solved
+        return BrowserResponse(
+            document.status, text, document.headers, held, final_url, jar
+        ), solved
 
     async def _fetch(self, context: Any, request: BrowserRequest, timeout: float) -> tuple[BrowserResponse, bool]:
         """Solve the challenge on the endpoint, then make the call with fetch()."""

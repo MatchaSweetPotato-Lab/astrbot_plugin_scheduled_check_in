@@ -27,6 +27,7 @@ from core.site_schema import (
     normalize_credentials,
     normalize_headers,
     normalize_path,
+    normalize_provider_cookies,
     normalize_protocol,
     normalize_site_type,
     parse_header_text,
@@ -114,6 +115,50 @@ class CredentialNormalizationTests(unittest.TestCase):
         credential = normalize_credential({"type": "github_oauth", "value": "c"})
         self.assertEqual(credential["session_cookie"], "")
         self.assertEqual(credential["session_updated_at"], "")
+
+    def test_provider_cookies_keep_same_names_on_different_hosts_and_paths(
+        self,
+    ) -> None:
+        cookies = [
+            {"name": "sid", "value": "a", "domain": "connect.linux.do", "path": "/"},
+            {"name": "sid", "value": "b", "domain": "linux.do", "path": "/"},
+            {
+                "name": "sid",
+                "value": "c",
+                "domain": "linux.do",
+                "path": "/session",
+                "expires": 1,
+            },
+        ]
+        credential = normalize_credential(
+            {"type": "linuxdo_oauth", "provider_cookies": cookies}
+        )
+        self.assertEqual(
+            [
+                (c["value"], c["domain"], c["path"])
+                for c in credential["provider_cookies"]
+            ],
+            [
+                ("a", "connect.linux.do", "/"),
+                ("b", "linux.do", "/"),
+                ("c", "linux.do", "/session"),
+            ],
+        )
+        self.assertEqual(credential["provider_cookies"][2]["expires"], 1)
+
+    def test_malformed_scoped_cookies_are_dropped(self) -> None:
+        self.assertEqual(
+            normalize_provider_cookies(
+                [
+                    None,
+                    {},
+                    {"name": "x", "url": "http://[bad"},
+                    {"name": "x", "domain": "h", "expires": float("nan")},
+                    {"name": "bad\r\nname", "domain": "h"},
+                ]
+            ),
+            [],
+        )
 
     def test_cookie_credentials_have_no_bearer_flag(self) -> None:
         self.assertNotIn("auto_bearer", normalize_credential({"type": "cookie"}))

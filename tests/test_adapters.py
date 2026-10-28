@@ -468,6 +468,40 @@ class ProviderCookieRotationTests(unittest.IsolatedAsyncioTestCase):
         await adapter.check_in()
         self.assertEqual(adapter.writeback.credential_values, {})
 
+    async def test_a_scoped_cookie_update_is_written_back_with_its_header(self) -> None:
+        response = FakeResponse(
+            302, "", headers={"location": f"{BASE}/cb?code=C&state=st"}
+        )
+        response.provider_cookies = [
+            {
+                "name": "user_session",
+                "value": "rotated",
+                "domain": "github.com",
+                "path": "/",
+            },
+        ]
+        adapter = create_adapter(self._site(), FakeSession(self._routes(response)))
+        self.assertTrue((await adapter.check_in()).success)
+        scoped = adapter.writeback.provider_cookies["gh"]
+        self.assertTrue(
+            any(c["value"] == "rotated" and c["domain"] == "github.com" for c in scoped)
+        )
+        self.assertEqual(adapter.writeback.credential_values["gh"], self.HELD)
+        calls = []
+
+        class Db:
+            def update_action_headers(self, *args):
+                pass
+
+            def update_credential_session(self, *args):
+                pass
+
+            def update_credential_value(self, site, credential, value, **kwargs):
+                calls.append((site, credential, value, kwargs))
+
+        persist_writeback(Db(), "s1", adapter.writeback)
+        self.assertEqual(calls, [("s1", "gh", self.HELD, {"provider_cookies": scoped})])
+
     async def test_a_rotation_is_kept_even_when_the_login_fails(self) -> None:
         """The provider may move the session on before rejecting; replaying the
         retired value would guarantee the next failure too."""

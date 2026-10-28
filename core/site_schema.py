@@ -12,8 +12,10 @@ so a hand-edited database row and a freshly submitted form end up identical.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 # ----------------------------------------------------------------------
 # Credential types
@@ -213,6 +215,60 @@ def _to_int(raw: Any) -> int:
         return 0
 
 
+def normalize_provider_cookies(raw: Any) -> list[dict[str, Any]]:
+    """Normalize a provider cookie jar without discarding cookie scope.
+
+    Args:
+        raw: Browser cookie records, or URL-based records used to seed a jar.
+
+    Returns:
+        JSON-safe cookies keyed by name, domain and path. Expired records are
+        retained so an old header cannot resurrect a deleted scoped cookie.
+    """
+    if not isinstance(raw, list):
+        return []
+    cookies: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            origin = urlsplit(str(item.get("url") or ""))
+        except ValueError:
+            continue
+        name = str(item.get("name") or "")
+        domain = str(item.get("domain") or origin.hostname or "").strip().lower()
+        path = str(item.get("path") or "/")
+        value = str(item.get("value") or "")
+        if (
+            not name
+            or not domain.lstrip(".")
+            or not path.startswith("/")
+            or any(c in name for c in "\r\n;= \t")
+            or any(c in domain for c in "/\r\n; \t")
+            or any(c in value for c in "\r\n")
+        ):
+            continue
+        try:
+            expires = float(item.get("expires", -1))
+        except (ValueError, TypeError):
+            continue
+        if not math.isfinite(expires):
+            continue
+        same_site = str(item.get("sameSite") or "Lax").capitalize()
+        cookie = {
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": path,
+            "secure": item.get("secure", origin.scheme == "https") is True,
+            "httpOnly": item.get("httpOnly") is True,
+            "sameSite": same_site if same_site in ("Strict", "Lax", "None") else "Lax",
+            "expires": -1.0 if expires < 0 else expires,
+        }
+        cookies[(name, domain, path)] = cookie
+    return list(cookies.values())
+
+
 def normalize_credential(raw: Any, index: int = 0) -> dict[str, Any]:
     """Normalize one credential entry.
 
@@ -236,6 +292,9 @@ def normalize_credential(raw: Any, index: int = 0) -> dict[str, Any]:
         # Users paste raw tokens far more often than "Bearer <token>".
         credential["auto_bearer"] = bool(source.get("auto_bearer", True))
     if cred_type in OAUTH_CREDENTIAL_TYPES:
+        credential["provider_cookies"] = normalize_provider_cookies(
+            source.get("provider_cookies")
+        )
         # The station cookie jar the login produced. On newer New-API builds it
         # holds the refresh token (``new_api_refresh``) rather than a session.
         credential["session_cookie"] = str(source.get("session_cookie") or "").strip()

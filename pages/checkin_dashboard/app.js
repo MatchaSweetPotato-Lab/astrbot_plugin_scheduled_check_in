@@ -19,7 +19,6 @@ let settings = {
   max_history_records: 0,
   lock_notify_session: '',
   report_level: 'all',
-  cf_fingerprint_fallback: true,
   cf_browser_fallback: true,
   cf_browser_headless: true,
   cf_browser_channel: 'auto',
@@ -2894,7 +2893,6 @@ function renderSettingsForm() {
   if (reportLevelSelect) {
     reportLevelSelect.value = settings.report_level || 'all';
   }
-  document.getElementById('setting-cf-fallback').checked = settings.cf_fingerprint_fallback !== false;
   document.getElementById('setting-tls-mldsa').checked = settings.http_tls_mldsa === true;
   document.getElementById('setting-acw-solve').checked = settings.acw_sc_v2_auto_solve !== false;
   renderCloudflareBrowserFields();
@@ -3276,7 +3274,6 @@ async function saveSettings() {
   if (lockNotifyInput) lockNotifyInput.value = lock_notify_session;
   const reportLevelSelect = document.getElementById('setting-report-level');
   const report_level = reportLevelSelect ? reportLevelSelect.value : 'all';
-  const cf_fingerprint_fallback = document.getElementById('setting-cf-fallback').checked;
   const http_tls_mldsa = document.getElementById('setting-tls-mldsa').checked;
   const acw_sc_v2_auto_solve = document.getElementById('setting-acw-solve').checked;
   const cloudflareBrowser = readCloudflareBrowserForm();
@@ -3293,7 +3290,6 @@ async function saveSettings() {
     max_history_records,
     lock_notify_session,
     report_level,
-    cf_fingerprint_fallback,
     http_tls_mldsa,
     acw_sc_v2_auto_solve,
     ...cloudflareBrowser

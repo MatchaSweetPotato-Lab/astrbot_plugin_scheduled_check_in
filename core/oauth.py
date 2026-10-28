@@ -32,6 +32,7 @@ import json
 import logging
 import re
 import secrets
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -39,10 +40,10 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 from curl_cffi.requests import AsyncSession
 
-from .browser import BrowserRequest, request_body
+from .browser import BrowserRequest, _cookie_specs, _in_zone, _zone, request_body
 from .cloudflare import CloudflareContext, is_cloudflare_challenge
 from .http_client import MLDSA_ADDED, mldsa_extra_fp, mldsa_support
-from .site_schema import holds_refresh_cookie
+from .site_schema import holds_refresh_cookie, normalize_provider_cookies
 
 logger = logging.getLogger("astrbot")
 
@@ -199,6 +200,9 @@ class OAuthLoginResult:
     # unknown). Empty on builds that still authenticate by cookie.
     access_token: str = ""
     access_expires_at: int = 0
+    # None means no jar update; scopes are stored separately from the legacy
+    # header so same-name cookies on different SSO hosts survive a round-trip.
+    provider_cookies: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -442,7 +446,7 @@ def _cloudflare_challenge_message(
     detail: str = "",
     remedy: str = "",
 ) -> str:
-    """Explain a Cloudflare interstitial that fingerprint screening did not get past.
+    """Explain a Cloudflare interstitial that remains after browser handling.
 
     Two things users get wrong here. A challenge says nothing about the
     credential, so every remedy for an expired session is the wrong advice. And
@@ -452,9 +456,14 @@ def _cloudflare_challenge_message(
     tried, so nobody re-copies a working cookie waiting for a different result.
 
     Args:
-        detail: What fingerprint screening tried, if anything.
+        provider: The OAuth provider that returned the challenge.
+        status: HTTP status of the challenged response.
+        detail: What browser handling tried, if anything.
         remedy: A setting that would have changed the handshake Cloudflare
             judged, when there is one; it goes before the stopgaps.
+
+    Returns:
+        The challenge failure message and available remedies.
     """
     tried = f"{detail}。" if detail else ""
     return (
@@ -515,7 +524,7 @@ class OAuthLoginClient:
                 the station actually replied.
             cloudflare: The run's Cloudflare context. Every leg is routed
                 through it, so a challenge — most often on connect.linux.do —
-                is retried with other fingerprints rather than failing the login.
+                is retried directly in the headless browser.
             mldsa: Add ML-DSA to the TLS handshake of every leg when the
                 fingerprint lacks it — what Cloudflare in front of
                 connect.linux.do looks for in a Chrome handshake.
@@ -527,16 +536,15 @@ class OAuthLoginClient:
         self.mldsa = mldsa
         self._on_attempt = on_attempt
         self._cloudflare = cloudflare
-        # What the Cloudflare context tried on the latest leg, and the
-        # fingerprint that leg went out with, for the message shown when a
-        # challenge survives.
+        # What the Cloudflare context tried on the latest leg, for the message
+        # shown when a challenge survives.
         self._cloudflare_detail = ""
-        self._last_impersonate = impersonate
         # Set by the authorize leg. Held here rather than returned, because a
         # rejected login still needs its rotation persisted — replaying a value
         # the provider has already retired guarantees the next failure.
         self._rotated_provider_cookie = ""
-
+        self._provider_cookies: list[dict[str, Any]] = []
+        self._provider_cookies_changed = False
 
     def _record(
         self,
@@ -577,58 +585,48 @@ class OAuthLoginClient:
         params: dict[str, str] | None = None,
         allow_redirects: bool = True,
         navigate: bool = False,
+        provider_cookies: list[dict[str, Any]] | None = None,
     ) -> Any:
         """Issue one request with the site's proxy and fingerprint applied.
 
         A Cloudflare challenge is handed to the run's context, which may answer
-        with the response of a retry under another fingerprint, or from a
-        headless browser, instead.
+        with the response of a retry from a headless browser.
 
         Args:
+            provider_cookies: Scoped cookies for a provider navigation.
             navigate: The request is a browser navigation — the authorize leg —
                 so a browser retry opens it as a page, rather than calling it
                 with fetch(), and stops at the redirect off the provider.
         """
 
-        async def send(impersonate: str) -> Any:
-            return await self.session.request(
-                method,
-                url,
-                headers=headers or {},
-                json=json_body,
-                params=params,
-                proxy=self.proxy,
-                impersonate=impersonate,
-                extra_fp=mldsa_extra_fp(impersonate, self.mldsa),
-                allow_redirects=allow_redirects,
-            )
-
-        impersonate = (
-            self._cloudflare.impersonate_for(url, self.impersonate)
-            if self._cloudflare is not None
-            else self.impersonate
+        response = await self.session.request(
+            method,
+            url,
+            headers=headers or {},
+            json=json_body,
+            params=params,
+            proxy=self.proxy,
+            impersonate=self.impersonate,
+            extra_fp=mldsa_extra_fp(self.impersonate, self.mldsa),
+            allow_redirects=allow_redirects,
         )
-        response = await send(impersonate)
         self._cloudflare_detail = ""
-        self._last_impersonate = impersonate
         if self._cloudflare is None:
             return response
         resolution = await self._cloudflare.resolve(
-            method=method,
-            url=url,
             response=response,
-            impersonate=impersonate,
-            send=send,
             record=self._record,
-            mldsa=self.mldsa,
             browser_request=BrowserRequest(
                 method,
-                f"{url}{'&' if '?' in url else '?'}{urlencode(params)}" if params else url,
+                f"{url}{'&' if '?' in url else '?'}{urlencode(params)}"
+                if params
+                else url,
                 dict(headers or {}),
                 body=request_body(json_body),
                 proxy=self.proxy,
                 verify=getattr(self.session, "verify", True) is not False,
                 navigate=navigate,
+                provider_cookies=provider_cookies,
             ),
         )
         self._cloudflare_detail = resolution.detail
@@ -640,7 +638,7 @@ class OAuthLoginClient:
         Only for a leg that went out without ML-DSA on a fingerprint the option
         adds it to; with ML-DSA already in the handshake the advice is moot.
         """
-        profile = self._last_impersonate
+        profile = self.impersonate
         if self.mldsa or mldsa_support(profile) != MLDSA_ADDED:
             return ""
         return (
@@ -783,6 +781,75 @@ class OAuthLoginClient:
         logger.info("No /api/oauth/state on %s (%s); using a local state.", self.base_url, tried)
         return local_state, ""
 
+    def _remember_provider_cookies(
+        self, provider: OAuthProvider, response: Any, url: str, cookie: str
+    ) -> None:
+        """Merge a response's provider cookies without losing their scopes.
+
+        Args:
+            provider: Provider whose cookies may be retained.
+            response: Browser snapshot or curl response cookie jar.
+            url: URL that issued a curl response.
+            cookie: Legacy header defining the cookie names the user holds.
+        """
+        allowed = set(parse_cookie_header(cookie)) | set(provider.adopted_cookies)
+        zone = _zone(urlparse(provider.authorize_url).hostname or "")
+        snapshot = getattr(response, "provider_cookies", None)
+        full_snapshot = snapshot is not None
+        if not full_snapshot:
+            snapshot = []
+            jar = getattr(getattr(response, "cookies", None), "jar", None)
+            if jar is not None:
+                for held in jar:
+                    snapshot.append(
+                        {
+                            "name": held.name,
+                            "value": held.value,
+                            "domain": ("." if held.domain_specified else "")
+                            + held.domain.lstrip("."),
+                            "path": held.path or "/",
+                            "secure": held.secure,
+                            "expires": held.expires if held.expires is not None else -1,
+                            "httpOnly": held.has_nonstandard_attr("HttpOnly")
+                            or str(
+                                held.get_nonstandard_attr("http_only", "False")
+                            ).lower()
+                            == "true",
+                            "sameSite": held.get_nonstandard_attr("SameSite", "Lax"),
+                        }
+                    )
+            else:
+                # Test doubles and older response implementations expose only
+                # name/value pairs. Such a response belongs to its exact host.
+                for name, value in getattr(response, "cookies", {}).items():
+                    snapshot.append(
+                        {
+                            "name": name,
+                            "value": getattr(value, "value", value),
+                            "url": url,
+                        }
+                    )
+        incoming = [
+            item
+            for item in normalize_provider_cookies(snapshot)
+            if item["name"] in allowed and _in_zone(item["domain"].lstrip("."), zone)
+        ]
+        if not incoming and not full_snapshot:
+            return
+        changed = {(c["name"], c["domain"], c["path"]): c for c in incoming}
+        merged = []
+        for previous in self._provider_cookies:
+            key = (previous["name"], previous["domain"], previous["path"])
+            if key in changed:
+                continue
+            # A browser snapshot omits deleted cookies. Keep their scope as a
+            # tombstone, so the old header cannot recreate them next time.
+            merged.append({**previous, "expires": 1.0} if full_snapshot else previous)
+        merged = normalize_provider_cookies([*merged, *incoming])
+        if merged != self._provider_cookies:
+            self._provider_cookies = merged
+            self._provider_cookies_changed = True
+
     async def _authorize(
         self,
         provider: OAuthProvider,
@@ -797,7 +864,9 @@ class OAuthLoginClient:
             unless the provider refreshed one of the cookies we already hold.
         """
         params: dict[str, str] | None = {
-            "client_id": client_id, "state": state, **provider.extra_authorize_params,
+            "client_id": client_id,
+            "state": state,
+            **provider.extra_authorize_params,
         }
         url = provider.authorize_url
         cookie = third_party_cookie
@@ -809,12 +878,51 @@ class OAuthLoginClient:
         # every one gets the Cloudflare handling and the cookies it sets are
         # carried to the next, as a browser's jar would.
         for _ in range(len(provider.relay_redirects) + 3):
+            parts = urlparse(url)
+            host, path = parts.hostname or "", parts.path or "/"
+            known = {item["name"] for item in self._provider_cookies}
+            fallback = {
+                name: value
+                for name, value in parse_cookie_header(cookie).items()
+                if name not in known
+            }
+            scoped = []
+            for item in self._provider_cookies:
+                domain = item["domain"]
+                matches = (
+                    _in_zone(host, domain.lstrip("."))
+                    if domain.startswith(".")
+                    else host == domain
+                )
+                if (
+                    matches
+                    and (
+                        path == item["path"]
+                        or (
+                            path.startswith(item["path"])
+                            and (
+                                item["path"].endswith("/")
+                                or path[len(item["path"]) :].startswith("/")
+                            )
+                        )
+                    )
+                    and (not item["secure"] or parts.scheme == "https")
+                    and (item["expires"] < 0 or item["expires"] > time.time())
+                ):
+                    scoped.append(item)
+            scoped.sort(key=lambda item: len(item["path"]), reverse=True)
+            header = "; ".join(
+                [
+                    *(f"{item['name']}={item['value']}" for item in scoped),
+                    *(f"{name}={value}" for name, value in fallback.items()),
+                ]
+            )
             try:
                 response = await self._request(
                     "GET",
                     url,
                     headers={
-                        "Cookie": cookie,
+                        "Cookie": header,
                         # A browser reaches this page by clicking the provider button
                         # on the station's login page. Send that navigation's full
                         # signature — a Referer without the matching Sec-Fetch-Site
@@ -830,6 +938,7 @@ class OAuthLoginClient:
                     params=params,
                     allow_redirects=False,
                     navigate=True,
+                    provider_cookies=self._provider_cookies,
                 )
             except Exception as exc:
                 self._record(step, "GET", url, error=str(exc))
@@ -838,6 +947,7 @@ class OAuthLoginClient:
             # Capture rotation even on failure paths: the provider may have moved
             # the session on before rejecting, and storing the new value keeps the
             # next run from replaying one it has already retired.
+            self._remember_provider_cookies(provider, response, url, cookie)
             merged = merge_rotated_cookies(
                 cookie, getattr(response, "cookies", {}), provider.adopted_cookies
             )
@@ -870,6 +980,9 @@ class OAuthLoginClient:
         rotated = cookie if cookie != third_party_cookie else ""
         if rotated:
             self._rotated_provider_cookie = rotated
+            # A legacy header update must be stored with its authoritative
+            # scopes, even when only its flattened view changed this time.
+            self._provider_cookies_changed = True
 
         status = response.status_code
         body = getattr(response, "text", "") or ""
@@ -914,6 +1027,16 @@ class OAuthLoginClient:
             # has not been authorized for this account — so do not assert that
             # the cookie is dead when the body may say otherwise.
             raise fail(_refused_request_message(provider, third_party_cookie, status, body))
+        if status >= 400:
+            # An error page of the provider's own, perhaps on a relay hop the
+            # browser followed: what it says beats any guess made here.
+            answered = urlparse(str(getattr(response, "url", "") or ""))
+            page = f"{answered.netloc}{answered.path}" if answered.netloc else provider.authorize_host
+            detail = _abridge(_strip_html(body), 160)
+            raise fail(
+                f"{provider.label} 授权未完成：{page} 返回 HTTP {status}"
+                + (f"，页面内容：{detail}" if detail else "")
+            )
         raise fail(
             f"{provider.label} 未直接返回授权码 (HTTP {status})，"
             f"请先在浏览器登录该站点并完成一次 OAuth 授权"
@@ -985,12 +1108,18 @@ class OAuthLoginClient:
                      response_text=body, error=detail)
         raise OAuthError(detail)
 
-    async def login(self, credential_type: str, third_party_cookie: str) -> OAuthLoginResult:
+    async def login(
+        self,
+        credential_type: str,
+        third_party_cookie: str,
+        provider_cookies: list[dict[str, Any]] | None = None,
+    ) -> OAuthLoginResult:
         """Run the full flow and return the station's session cookie.
 
         Args:
             credential_type: ``github_oauth`` or ``linuxdo_oauth``.
             third_party_cookie: Provider-domain session cookie from the user.
+            provider_cookies: Previously retained provider cookie scopes.
 
         Returns:
             An ``OAuthLoginResult`` describing success or the failure reason.
@@ -1006,6 +1135,26 @@ class OAuthLoginClient:
                 f"{provider.label} 凭据为空，请填入 {provider.authorize_host} 的完整 Cookie"
                 f"（至少包含 {', '.join(provider.all_cookies)}）",
             )
+
+        zone = _zone(urlparse(provider.authorize_url).hostname or "")
+        scoped = [
+            item
+            for item in normalize_provider_cookies(provider_cookies)
+            if _in_zone(item["domain"].lstrip("."), zone)
+        ]
+        self._provider_cookies = normalize_provider_cookies(
+            [
+                *scoped,
+                *_cookie_specs(
+                    provider.authorize_url,
+                    parse_cookie_header(cookie).items(),
+                    zone_wide=True,
+                    provider_cookies=scoped,
+                ),
+            ]
+        )
+        self._provider_cookies_changed = False
+        self._rotated_provider_cookie = ""
 
         # Warn rather than refuse: a provider may still accept a partial cookie,
         # and guessing wrong would block a working setup.
@@ -1036,6 +1185,9 @@ class OAuthLoginClient:
                 False,
                 str(exc),
                 rotated_provider_cookie=self._rotated_provider_cookie,
+                provider_cookies=self._provider_cookies
+                if self._provider_cookies_changed
+                else None,
             )
 
         if rotated_cookie:
@@ -1050,6 +1202,9 @@ class OAuthLoginClient:
             user_id=fields.user_id,
             access_token=fields.access_token,
             access_expires_at=fields.access_expires_at,
+            provider_cookies=self._provider_cookies
+            if self._provider_cookies_changed
+            else None,
         )
 
     async def refresh(self, session_cookie: str) -> TokenRefreshResult:

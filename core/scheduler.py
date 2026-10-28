@@ -405,9 +405,8 @@ class CheckInScheduler:
         site_results_to_persist: list[CheckInResult] = []
 
         async with create_client_session(settings) as session:
-            # One context for the whole run: a fingerprint Cloudflare let
-            # through for one site is reused by the next, and a host that
-            # turned every fingerprint away is not screened again per site.
+            # Share browser clearance across the run while allowing each
+            # challenged request its own browser attempt.
             cloudflare = self._cloudflare_context(settings)
             options = RequestOptions.from_settings(settings)
             for idx, site_config in enumerate(enabled_sites):
