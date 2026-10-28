@@ -9,6 +9,9 @@ it says nothing about whether Cloudflare's own challenge passes.
 from __future__ import annotations
 
 import unittest
+import tempfile
+from dataclasses import replace
+from pathlib import Path
 from unittest import mock
 
 import tests  # noqa: F401
@@ -20,6 +23,10 @@ from core.browser import (
     BrowserUnavailable,
     playwright_installed,
 )
+from core.cloudflare import CloudflareContext
+from core.oauth import LINUXDO_OAUTH, PROVIDERS, OAuthLoginClient
+from core.storage import DatabaseManager
+from tests.fakes import FakeResponse, FakeSession
 
 
 try:
@@ -32,6 +39,9 @@ CHALLENGE = """<html><head><title>Just a moment...</title></head><body>
 setTimeout(() => { document.cookie = 'cf_clearance=ok; path=/'; location.reload(); }, 800);</script>
 </body></html>"""
 STATION = "127.0.0.2"
+# A provider zone of two hosts, as linux.do and connect.linux.do are; Chrome
+# resolves every *.localhost name to this machine.
+ZONE = "zone.localhost"
 # An interactive challenge: nothing happens until the checkbox in the widget,
 # a cross-site frame, is clicked by a trusted hand.
 INTERACTIVE = """<html><head><title>Just a moment...</title></head><body>
@@ -60,19 +70,33 @@ setTimeout(() => {
 @unittest.skipUnless(playwright_installed() and web is not None, "Playwright or aiohttp is not installed")
 class LiveBrowserTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
+        # These requests stay on loopback, regardless of the user's proxy.
+        proxy_patch = mock.patch.object(
+            browser_module, "_proxy_settings", return_value=None
+        )
+        proxy_patch.start()
+        self.addCleanup(proxy_patch.stop)
         self.hits: list[tuple] = []
         app = web.Application()
-        app.add_routes([
-            web.get("/oauth2/authorize", self.authorize),
-            web.get("/hop", self.hop),
-            web.get("/login", self.login),
-            web.get("/oauth/linuxdo", self.callback),
-            web.get("/", self.root),
-            web.route("*", "/api/user/checkin", self.checkin),
-            web.get("/ticked", self.ticked),
-            web.get("/widget", self.widget),
-            web.get("/geometry", self.geometry),
-        ])
+        app.add_routes(
+            [
+                web.get("/oauth2/authorize", self.authorize),
+                web.get("/hop", self.hop),
+                web.get("/login", self.login),
+                web.get("/oauth/linuxdo", self.callback),
+                web.get("/", self.root),
+                web.route("*", "/api/user/checkin", self.checkin),
+                web.get("/ticked", self.ticked),
+                web.get("/widget", self.widget),
+                web.get("/geometry", self.geometry),
+                web.get("/relay/authorize", self.relay_authorize),
+                web.get("/relay/sso", self.relay_sso),
+                web.get("/relay/callback", self.relay_callback),
+                web.get("/scoped/authorize", self.scoped_authorize),
+                web.get("/scoped/sso", self.scoped_sso),
+                web.get("/scoped/callback", self.scoped_callback),
+            ]
+        )
         self.runner = web.AppRunner(app)
         await self.runner.setup()
         site = web.TCPSite(self.runner, "127.0.0.1", 0)
@@ -153,6 +177,141 @@ class LiveBrowserTests(unittest.IsolatedAsyncioTestCase):
             return web.Response(status=403, text=GEOMETRY, content_type="text/html", headers={"cf-mitigated": "challenge"})
         return web.Response(text="<html>measured</html>", content_type="text/html")
 
+    @staticmethod
+    def first_cookie(request: web.Request, name: str) -> str | None:
+        # Of a name sent twice, the first, which is the one connect.linux.do reads.
+        for part in request.headers.get("Cookie", "").split(";"):
+            key, _, value = part.strip().partition("=")
+            if key == name:
+                return value
+        return None
+
+    async def relay_authorize(self, request: web.Request) -> web.Response:
+        """connect.linux.do's authorize: a session it does not honour is
+        replaced, and the browser sent round linux.do's SSO to sign it in."""
+        self.hits.append(("relay-authorize",))
+        state = request.query["state"]
+        if self.first_cookie(request, "sess") == "valid":
+            raise web.HTTPFound(f"http://{STATION}:{self.port}/oauth/linuxdo?code=CODE&state={state}")
+        response = web.HTTPFound(f"http://{ZONE}:{self.port}/relay/sso?state={state}")
+        response.set_cookie("sess", "nonce")
+        raise response
+
+    async def relay_sso(self, request: web.Request) -> web.Response:
+        self.hits.append(("relay-sso",))
+        if self.first_cookie(request, "_t") != "tok":
+            raise web.HTTPFound("/login")
+        response = web.HTTPFound(f"http://connect.{ZONE}:{self.port}/relay/callback?state={request.query['state']}")
+        response.set_cookie("_t", "tok2")
+        raise response
+
+    async def relay_callback(self, request: web.Request) -> web.Response:
+        self.hits.append(("relay-callback",))
+        if self.first_cookie(request, "sess") != "nonce":
+            return web.Response(status=400, text="<html>Invalid state</html>", content_type="text/html")
+        response = web.HTTPFound(f"/relay/authorize?state={request.query['state']}")
+        response.set_cookie("sess", "valid")
+        raise response
+
+    async def scoped_authorize(self, request: web.Request) -> web.Response:
+        self.hits.append(("scoped-connect", self.first_cookie(request, "_t")))
+        if self.first_cookie(request, "_t") not in ("seed", "connect-session"):
+            return web.Response(
+                status=403, text="connect rejected another host's cookie"
+            )
+        response = web.HTTPFound(f"http://{ZONE}:{self.port}/scoped/sso")
+        response.set_cookie("_t", "connect-session", path="/scoped")
+        raise response
+
+    async def scoped_sso(self, request: web.Request) -> web.Response:
+        self.hits.append(("scoped-root", self.first_cookie(request, "_t")))
+        if self.first_cookie(request, "_t") not in ("seed", "root-session"):
+            return web.Response(status=403, text="root rejected another host's cookie")
+        response = web.HTTPFound(f"http://connect.{ZONE}:{self.port}/scoped/callback")
+        response.set_cookie("_t", "root-session", path="/scoped")
+        raise response
+
+    async def scoped_callback(self, request: web.Request) -> web.Response:
+        if self.first_cookie(request, "_t") != "connect-session":
+            return web.Response(status=403, text="callback received the wrong cookie")
+        raise web.HTTPFound(
+            f"http://{STATION}:{self.port}/oauth/linuxdo?code=CODE&state=ST"
+        )
+
+    async def test_scoped_provider_cookies_survive_storage_and_a_second_login(
+        self,
+    ) -> None:
+        authorize = f"http://connect.{ZONE}:{self.port}/scoped/authorize"
+        provider = replace(PROVIDERS[LINUXDO_OAUTH], authorize_url=authorize)
+        with tempfile.TemporaryDirectory() as folder:
+            db = DatabaseManager(Path(folder) / "cookies.db")
+            db.save_sites(
+                [
+                    {
+                        "id": "s1",
+                        "name": "Relay",
+                        "type": "new-api",
+                        "base_url": self.base,
+                        "credentials": [
+                            {"id": "c1", "type": "linuxdo_oauth", "value": "_t=seed"}
+                        ],
+                    }
+                ]
+            )
+            with mock.patch.dict(PROVIDERS, {LINUXDO_OAUTH: provider}):
+                for _ in range(2):
+                    credential = db.get_sites()[0]["credentials"][0]
+                    session = FakeSession(
+                        {
+                            ("GET", f"{self.base}/api/status"): FakeResponse(
+                                200,
+                                '{"data":{"linuxdo_oauth":true,"linuxdo_client_id":"cid"}}',
+                            ),
+                            ("GET", f"{self.base}/api/oauth/state"): FakeResponse(
+                                200, '{"data":"ST"}'
+                            ),
+                            ("GET", authorize): FakeResponse(
+                                403, CHALLENGE, headers={"cf-mitigated": "challenge"}
+                            ),
+                            ("GET", f"{self.base}/api/oauth/linuxdo"): FakeResponse(
+                                200, "{}", cookies={"session": "fresh"}
+                            ),
+                        }
+                    )
+                    client = OAuthLoginClient(
+                        session,
+                        self.base,
+                        "chrome131",
+                        cloudflare=CloudflareContext(browser=self.solver),
+                    )
+                    result = await client.login(
+                        LINUXDO_OAUTH,
+                        credential["value"],
+                        credential["provider_cookies"],
+                    )
+                    self.assertTrue(result.success, result.message)
+                    db.update_credential_value(
+                        "s1",
+                        "c1",
+                        result.rotated_provider_cookie or credential["value"],
+                        provider_cookies=result.provider_cookies,
+                    )
+            scoped = {
+                (c["domain"], c["path"]): c["value"]
+                for c in db.get_sites()[0]["credentials"][0]["provider_cookies"]
+            }
+            self.assertEqual(scoped[(f"connect.{ZONE}", "/scoped")], "connect-session")
+            self.assertEqual(scoped[(ZONE, "/scoped")], "root-session")
+            self.assertEqual(
+                self.hits,
+                [
+                    ("scoped-connect", "seed"),
+                    ("scoped-root", "seed"),
+                    ("scoped-connect", "connect-session"),
+                    ("scoped-root", "root-session"),
+                ],
+            )
+
     async def test_navigation_solves_the_challenge_and_stops_before_the_station(self) -> None:
         outcome = await self.solver.request(BrowserRequest(
             "GET", f"{self.base}/oauth2/authorize?client_id=c&state=ST",
@@ -173,6 +332,21 @@ class LiveBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(again.solved)
         self.assertEqual(again.response.status_code, 302)
         self.assertEqual(again.response.headers["location"], f"{self.base}/login")
+
+    async def test_a_session_set_on_the_relay_replaces_the_pasted_one(self) -> None:
+        """A stale pasted session must not shadow the one the relay sets: the
+        callback would read the stale one first and refuse the state."""
+        outcome = await self.solver.request(BrowserRequest(
+            "GET", f"http://connect.{ZONE}:{self.port}/relay/authorize?state=ST",
+            {"Cookie": "_t=tok; sess=stale"}, navigate=True,
+        ), self.options)
+        response = outcome.response
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["location"], f"http://{STATION}:{self.port}/oauth/linuxdo?code=CODE&state=ST")
+        self.assertEqual(self.hits, [("relay-authorize",), ("relay-sso",), ("relay-callback",), ("relay-authorize",)])
+        # What the run writes back: the values the provider set, not the pasted ones.
+        self.assertEqual(response.cookies["sess"], "valid")
+        self.assertEqual(response.cookies["_t"], "tok2")
 
     async def test_an_api_call_is_made_with_fetch_after_the_challenge(self) -> None:
         """A POST to a path the rule covers alone: the challenge is met on that

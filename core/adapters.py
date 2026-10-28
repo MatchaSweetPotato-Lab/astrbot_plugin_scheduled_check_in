@@ -139,6 +139,7 @@ class SiteWriteback:
     # Provider cookies the upstream rotated during a login, keyed by credential
     # id. Storing them keeps the next run from replaying a retired session.
     credential_values: dict[str, str] = field(default_factory=dict)
+    provider_cookies: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
         """Return whether there is nothing to persist."""
@@ -147,6 +148,7 @@ class SiteWriteback:
             and self.balance_headers is None
             and not self.oauth_sessions
             and not self.credential_values
+            and not self.provider_cookies
         )
 
 
@@ -173,7 +175,13 @@ def persist_writeback(db: Any, site_id: str, writeback: SiteWriteback | None) ->
             else:
                 db.update_credential_session(site_id, credential_id, session_cookie, *token)
         for credential_id, value in writeback.credential_values.items():
-            db.update_credential_value(site_id, credential_id, value)
+            cookies = writeback.provider_cookies.get(credential_id)
+            if cookies is None:
+                db.update_credential_value(site_id, credential_id, value)
+            else:
+                db.update_credential_value(
+                    site_id, credential_id, value, provider_cookies=cookies
+                )
     except Exception as exc:
         logger.warning(f"Could not persist discovered config for site {site_id}: {exc}")
 
@@ -186,8 +194,8 @@ class _TextResponse:
     text: str
     challenge_error: str = ""
     challenge_solved: bool = False
-    # A Cloudflare challenge that fingerprint screening did not get past, and
-    # what was tried against it.
+    # A Cloudflare challenge that remains after browser handling, and what
+    # was tried against it.
     cloudflare: bool = False
     cloudflare_detail: str = ""
 
@@ -268,7 +276,7 @@ class BaseCheckInAdapter(ABC):
         self._refresh_tried: set[str] = set()
         # Request trace for the current run, attached to the result.
         self.attempts: list[dict[str, Any]] = []
-        # Set once a Cloudflare challenge outlasted fingerprint screening this
+        # Set once a Cloudflare challenge outlasted browser handling this
         # run, so the resulting failure is not mistaken for a dead credential.
         self._cloudflare_blocked = False
 
@@ -489,7 +497,9 @@ class BaseCheckInAdapter(ABC):
             Tuple of ``(session_cookie, error_message)``.
         """
         result = await self._oauth_client().login(
-            str(credential.get("type") or ""), credential.get("value")
+            str(credential.get("type") or ""),
+            credential.get("value"),
+            provider_cookies=credential.get("provider_cookies"),
         )
 
         # Persist a rotated provider cookie whether or not the login succeeded:
@@ -497,9 +507,15 @@ class BaseCheckInAdapter(ABC):
         # replaying a value it has already retired guarantees the next failure.
         if result.rotated_provider_cookie:
             credential["value"] = result.rotated_provider_cookie
-            rotated_id = str(credential.get("id") or "")
-            if rotated_id:
-                self.writeback.credential_values[rotated_id] = result.rotated_provider_cookie
+        if result.provider_cookies is not None:
+            credential["provider_cookies"] = result.provider_cookies
+        rotated_id = str(credential.get("id") or "")
+        if rotated_id and (
+            result.rotated_provider_cookie or result.provider_cookies is not None
+        ):
+            self.writeback.credential_values[rotated_id] = credential["value"]
+            if result.provider_cookies is not None:
+                self.writeback.provider_cookies[rotated_id] = result.provider_cookies
 
         if not result.success:
             return "", result.message
@@ -727,18 +743,11 @@ class BaseCheckInAdapter(ABC):
         merged_headers["Cookie"] = "; ".join(f"{name}={value}" for name, value in cookies.items())
         return merged_headers
 
-    def _impersonate_for(self, url: str) -> str:
-        """Fingerprint for ``url``: one Cloudflare let through this run, else the configured one."""
-        if self.cloudflare is None:
-            return self.impersonate
-        return self.cloudflare.impersonate_for(url, self.impersonate)
-
     async def _send(
         self,
         method: str,
         url: str,
         headers: dict[str, str],
-        impersonate: str | None = None,
         body: str | None = None,
     ) -> Any:
         """Issue one raw request with the site's proxy and fingerprint.
@@ -749,7 +758,7 @@ class BaseCheckInAdapter(ABC):
         Args:
             body: Request body, sent as UTF-8 exactly as given.
         """
-        profile = impersonate or self._impersonate_for(url)
+        profile = self.impersonate
         extra: dict[str, Any] = {}
         if body is not None:
             extra["data"] = body.encode("utf-8")
@@ -763,7 +772,9 @@ class BaseCheckInAdapter(ABC):
             **extra,
         )
 
-    def _record_cloudflare(self, step: str, method: str, url: str, **fields: Any) -> None:
+    def _record_cloudflare(
+        self, step: str, method: str, url: str, **fields: Any
+    ) -> None:
         """Trace callback in the shape the Cloudflare context calls."""
         self._record_attempt(step=step, method=method, endpoint=url, **fields)
 
@@ -781,18 +792,13 @@ class BaseCheckInAdapter(ABC):
             was tried against it.
         """
         mldsa = self.options.tls_mldsa
-        impersonate = self._impersonate_for(url)
-        response = await self._send(method, url, headers, impersonate, body)
+        impersonate = self.impersonate
+        response = await self._send(method, url, headers, body=body)
         detail = ""
         if self.cloudflare is not None:
             resolution = await self.cloudflare.resolve(
-                method=method,
-                url=url,
                 response=response,
-                impersonate=impersonate,
-                send=lambda profile: self._send(method, url, headers, profile, body),
                 record=self._record_cloudflare,
-                mldsa=mldsa,
                 browser_request=BrowserRequest(
                     method,
                     url,
@@ -825,8 +831,8 @@ class BaseCheckInAdapter(ABC):
         Both follow the global settings: whether an Aliyun ``acw_sc__v2``
         challenge is solved, and whether ML-DSA goes into every attempt's TLS
         handshake, retries included. Cloudflare challenges are handled
-        regardless; the run's Cloudflare context decides whether to retry
-        other fingerprints.
+        regardless; the run's Cloudflare context retries them directly in
+        the headless browser when enabled.
         """
         request_headers = self._merge_challenge_cookies(headers)
         response, cloudflare_detail = await self._send_past_cloudflare(
@@ -965,7 +971,14 @@ class BaseCheckInAdapter(ABC):
 
     @staticmethod
     def _cloudflare_message(response: _TextResponse) -> str:
-        """Describe a Cloudflare challenge that fingerprint screening did not get past."""
+        """Describe a Cloudflare challenge that remains after browser handling.
+
+        Args:
+            response: The challenged response and browser handling details.
+
+        Returns:
+            The failure message, without blaming the credential.
+        """
         message = f"被 Cloudflare 人机验证拦截 (HTTP {response.status})，并非凭据失效"
         if response.cloudflare_detail:
             message += f"；{response.cloudflare_detail}"

@@ -21,6 +21,7 @@ from core.browser import (
     BrowserUnavailable,
     _cookie_specs,
     _proxy_settings,
+    _site_cookies,
     _zone,
     normalize_channel,
     normalize_timeout,
@@ -62,7 +63,7 @@ class FakeBrowser:
 
 
 def context(browser: Any, **options: Any) -> CloudflareContext:
-    return CloudflareContext(CloudflareOptions(**options), pacing=0, browser=browser)
+    return CloudflareContext(CloudflareOptions(**options), browser=browser)
 
 
 class Trace:
@@ -76,18 +77,10 @@ class Trace:
         return [e for e in self.entries if e["step"] == "Cloudflare 无头浏览器"]
 
 
-async def always_challenged(profile: str) -> FakeResponse:
-    return challenge()
-
-
 async def resolve(ctx: CloudflareContext, trace: Trace | None = None, *, url: str = AUTHORIZE,
-                  request: BrowserRequest | None = None, send: Any = always_challenged) -> Any:
+                  request: BrowserRequest | None = None, response: Any = None) -> Any:
     return await ctx.resolve(
-        method="GET",
-        url=url,
-        response=challenge(),
-        impersonate="chrome131",
-        send=send,
+        response=response if response is not None else challenge(),
         record=trace,
         browser_request=request or BrowserRequest("GET", url),
     )
@@ -104,14 +97,68 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(_zone("api.example.com.cn"), "example.com.cn")
         self.assertEqual(_zone("127.0.0.1"), "127.0.0.1")
 
-    def test_provider_cookies_reach_every_subdomain_but_host_cookies_do_not(self) -> None:
-        specs = _cookie_specs(AUTHORIZE, [("_t", "a"), ("__Host-x", "b")], zone_wide=True)
-        self.assertEqual(specs[0]["domain"], ".linux.do")
-        self.assertTrue(specs[0]["secure"])
-        self.assertEqual(specs[1], {"name": "__Host-x", "value": "b", "url": "https://connect.linux.do/"})
-        station = _cookie_specs(f"{BASE}/api/x", [("session", "s")], zone_wide=False)
-        self.assertEqual(station[0]["url"], f"{BASE}/")
-        self.assertNotIn("domain", station[0])
+    def test_provider_cookies_go_on_the_host_and_its_domain_host_only(self) -> None:
+        specs = _cookie_specs(AUTHORIZE, [("_t", "a"), ("__Host-x", "b"), ("cf_clearance", "c")], zone_wide=True)
+        self.assertEqual(specs, [
+            # Host-only, so a value the site sets on either host replaces it.
+            {"name": "_t", "value": "a", "url": "https://connect.linux.do/"},
+            {"name": "_t", "value": "a", "url": "https://linux.do/"},
+            {"name": "__Host-x", "value": "b", "url": "https://connect.linux.do/"},
+            # Where Cloudflare itself puts its cookies.
+            {"name": "cf_clearance", "value": "c", "domain": ".linux.do", "path": "/", "secure": True},
+        ])
+        station = _cookie_specs(f"{BASE}/api/x", [("session", "s"), ("cf_clearance", "c")], zone_wide=False)
+        self.assertEqual(station, [
+            {"name": "session", "value": "s", "url": f"{BASE}/"},
+            {"name": "cf_clearance", "value": "c", "url": f"{BASE}/"},
+        ])
+
+    def test_a_cookie_the_site_set_wins_over_the_pasted_one(self) -> None:
+        pasted = {"_t": "old", "sid": "old"}
+        jar = [
+            {"name": "_t", "value": "old"}, {"name": "_t", "value": "rotated"},
+            {"name": "sid", "value": "fresh"}, {"name": "sid", "value": "old"},
+            {"name": "_cfuvid", "value": "u"},
+        ]
+        self.assertEqual(_site_cookies(jar, pasted), {"_t": "rotated", "sid": "fresh", "_cfuvid": "u"})
+
+    def test_saved_scopes_override_the_pasted_value_on_both_hosts(self) -> None:
+        specs = _cookie_specs(
+            AUTHORIZE,
+            [("_t", "wrong"), ("other", "legacy")],
+            zone_wide=True,
+            provider_cookies=[
+                {
+                    "name": "_t",
+                    "value": "connect",
+                    "domain": "connect.linux.do",
+                    "path": "/",
+                },
+                {
+                    "name": "_t",
+                    "value": "root",
+                    "domain": "linux.do",
+                    "path": "/session",
+                },
+            ],
+        )
+        saved = [cookie for cookie in specs if cookie["name"] == "_t"]
+        self.assertEqual(
+            [(c["value"], c["domain"], c["path"]) for c in saved],
+            [("connect", "connect.linux.do", "/"), ("root", "linux.do", "/session")],
+        )
+        self.assertEqual(len([c for c in specs if c["name"] == "other"]), 2)
+
+    def test_expired_scopes_do_not_resurrect_a_pasted_cookie(self) -> None:
+        specs = _cookie_specs(
+            AUTHORIZE,
+            [("_t", "retired")],
+            zone_wide=True,
+            provider_cookies=[
+                {"name": "_t", "value": "expired", "domain": "linux.do", "expires": 1}
+            ],
+        )
+        self.assertEqual(specs, [])
 
     def test_proxy_credentials_are_split_out(self) -> None:
         self.assertEqual(
@@ -146,7 +193,7 @@ class OptionTests(unittest.TestCase):
                     "cf_browser_channel": "EDGE", "cf_browser_timeout_seconds": "90"}
         normalize_cloudflare_settings(settings)
         self.assertEqual(settings, {
-            "cf_fingerprint_fallback": True, "cf_browser_fallback": False, "cf_browser_headless": False,
+            "cf_browser_fallback": False, "cf_browser_headless": False,
             "cf_browser_channel": "auto", "cf_browser_timeout_seconds": 90,
         })
 
@@ -187,28 +234,35 @@ class UnavailableTests(unittest.IsolatedAsyncioTestCase):
 # The context
 # ----------------------------------------------------------------------
 class ResolveTests(unittest.IsolatedAsyncioTestCase):
-    async def test_the_browser_takes_over_when_every_fingerprint_fails(self) -> None:
+    async def test_the_browser_takes_over_as_soon_as_curl_is_challenged(self) -> None:
         browser, trace = FakeBrowser(BrowserResponse(200, "through")), Trace()
         resolution = await resolve(context(browser), trace)
         self.assertEqual(resolution.response.text, "through")
         self.assertEqual(len(browser.calls), 1)
-        self.assertEqual([e["step"] for e in trace.entries], ["Cloudflare 指纹轮换", "Cloudflare 无头浏览器"])
+        self.assertEqual([e["step"] for e in trace.entries], ["Cloudflare 无头浏览器"])
         entry = trace.browser_entries()[0]
         self.assertTrue(entry["success"])
         self.assertIn("Chrome 153 通过人机验证 (HTTP 200)", entry["message"])
 
-    async def test_a_passing_fingerprint_never_starts_the_browser(self) -> None:
-        async def passes(profile: str) -> FakeResponse:
-            return FakeResponse(200, "ok")
-
+    async def test_a_normal_curl_response_never_starts_the_browser(self) -> None:
         browser = FakeBrowser()
-        await resolve(context(browser), send=passes)
+        original = FakeResponse(200, "ok")
+        resolution = await resolve(context(browser), response=original)
+        self.assertIs(resolution.response, original)
         self.assertEqual(browser.calls, [])
 
-    async def test_the_browser_runs_with_the_ladder_off(self) -> None:
-        browser = FakeBrowser(BrowserResponse(200, "through"))
-        resolution = await resolve(context(browser, fingerprint_fallback=False))
-        self.assertEqual(resolution.response.text, "through")
+    async def test_a_retired_fingerprint_setting_cannot_restore_curl_retries(self) -> None:
+        for value in (True, False):
+            with self.subTest(value=value):
+                browser, trace = FakeBrowser(BrowserResponse(200, "through")), Trace()
+                ctx = CloudflareContext(
+                    CloudflareOptions.from_settings({"cf_fingerprint_fallback": value}),
+                    browser=browser,
+                )
+                resolution = await resolve(ctx, trace)
+                self.assertEqual(resolution.response.text, "through")
+                self.assertEqual(len(browser.calls), 1)
+                self.assertEqual([e["step"] for e in trace.entries], ["Cloudflare 无头浏览器"])
 
     async def test_a_disabled_browser_says_so(self) -> None:
         browser = FakeBrowser()
@@ -216,11 +270,12 @@ class ResolveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(browser.calls, [])
         self.assertIn("无头浏览器验证已在全局设置中关闭", resolution.detail)
 
-    async def test_without_a_browser_request_only_the_ladder_runs(self) -> None:
+    async def test_without_a_browser_request_the_challenge_is_reported(self) -> None:
         browser = FakeBrowser()
         ctx = context(browser)
-        await ctx.resolve(method="GET", url=AUTHORIZE, response=challenge(), impersonate="chrome131",
-                          send=always_challenged)
+        resolution = await ctx.resolve(response=challenge())
+        self.assertEqual(resolution.response.status_code, 403)
+        self.assertIn("缺少原始请求信息", resolution.detail)
         self.assertEqual(browser.calls, [])
 
     async def test_the_clearance_is_carried_to_the_next_request_through_the_same_proxy(self) -> None:
@@ -231,21 +286,16 @@ class ResolveTests(unittest.IsolatedAsyncioTestCase):
         await resolve(ctx, url=f"{BASE}/x", request=BrowserRequest("GET", f"{BASE}/x"))
         self.assertEqual([call[2] for call in browser.calls], [[], CLEARANCE, []])
 
-    async def test_a_host_the_browser_got_past_skips_the_ladder(self) -> None:
-        sent: list[str] = []
-
-        async def counted(profile: str) -> FakeResponse:
-            sent.append(profile)
-            return challenge()
-
-        ctx = context(FakeBrowser(BrowserResponse(200, "a"), BrowserResponse(200, "b")))
-        await resolve(ctx, send=counted)
-        rungs = len(sent)
-        resolution = await resolve(ctx, send=counted)
+    async def test_a_later_challenge_goes_straight_back_to_the_browser(self) -> None:
+        browser, trace = FakeBrowser(BrowserResponse(200, "a"), BrowserResponse(200, "b")), Trace()
+        ctx = context(browser)
+        await resolve(ctx, trace)
+        resolution = await resolve(ctx, trace)
         self.assertEqual(resolution.response.text, "b")
-        self.assertEqual(len(sent), rungs)
+        self.assertEqual(len(browser.calls), 2)
+        self.assertEqual([e["step"] for e in trace.entries], ["Cloudflare 无头浏览器"] * 2)
 
-    async def test_a_browser_that_stayed_on_the_challenge_is_not_tried_again(self) -> None:
+    async def test_a_failed_challenge_does_not_block_a_later_request(self) -> None:
         browser, trace = FakeBrowser(BrowserResponse(403, CHALLENGE_BODY, {"cf-mitigated": "challenge"})), Trace()
         ctx = context(browser, browser_timeout=30)
         first = await resolve(ctx, trace)
@@ -253,8 +303,40 @@ class ResolveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("30 秒内未能通过人机验证", first.detail)
         self.assertTrue(first.detail.startswith("已自动尝试："))
         second = await resolve(ctx)
-        self.assertEqual(len(browser.calls), 1)
-        self.assertIn("跳过", second.detail)
+        self.assertEqual(len(browser.calls), 2)
+        self.assertEqual(second.response.status_code, 200)
+
+    async def test_a_failed_proxy_does_not_block_another_proxy(self) -> None:
+        browser = FakeBrowser(
+            BrowserResponse(403, CHALLENGE_BODY), BrowserResponse(200, "through")
+        )
+        ctx = context(browser)
+        await resolve(ctx, request=BrowserRequest("GET", AUTHORIZE, proxy="http://a:1"))
+        second = await resolve(
+            ctx, request=BrowserRequest("GET", AUTHORIZE, proxy="http://b:2")
+        )
+        self.assertEqual(second.response.text, "through")
+        self.assertEqual(
+            [call[0].proxy for call in browser.calls], ["http://a:1", "http://b:2"]
+        )
+        self.assertEqual(browser.calls[1][2], [])
+
+    async def test_a_failed_endpoint_does_not_block_another_endpoint(self) -> None:
+        for failure in (
+            BrowserResponse(403, CHALLENGE_BODY),
+            RuntimeError("connection reset"),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                browser = FakeBrowser(failure, BrowserResponse(200, "through"))
+                ctx = context(browser)
+                await resolve(ctx, url=f"{BASE}/api/user/self")
+                second = await resolve(
+                    ctx,
+                    url=f"{BASE}/api/user/checkin",
+                    request=BrowserRequest("POST", f"{BASE}/api/user/checkin"),
+                )
+                self.assertEqual(second.response.text, "through")
+                self.assertEqual(len(browser.calls), 2)
 
     async def test_an_unavailable_browser_is_reported_once_per_run(self) -> None:
         browser, trace = FakeBrowser(BrowserUnavailable("未安装 Playwright（pip install playwright）")), Trace()
@@ -297,11 +379,14 @@ class OAuthTests(unittest.IsolatedAsyncioTestCase):
         ))
         session = self._session()
         client = OAuthLoginClient(session, BASE, "chrome131", "http://proxy:1",
-                                  cloudflare=context(browser, fingerprint_fallback=False))
+                                  cloudflare=context(browser))
         result = await client.login(LINUXDO_OAUTH, "_t=a; _forum_session=b")
         self.assertTrue(result.success, result.message)
         self.assertEqual(result.session_cookie, "session=fresh")
         self.assertEqual(result.rotated_provider_cookie, "_t=rotated; _forum_session=b")
+        self.assertEqual(len(session.calls_to("/oauth2/authorize")), 1)
+        self.assertEqual(len(browser.calls), 1)
+        self.assertTrue(browser.calls[0][1].headless)
         # The code went to the station over curl_cffi, not through the browser.
         exchange = session.calls_to("/api/oauth/linuxdo")[-1]
         self.assertEqual(exchange["params"], {"code": "C", "state": "st"})
@@ -316,7 +401,7 @@ class OAuthTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_bounce_to_the_login_page_blames_the_session(self) -> None:
         browser = FakeBrowser(BrowserResponse(302, "", {"location": "https://linux.do/login"}))
         client = OAuthLoginClient(self._session(), BASE, "chrome131", None,
-                                  cloudflare=context(browser, fingerprint_fallback=False))
+                                  cloudflare=context(browser))
         result = await client.login(LINUXDO_OAUTH, "_t=a; _forum_session=b")
         self.assertFalse(result.success)
         self.assertIn("会话 Cookie", result.message)
@@ -328,7 +413,7 @@ class OAuthTests(unittest.IsolatedAsyncioTestCase):
         })
         browser = FakeBrowser(BrowserResponse(200, '{"data":{"flow_token":"ft"}}', cookies={"sid": "1"}))
         client = OAuthLoginClient(session, BASE, "chrome131", None,
-                                  cloudflare=context(browser, fingerprint_fallback=False))
+                                  cloudflare=context(browser))
         from core.oauth import PROVIDERS
 
         state, cookie = await client._fetch_flow_token(PROVIDERS[LINUXDO_OAUTH])
@@ -352,13 +437,17 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             BrowserResponse(200, json.dumps({"success": True, "data": {"id": 7, "quota": 1000000}})),
         ]
         session = FakeSession({}, default=challenge())
-        adapter = create_adapter(site, session, None, context(browser, fingerprint_fallback=False))
+        adapter = create_adapter(site, session, None, context(browser))
         result = await adapter.check_in()
         self.assertTrue(result.success, result.message)
+        self.assertEqual(len(session.calls), len(browser.calls))
+        self.assertEqual(len(session.calls_to("/api/user/checkin")), 1)
+        self.assertTrue(all(call["impersonate"] == "chrome131" for call in session.calls))
         methods = [(call[0].method, call[0].url.removeprefix(BASE)) for call in browser.calls]
         self.assertIn(("POST", "/api/user/checkin"), methods)
         self.assertTrue(all("session=abc" in call[0].headers.get("Cookie", "") for call in browser.calls))
         self.assertIn("Cloudflare 无头浏览器", [a["step"] for a in adapter.attempts])
+        self.assertNotIn("Cloudflare 指纹轮换", [a["step"] for a in adapter.attempts])
 
 
 if __name__ == "__main__":

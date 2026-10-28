@@ -39,6 +39,7 @@ from .site_schema import (
     normalize_credentials,
     normalize_headers,
     normalize_path,
+    normalize_provider_cookies,
     normalize_site_type,
 )
 from .task_schema import join_tasks, normalize_tasks, split_task
@@ -68,10 +69,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "lock_notify_session": "",
     # Reporting verbosity level: "all" (full briefing) or "failure_only" (alerts on failures only).
     "report_level": "all",
-    # When Cloudflare challenges a request (see core/cloudflare.py), retry it
-    # with other browser fingerprints.
-    "cf_fingerprint_fallback": True,
-    # When no fingerprint gets past it, re-issue the request from a headless
+    # When Cloudflare challenges a request, re-issue it directly from a headless
     # browser that solves the challenge (see core/browser.py). Needs Playwright.
     "cf_browser_fallback": True,
     "cf_browser_headless": True,
@@ -714,6 +712,11 @@ class DatabaseManager:
             if not credential.get("value"):
                 credential["value"] = str(match.get("value") or "")
                 credential["value_updated_at"] = str(match.get("value_updated_at") or "")
+            credential["provider_cookies"] = (
+                match.get("provider_cookies", [])
+                if credential["value"] == match.get("value")
+                else []
+            )
         return credentials
 
     def _seal_text(
@@ -752,10 +755,11 @@ class DatabaseManager:
             return [self._site_row_to_dict(row) for row in cursor.fetchall()]
 
     def get_sites_for_display(self) -> list[dict[str, Any]]:
-        """Get all sites with OAuth session cookies and tokens withheld.
+        """Get all sites with OAuth session tokens and scoped cookie jars withheld.
 
         Used by the web API: the dashboard never needs the station secrets a
-        login produced, only which of them are currently held.
+        login produced, only which of them are currently held. Provider jars
+        stay server-side and are restored when an unchanged credential is saved.
         """
         sites = self.get_sites()
         states = self.get_task_states()
@@ -770,6 +774,7 @@ class DatabaseManager:
                 credential["has_access_token"] = bool(credential.get("access_token"))
                 credential["session_cookie"] = ""
                 credential["access_token"] = ""
+                credential["provider_cookies"] = []
         return sites
 
     def merge_stored_oauth_secrets(self, site: dict[str, Any]) -> dict[str, Any]:
@@ -973,6 +978,7 @@ class DatabaseManager:
         site_id: str,
         credential_id: str,
         value: str,
+        provider_cookies: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Replace a credential's secret with a rotated one.
 
@@ -986,6 +992,9 @@ class DatabaseManager:
             site_id: Owning site.
             credential_id: Credential whose value rotated.
             value: The new secret.
+            provider_cookies: Scoped provider cookie jar, stored atomically
+                with the legacy header. None clears old scopes on a changed
+                header, and leaves them alone when the header is unchanged.
 
         Returns:
             Whether a credential was updated.
@@ -1006,9 +1015,20 @@ class DatabaseManager:
             for credential in credentials:
                 if credential.get("id") != str(credential_id).strip():
                     continue
-                if credential.get("value") == new_value:
+                cookies = (
+                    normalize_provider_cookies(provider_cookies)
+                    if provider_cookies is not None
+                    else []
+                )
+                same_value = credential.get("value") == new_value
+                if same_value and (
+                    provider_cookies is None
+                    or credential.get("provider_cookies", []) == cookies
+                ):
                     return False
                 credential["value"] = new_value
+                if "provider_cookies" in credential:
+                    credential["provider_cookies"] = cookies
                 credential["value_updated_at"] = now_str
                 updated = True
                 break
@@ -1561,7 +1581,10 @@ class DatabaseManager:
                     continue
                 settings[row["key"]] = _load_json(row["value"], row["value"])
 
-        settings["http_impersonate"] = normalize_impersonate(settings.get("http_impersonate"))
+        settings.pop("cf_fingerprint_fallback", None)
+        settings["http_impersonate"] = normalize_impersonate(
+            settings.get("http_impersonate")
+        )
         return settings
 
     def save_settings(

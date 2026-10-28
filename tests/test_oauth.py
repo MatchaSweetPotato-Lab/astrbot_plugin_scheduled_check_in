@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 
 import tests  # noqa: F401
+from curl_cffi.requests import Cookies
 from core.cloudflare import CloudflareContext, CloudflareOptions
 from core.oauth import (
     GITHUB_OAUTH,
@@ -906,6 +907,136 @@ class DiscourseRelayTests(LinuxdoAuthorizeHelpers, unittest.IsolatedAsyncioTestC
         self.assertEqual(jar["auth.session-token"], "tok")
         self.assertEqual(jar["_t"], "rotated")
 
+    async def test_saved_cookie_scopes_are_used_for_each_curl_relay_host(self) -> None:
+        session = self._relay_session(
+            FakeResponse(
+                302, "", headers={"location": f"{BASE}/oauth/linuxdo?code=C&state=st"}
+            )
+        )
+        scoped = [
+            {
+                "name": "_t",
+                "value": "connect",
+                "domain": "connect.linux.do",
+                "path": "/",
+            },
+            {
+                "name": "_t",
+                "value": "private",
+                "domain": "connect.linux.do",
+                "path": "/discourse",
+            },
+            {
+                "name": "_t",
+                "value": "wrong-path",
+                "domain": "connect.linux.do",
+                "path": "/discourse//",
+            },
+            {"name": "_t", "value": "root", "domain": "linux.do", "path": "/"},
+        ]
+        result = await OAuthLoginClient(session, BASE, "chrome131").login(
+            LINUXDO_OAUTH, self.COOKIE, scoped
+        )
+        self.assertTrue(result.success, result.message)
+        headers = [call["headers"]["Cookie"] for call in session.calls[2:6]]
+        self.assertIn("_t=connect", headers[0])
+        self.assertIn("_t=root", headers[1])
+        self.assertTrue(headers[2].startswith("_t=private; _t=connect"), headers[2])
+        self.assertIn("_t=connect", headers[3])
+        self.assertNotIn("_t=rotated", headers[3])
+
+    async def test_curl_cookie_jars_keep_duplicate_names_and_domain_attributes(
+        self,
+    ) -> None:
+        response = FakeResponse(
+            302, "", headers={"location": f"{BASE}/oauth/linuxdo?code=C&state=st"}
+        )
+        response.cookies = Cookies()
+        response.cookies.set(
+            "_t", "connect-new", domain="connect.linux.do", path="/oauth2"
+        )
+        response.cookies.set("_t", "root-new", domain=".linux.do", path="/")
+        for item in response.cookies.jar:
+            item.set_nonstandard_attr("http_only", "True")
+            item.secure = True
+            item.expires = 4102444800
+        session = FakeSession(self._routes(response))
+        result = await OAuthLoginClient(session, BASE, "chrome131").login(
+            LINUXDO_OAUTH,
+            self.COOKIE,
+            [
+                {
+                    "name": "_t",
+                    "value": "connect-old",
+                    "domain": ".connect.linux.do",
+                    "path": "/oauth2",
+                },
+                {"name": "_t", "value": "root-old", "domain": ".linux.do", "path": "/"},
+            ],
+        )
+        self.assertTrue(result.success, result.message)
+        values = {
+            (c["domain"], c["path"]): c["value"]
+            for c in result.provider_cookies
+            if c["name"] == "_t"
+        }
+        self.assertEqual(
+            values,
+            {
+                (".connect.linux.do", "/oauth2"): "connect-new",
+                (".linux.do", "/"): "root-new",
+            },
+        )
+        self.assertTrue(
+            all(
+                c["httpOnly"] and c["secure"] and c["expires"] == 4102444800
+                for c in result.provider_cookies
+                if c["name"] == "_t"
+            )
+        )
+
+    async def test_a_deleted_browser_cookie_is_not_recreated_from_the_old_header(
+        self,
+    ) -> None:
+        response = FakeResponse(403, "provider refused authorization")
+        response.provider_cookies = [
+            {
+                "name": "_t",
+                "value": "connect",
+                "domain": "connect.linux.do",
+                "path": "/",
+            }
+        ]
+        first = await OAuthLoginClient(
+            FakeSession(self._routes(response)), BASE, "chrome131"
+        ).login(
+            LINUXDO_OAUTH,
+            self.COOKIE,
+            [
+                {
+                    "name": "_t",
+                    "value": "connect",
+                    "domain": "connect.linux.do",
+                    "path": "/",
+                },
+                {"name": "_t", "value": "root", "domain": "linux.do", "path": "/"},
+            ],
+        )
+        self.assertFalse(first.success)
+        self.assertTrue(
+            any(
+                c["domain"] == "linux.do" and c["expires"] == 1
+                for c in first.provider_cookies
+            )
+        )
+        session = self._relay_session(
+            FakeResponse(302, "", headers={"location": f"{BASE}/cb?code=C&state=st"})
+        )
+        await OAuthLoginClient(session, BASE, "chrome131").login(
+            LINUXDO_OAUTH, self.COOKIE, first.provider_cookies
+        )
+        self.assertNotIn("_t=", session.calls[3]["headers"]["Cookie"])
+
     async def test_a_redirect_off_the_relay_still_fails(self) -> None:
         session = self._relay_session(FakeResponse(
             302, "", headers={"location": "https://evil.example/x"}))
@@ -998,6 +1129,17 @@ class RefusedAuthorizeTests(LinuxdoAuthorizeHelpers, unittest.IsolatedAsyncioTes
         result = await self._login(FakeResponse(403, "nope"))
         self.assertIn("connect.linux.do", result.message)
 
+    async def test_an_error_page_is_quoted_not_guessed_at(self) -> None:
+        """What connect.linux.do showed when its SSO callback refused the relay."""
+        page = ("<html><head><title>Error - LINUX DO Connect</title><style>p{}</style></head>"
+                "<body><h1>Invalid state</h1><p>Please make sure you entered the information correctly.</p></body></html>")
+        result = await self._login(FakeResponse(400, page))
+        self.assertFalse(result.success)
+        self.assertIn("HTTP 400", result.message)
+        self.assertIn("Invalid state", result.message)
+        self.assertNotIn("p{}", result.message)
+        self.assertNotIn("完成一次 OAuth 授权", result.message)
+
 
 # The page connect.linux.do actually returned, trimmed to its identifying parts.
 CLOUDFLARE_PAGE = (
@@ -1080,15 +1222,14 @@ class CloudflareChallengeLoginTests(LinuxdoAuthorizeHelpers, unittest.IsolatedAs
                 self.assertIn("Cloudflare", result.message)
                 self.assertNotIn("未携带 ML-DSA", result.message)
 
-    async def test_reports_what_fingerprint_screening_tried(self) -> None:
-        """Without it the user cannot tell a disabled fallback from a lost one."""
+    async def test_reports_when_the_browser_is_unavailable(self) -> None:
         session = FakeSession(self._routes(FakeResponse(403, CLOUDFLARE_PAGE)))
-        context = CloudflareContext(CloudflareOptions(), pacing=0)
+        context = CloudflareContext(CloudflareOptions())
         client = OAuthLoginClient(session, BASE, "chrome131", None, cloudflare=context)
         result = await client.login(LINUXDO_OAUTH, self.COOKIE)
         self.assertFalse(result.success)
-        self.assertIn("已自动尝试", result.message)
-        self.assertIn("指纹轮换", result.message)
+        self.assertIn("无头浏览器不可用", result.message)
+        self.assertEqual(len(session.calls_to("/oauth2/authorize")), 1)
         self.assertRegex(result.message, r"(不是|并非|而非)凭据失效")
 
     async def test_offers_the_durable_alternative(self) -> None:

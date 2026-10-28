@@ -26,6 +26,7 @@ from core.storage import (
     USER_KEY_SLOT_ID,
     DatabaseManager,
 )
+from core.site_schema import normalize_provider_cookies
 
 
 def read_raw(db_path: Path, column: str, site_id: str = "site_1") -> str:
@@ -282,6 +283,14 @@ class DatabaseManagerTests(unittest.TestCase):
         self.assertEqual(reloaded["end_time"], "11:00")
         self.assertEqual(reloaded["http_timeout_seconds"], 30)
         self.assertEqual(reloaded["max_history_records"], 500)
+
+    def test_the_retired_cf_fingerprint_setting_is_hidden(self) -> None:
+        for value in (True, False):
+            with self.subTest(value=value):
+                self.db.save_settings({"cf_fingerprint_fallback": value})
+                settings = self.db.get_settings()
+                self.assertNotIn("cf_fingerprint_fallback", settings)
+                self.assertIs(settings["cf_browser_fallback"], True)
 
     def test_history_logs_and_pruning(self) -> None:
         """Test recording, pagination, count, and configurable pruning of logs."""
@@ -1037,6 +1046,24 @@ class CredentialRotationTests(unittest.TestCase):
 
     HELD = "user_session=OLD; _gh_sess=G1; logged_in=yes"
     ROTATED = "user_session=OLD; _gh_sess=G2; logged_in=yes"
+    SCOPED = normalize_provider_cookies(
+        [
+            {
+                "name": "user_session",
+                "value": "root",
+                "domain": "github.com",
+                "path": "/",
+                "secure": True,
+            },
+            {
+                "name": "user_session",
+                "value": "login",
+                "domain": "login.github.com",
+                "path": "/auth",
+                "secure": True,
+            },
+        ]
+    )
 
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -1107,6 +1134,46 @@ class CredentialRotationTests(unittest.TestCase):
         payload[0]["credentials"][0]["value"] = "user_session=TYPED"
         self.db.save_sites(payload)
         self.assertEqual(self._credential()["value"], "user_session=TYPED")
+
+    def test_scopes_are_saved_even_when_the_header_did_not_change(self) -> None:
+        self.assertTrue(
+            self.db.update_credential_value("site_1", "gh", self.HELD, self.SCOPED)
+        )
+        self.assertEqual(self._credential()["provider_cookies"], self.SCOPED)
+        self.assertFalse(
+            self.db.update_credential_value("site_1", "gh", self.HELD, self.SCOPED)
+        )
+
+    def test_scoped_cookies_survive_encryption_and_are_withheld_from_the_dashboard(
+        self,
+    ) -> None:
+        key = self.db.enable_encryption()
+        self.db.update_credential_value("site_1", "gh", self.ROTATED, self.SCOPED)
+        self.db.lock_encryption()
+        self.db.unlock_encryption(key)
+        self.assertEqual(self._credential()["provider_cookies"], self.SCOPED)
+        self.assertTrue(read_raw(self.db_path, "credentials").startswith(CIPHER_PREFIX))
+        self.assertEqual(
+            self.db.get_sites_for_display()[0]["credentials"][0]["provider_cookies"], []
+        )
+
+    def test_an_unchanged_editor_retains_scopes_rotated_in_the_background(self) -> None:
+        posted = self.db.get_sites_for_display()
+        del posted[0]["credentials"][0]["value"]
+        self.db.update_credential_value("site_1", "gh", self.ROTATED, self.SCOPED)
+        self.db.save_sites(posted)
+        self.assertEqual(self._credential()["provider_cookies"], self.SCOPED)
+        merged = self.db.merge_stored_oauth_secrets(self.db.get_sites_for_display()[0])
+        self.assertEqual(merged["credentials"][0]["provider_cookies"], self.SCOPED)
+
+    def test_a_manually_replaced_cookie_clears_old_scopes(self) -> None:
+        self.db.update_credential_value("site_1", "gh", self.ROTATED, self.SCOPED)
+        posted = self.db.get_sites_for_display()
+        posted[0]["credentials"][0]["value"] = "user_session=MANUAL"
+        merged = self.db.merge_stored_oauth_secrets(posted[0])
+        self.assertEqual(merged["credentials"][0]["provider_cookies"], [])
+        self.db.save_sites(posted)
+        self.assertEqual(self._credential()["provider_cookies"], [])
 
 
 class StoredOAuthSecretsTests(unittest.TestCase):
